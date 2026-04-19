@@ -234,61 +234,84 @@ async def parallel_upload(client, file_path):
 # ========================================================
 # 📂 🟢 ORIGINAL FAST DOWNLOAD ROUTE (Size Fix + Speed Fix)
 # ========================================================
+# ========================================================
+# 📂 🟢 100% PERFECT DOWNLOAD ROUTE (Size Fix + IDM Multi-Thread Speed)
+# ========================================================
 @app.get("/download/{short_id}")
-async def download_file(short_id: str):
-    # Database entry check kiya (SQLite wala)
+async def download_file(short_id: str, request: Request):
     entry = get_file_entry(short_id)
-    if not entry:
+    if not entry: 
         raise HTTPException(status_code=404, detail="File not found")
 
-    file_size = entry["size"]
+    file_size = int(entry["size"])
     t_start = time.time()
-    log(f"⬇️  DOWNLOAD START | {entry['filename']} | {file_size/(1024*1024):.1f}MB")
+    log(f"⬇️  DOWNLOAD REQUEST | {entry['filename']} | {file_size/(1024*1024):.1f}MB")
 
     try:
         client = await get_client()
         message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
 
         if not message or not message.document:
-            delete_file_entry(short_id) # SQLite wala delete
+            delete_file_entry(short_id)
             raise HTTPException(status_code=404, detail="File deleted from Telegram")
 
         document = message.document
-        log(f"🚀 Streaming starts | {time.time()-t_start:.2f}s after tap")
+    except Exception as e: 
+        raise HTTPException(status_code=500, detail=str(e))
 
-        # Stream directly — no temp file, instant start!
-        async def stream_from_telegram():
-            bytes_sent = 0
-            async for chunk in client.iter_download(
-                document,
-                request_size=2 * 1024 * 1024,  # 2MB chunks — max speed
-            ):
-                data = bytes(chunk)
-                bytes_sent += len(data)
-                yield data
-            log(f"✅ DOWNLOAD DONE | {bytes_sent/(1024*1024):.1f}MB | {time.time()-t_start:.1f}s")
+    # 🟢 MAGIC: Handling Browser/IDM Range Requests for Multi-Threading!
+    range_header = request.headers.get("Range")
+    start = 0
+    end = file_size - 1
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        log(f"❌ DOWNLOAD ERROR | {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Download error: {str(e)}")
+    if range_header:
+        try:
+            ranges = range_header.replace("bytes=", "").split("-")
+            start = int(ranges[0]) if ranges[0] else 0
+            end = int(ranges[1]) if len(ranges) > 1 and ranges[1] else file_size - 1
+        except:
+            pass
 
+    if start >= file_size or end >= file_size:
+        return StreamingResponse(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+
+    limit = end - start + 1
     filename_safe = entry["filename"].replace('"', '\"')
 
-    # Wahi Original Headers Jo Aapko Chahiye The!
-    return StreamingResponse(
-        stream_from_telegram(),
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename_safe}"',
-            "Content-Type": entry["content_type"] or "application/octet-stream",
-            "Content-Length": str(file_size),
-            "Accept-Ranges": "bytes",
-            "X-Accel-Buffering": "no",
-            "X-Content-Type-Options": "nosniff",
-        },
-        media_type=entry["content_type"] or "application/octet-stream"
-    )
+    async def stream_from_telegram():
+        # Telegram se directly start to end byte tak fetch karega
+        async for chunk in client.iter_download(document, offset=start, limit=limit, request_size=1024 * 1024):
+            yield bytes(chunk)
+
+    # 🟢 ORIGINAL HEADERS + RANGE HEADERS
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename_safe}"',
+        "Content-Type": entry["content_type"] or "application/octet-stream",
+        "Accept-Ranges": "bytes",
+        "X-Accel-Buffering": "no",
+        "Cache-Control": "no-transform",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+    if range_header:
+        # IDM ko exact size aur part batayega (206 Partial Content)
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        headers["Content-Length"] = str(limit)
+        return StreamingResponse(
+            stream_from_telegram(), 
+            status_code=206, 
+            headers=headers, 
+            media_type=entry["content_type"] or "application/octet-stream"
+        )
+    else:
+        # Normal Download ko exact size batayega (200 OK)
+        headers["Content-Length"] = str(file_size)
+        return StreamingResponse(
+            stream_from_telegram(), 
+            status_code=200, 
+            headers=headers, 
+            media_type=entry["content_type"] or "application/octet-stream"
+        )
 
 # ========================================================
 # 📂 OTHER API ROUTES
