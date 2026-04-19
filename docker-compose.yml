@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  telestore:
+    build: .
+    ports:
+      - "9500:9500"
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - CHANNEL_ID=${CHANNEL_ID}
+      - BASE_URL=${BASE_URL:-http://localhost:9500}
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - PORT=${PORT:-9500}
+    volumes:
+      - telestore-data:/app/data
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.telestore-headers.headers.customResponseHeaders.X-Accel-Buffering=no"
+      - "traefik.http.middlewares.telestore-headers.headers.customResponseHeaders.Accept-Ranges=bytes"
+      - "traefik.http.routers.telestore.middlewares=telestore-headers"
+
+volumes:
+  telestore-data:
