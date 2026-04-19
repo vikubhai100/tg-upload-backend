@@ -189,54 +189,46 @@ async def fast_http_download(url: str, output_file: str, max_workers: int = 15):
         return total_size
 
 # ========================================================
-# 🚀🚀 MULTI-THREADED TELEGRAM UPLOADER (Server to TG)
+# 🚀🚀 MEMORY-EFFICIENT MULTI-THREADED TELEGRAM UPLOADER
 # ========================================================
 async def parallel_upload(client, file_path):
     file_size = os.path.getsize(file_path)
     file_name = os.path.basename(file_path)
-    
+
     if file_size < 10 * 1024 * 1024:
         return await client.upload_file(file_path)
-        
-    part_size = 512 * 1024 
+
+    part_size = 512 * 1024
     total_parts = math.ceil(file_size / part_size)
-    file_id = int.from_bytes(os.urandom(8), "big", signed=True) 
-    is_big = file_size > 10 * 1024 * 1024
-    
-    sem = asyncio.Semaphore(15) 
-    
-    async def upload_part(part_idx, chunk_data):
+    file_id = int.from_bytes(os.urandom(8), "big", signed=True)
+    is_big = True
+
+    sem = asyncio.Semaphore(15)
+
+    async def upload_part(part_idx):
         async with sem:
+            start = part_idx * part_size
+            end = min(start + part_size, file_size)
+            with open(file_path, 'rb') as f:
+                f.seek(start)
+                chunk = f.read(end - start)
+            
             for attempt in range(5):
                 try:
                     if is_big:
-                        await client(SaveBigFilePartRequest(file_id, part_idx, total_parts, chunk_data))
+                        await client(SaveBigFilePartRequest(file_id, part_idx, total_parts, chunk))
                     else:
-                        await client(SaveFilePartRequest(file_id, part_idx, chunk_data))
+                        await client(SaveFilePartRequest(file_id, part_idx, chunk))
                     return
-                except Exception as e:
+                except Exception:
                     await asyncio.sleep(1)
-            raise Exception(f"Failed to upload part {part_idx}")
+            raise Exception(f"Failed part {part_idx}")
 
-    tasks = []
-    with open(file_path, 'rb') as f:
-        for i in range(total_parts):
-            chunk = f.read(part_size)
-            tasks.append(asyncio.create_task(upload_part(i, chunk)))
-
+    tasks = [asyncio.create_task(upload_part(i)) for i in range(total_parts)]
     await asyncio.gather(*tasks)
-    
-    if is_big:
-        return InputFileBig(id=file_id, parts=total_parts, name=file_name)
-    else:
-        return InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
 
-# ========================================================
-# 📂 🟢 ORIGINAL FAST DOWNLOAD ROUTE (Size Fix + Speed Fix)
-# ========================================================
-# ========================================================
-# 📂 🟢 100% PERFECT DOWNLOAD ROUTE (Size Fix + IDM Multi-Thread Speed)
-# ========================================================
+    return InputFileBig(id=file_id, parts=total_parts, name=file_name)
+
 # ========================================================
 # 📂 🟢 100% PERFECT DOWNLOAD ROUTE (Fixes '?' Size & Speed)
 # ========================================================
@@ -281,7 +273,6 @@ async def download_file(short_id: str, request: Request):
     filename_safe = entry["filename"].replace('"', '')
 
     async def stream_from_telegram():
-        # Telegram API chunk size max 1MB rakha hai for consistent speed
         async for chunk in client.iter_download(document, offset=start, limit=limit, request_size=1024 * 1024):
             yield bytes(chunk)
 
@@ -289,22 +280,31 @@ async def download_file(short_id: str, request: Request):
     headers = {
         "Content-Disposition": f'attachment; filename="{filename_safe}"',
         "Content-Type": entry["content_type"] or "application/octet-stream",
-        "Content-Length": str(limit),  # Force exact size
+        "Content-Length": str(limit),
         "Accept-Ranges": "bytes",
-        "Cache-Control": "no-store, no-cache, must-revalidate", # Cloudflare ko data cache karne se rokega
-        "X-Accel-Buffering": "no", # Nginx ko stream rokne se rokega
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "X-Accel-Buffering": "no",
         "Connection": "keep-alive"
     }
 
     if range_header:
         headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        return StreamingResponse(stream_from_telegram(), status_code=206, headers=headers)
+        response = StreamingResponse(stream_from_telegram(), status_code=206, headers=headers)
     else:
-        return StreamingResponse(stream_from_telegram(), status_code=200, headers=headers)
+        response = StreamingResponse(stream_from_telegram(), status_code=200, headers=headers)
+
+    # Completion log
+    async def log_on_close():
+        t_end = time.time()
+        log(f"✅ DOWNLOAD DONE | {entry['filename']} | {file_size/(1024*1024):.1f}MB | {(t_end-t_start):.2f}s")
+    
+    # FastAPI ke response ke saath log attach karne ka simple tareeka
+    response.background = asyncio.create_task(log_on_close()) if asyncio.iscoroutinefunction(log_on_close) else None
+    return response
 
 
 # ========================================================
-# 📂 OTHER API ROUTES
+# 📂 OTHER API ROUTES (Sab same rakha hai)
 # ========================================================
 def verify_key(key: str):
     if key != INTERNAL_API_KEY: raise HTTPException(status_code=403, detail="Invalid API Key")
@@ -342,7 +342,7 @@ async def mock_upload_server(key: str):
 async def mock_upload(key: str, file_0: UploadFile = File(...)):
     verify_key(key)
     filename = file_0.filename
-    
+
     suffix = Path(filename).suffix or ".bin"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp_path = tmp.name
@@ -351,22 +351,22 @@ async def mock_upload(key: str, file_0: UploadFile = File(...)):
     try:
         def write_sync(chunk):
             with open(tmp_path, 'ab') as f: f.write(chunk)
-            
+
         while True:
             chunk = await file_0.read(10 * 1024 * 1024) 
             if not chunk: break
             await asyncio.to_thread(write_sync, chunk)
-                
+
         file_size = os.path.getsize(tmp_path)
         client = await get_client()
         log(f"⚡ FAST PARALLEL UPLOAD TO TG START | {filename}")
-        
+
         uploaded_file = await parallel_upload(client, tmp_path)
-        
+
         message = await client.send_file(CHANNEL_ID, uploaded_file, caption=f"📁 {filename}\n💾 {format_size(file_size)}", force_document=True)
         doc = message.document
         short_id = str(uuid.uuid4())[:8]
-        
+
         save_file_entry(short_id, {
             "message_id": message.id, "filename": filename, "size": file_size,
             "content_type": file_0.content_type or "application/octet-stream",
@@ -391,7 +391,7 @@ async def mock_remote_upload(request: Request):
         url = data.get("url")
         filename = data.get("filename", f"file_{int(time.time())}.bin")
         verify_key(key)
-        
+
         suffix = Path(filename).suffix or ".bin"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         tmp_path = tmp.name
@@ -399,20 +399,20 @@ async def mock_remote_upload(request: Request):
 
         log(f"📥 PYTHON IDM DOWNLOADING | {filename}")
         file_size = await fast_http_download(url, tmp_path, max_workers=15)
-        
+
         client = await get_client()
         log(f"⚡ FAST PARALLEL UPLOADING | {filename} ({format_size(file_size)})")
-        
+
         uploaded_file = await parallel_upload(client, tmp_path)
-        
+
         message = await client.send_file(
             CHANNEL_ID, uploaded_file,
             caption=f"📁 {filename}\n💾 {format_size(file_size)}", force_document=True
         )
-        
+
         doc = message.document
         short_id = str(uuid.uuid4())[:8]
-        
+
         save_file_entry(short_id, {
             "message_id": message.id, "filename": filename, "size": file_size,
             "content_type": "application/octet-stream",
@@ -421,10 +421,10 @@ async def mock_remote_upload(request: Request):
             "file_reference": doc.file_reference.hex() if doc else None,
             "dc_id": doc.dc_id if doc else None,
         })
-        
+
         log(f"✅ PYTHON PROCESS DONE | ID: {short_id}")
         return [{"file_code": short_id, "file_status": "OK"}]
-    
+
     except Exception as e:
         log(f"❌ REMOTE UPLOAD ERROR: {e}")
         return {"error": str(e)}
