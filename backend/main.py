@@ -236,62 +236,44 @@ async def parallel_upload(client, file_path):
 # ========================================================
 @app.get("/download/{short_id}")
 async def download_file(short_id: str):
-    db = load_db()
-    entry = db.get(short_id)
-    if not entry:
-        raise HTTPException(status_code=404, detail="File not found")
+    entry = get_file_entry(short_id)
+    if not entry: raise HTTPException(status_code=404, detail="File not found")
 
     file_size = entry["size"]
-    t_start = time.time()
-    log(f"⬇️  DOWNLOAD START | {entry['filename']} | {file_size/(1024*1024):.1f}MB")
-
     try:
         client = await get_client()
         message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
 
         if not message or not message.document:
-            db = load_db()
-            if short_id in db:
-                del db[short_id]
-                save_db(db)
+            delete_file_entry(short_id)
             raise HTTPException(status_code=404, detail="File deleted from Telegram")
 
         document = message.document
-        log(f"🚀 Streaming starts | {time.time()-t_start:.2f}s after tap")
-
-        # Stream directly — no temp file, instant start!
+        
+        # 🟢 THE FASTEST METHOD FOR TELEGRAM
         async def stream_from_telegram():
-            bytes_sent = 0
-            async for chunk in client.iter_download(
-                document,
-                request_size=2 * 1024 * 1024,  # 2MB chunks — max speed
-            ):
-                data = bytes(chunk)
-                bytes_sent += len(data)
-                yield data
-            log(f"✅ DOWNLOAD DONE | {bytes_sent/(1024*1024):.1f}MB | {time.time()-t_start:.1f}s")
+            # 2MB chunks give the best speed from Telegram servers
+            async for chunk in client.iter_download(document, request_size=2 * 1024 * 1024):
+                yield bytes(chunk)
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        log(f"❌ DOWNLOAD ERROR | {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Download error: {str(e)}")
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
     filename_safe = entry["filename"].replace('"', '\"')
-
+    
+    # 🟢 MAGIC HEADERS TO FIX FILE SIZE '?' AND ENSURE FAST SPEED
     return StreamingResponse(
         stream_from_telegram(),
         headers={
             "Content-Disposition": f'attachment; filename="{filename_safe}"',
-            "Content-Type": entry["content_type"],
-            "Content-Length": str(file_size),
-            "Accept-Ranges": "bytes",
-            "X-Accel-Buffering": "no",
-            "X-Content-Type-Options": "nosniff",
+            "Content-Length": str(file_size),            # Sends exact file size
+            "Accept-Ranges": "bytes",                    # Tells browser resume is supported
+            "Cache-Control": "no-transform",             # Stops Cloudflare from hiding size
+            "X-Accel-Buffering": "no",                   # Stops Coolify/Nginx from slowing down stream
+            "X-Content-Type-Options": "nosniff"
         },
-        media_type=entry["content_type"]
+        media_type=entry["content_type"] or "application/octet-stream"
     )
-
 
 # ========================================================
 # 📂 OTHER API ROUTES
