@@ -212,7 +212,7 @@ async def parallel_upload(client, file_path):
             with open(file_path, 'rb') as f:
                 f.seek(start)
                 chunk = f.read(end - start)
-            
+
             for attempt in range(5):
                 try:
                     if is_big:
@@ -235,10 +235,10 @@ async def parallel_upload(client, file_path):
 @app.get("/download/{short_id}")
 async def download_file(short_id: str, request: Request):
     entry = get_file_entry(short_id)
-    if not entry: raise HTTPException(status_code=404, detail="File not found")
+    if not entry: 
+        raise HTTPException(status_code=404, detail="File not found")
 
     file_size = int(entry["size"])
-    t_start = time.time()
     log(f"⬇️  DOWNLOAD START | {entry['filename']} | {file_size/(1024*1024):.1f}MB")
 
     try:
@@ -273,38 +273,34 @@ async def download_file(short_id: str, request: Request):
     filename_safe = entry["filename"].replace('"', '')
 
     async def stream_from_telegram():
-        async for chunk in client.iter_download(document, offset=start, limit=limit, request_size=1024 * 1024):
-            yield bytes(chunk)
+        try:
+            async for chunk in client.iter_download(document, offset=start, limit=limit, request_size=1024 * 1024):
+                yield bytes(chunk)
+        except Exception as e:
+            log(f"Stream interrupted: {e}")
 
-    # 🟢 ANTI-PROXY HEADERS (Ab size hamesha dikhega)
+    # 🟢 ANTI-PROXY HEADERS (Ab size hamesha dikhega aur buffer nahi hoga)
     headers = {
         "Content-Disposition": f'attachment; filename="{filename_safe}"',
         "Content-Type": entry["content_type"] or "application/octet-stream",
-        "Content-Length": str(limit),
         "Accept-Ranges": "bytes",
-        "Cache-Control": "no-store, no-cache, must-revalidate",
         "X-Accel-Buffering": "no",
+        "Cache-Control": "no-transform",
+        "X-Content-Type-Options": "nosniff",
         "Connection": "keep-alive"
     }
 
     if range_header:
         headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        response = StreamingResponse(stream_from_telegram(), status_code=206, headers=headers)
+        headers["Content-Length"] = str(limit)
+        return StreamingResponse(stream_from_telegram(), status_code=206, headers=headers)
     else:
-        response = StreamingResponse(stream_from_telegram(), status_code=200, headers=headers)
-
-    # Completion log
-    async def log_on_close():
-        t_end = time.time()
-        log(f"✅ DOWNLOAD DONE | {entry['filename']} | {file_size/(1024*1024):.1f}MB | {(t_end-t_start):.2f}s")
-    
-    # FastAPI ke response ke saath log attach karne ka simple tareeka
-    response.background = asyncio.create_task(log_on_close()) if asyncio.iscoroutinefunction(log_on_close) else None
-    return response
+        headers["Content-Length"] = str(file_size)
+        return StreamingResponse(stream_from_telegram(), status_code=200, headers=headers)
 
 
 # ========================================================
-# 📂 OTHER API ROUTES (Sab same rakha hai)
+# 📂 OTHER API ROUTES
 # ========================================================
 def verify_key(key: str):
     if key != INTERNAL_API_KEY: raise HTTPException(status_code=403, detail="Invalid API Key")
