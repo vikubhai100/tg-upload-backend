@@ -11,24 +11,19 @@ services:
       - BASE_URL=${BASE_URL:-http://localhost:9500}
       - API_ID=${API_ID}
       - API_HASH=${API_HASH}
+      - SESSION_STRING=${SESSION_STRING:-}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-super_secret_key_123}
       - PORT=${PORT:-9500}
     volumes:
       - telestore-data:/app/data
     restart: unless-stopped
     labels:
       - "traefik.enable=true"
-
-      # Gzip compression band karo — yahi Content-Length destroy karta tha
+      # Gzip compression band — Content-Length preserve hoga
       - "traefik.http.middlewares.telestore-nogzip.compress=false"
-
-      # Buffering band karo — direct stream hoga
-      - "traefik.http.middlewares.telestore-buffer.buffering.maxResponseBodyBytes=0"
-
-      # Custom response headers
+      # Buffering band — direct stream browser tak
       - "traefik.http.middlewares.telestore-headers.headers.customResponseHeaders.X-Accel-Buffering=no"
       - "traefik.http.middlewares.telestore-headers.headers.customResponseHeaders.Accept-Ranges=bytes"
-
-      # Sabhi middlewares ek saath apply karo
       - "traefik.http.routers.telestore.middlewares=telestore-nogzip,telestore-headers"
 
 volumes:
