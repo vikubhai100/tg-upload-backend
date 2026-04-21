@@ -3,367 +3,375 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>TeleStore — File Directory</title>
-  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet" />
+  <title>TeleStore — Cloud Storage</title>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
     :root {
-      --bg: #0a0a0f;
-      --surface: #111118;
-      --border: rgba(255,255,255,0.07);
-      --accent: #5b6ef5;
-      --accent2: #8b5cf6;
-      --green: #22d3a5;
-      --red: #f87171;
-      --text: #e8e8f0;
-      --muted: #6b6b80;
+      --primary: #6366f1;
+      --primary-hover: #4f46e5;
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --border: #e2e8f0;
+      --radius: 16px;
+      --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
     }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      background: var(--bg);
+      background-color: var(--bg);
       color: var(--text);
-      font-family: 'Syne', sans-serif;
-      min-height: 100vh;
-      overflow-x: hidden;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      line-height: 1.5;
+      transition: background 0.3s;
     }
 
-    /* Animated background grid */
-    body::before {
-      content: '';
-      position: fixed;
-      inset: 0;
-      background-image:
-        linear-gradient(rgba(91,110,245,0.04) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(91,110,245,0.04) 1px, transparent 1px);
-      background-size: 48px 48px;
-      z-index: 0;
-      pointer-events: none;
-    }
-
-    .blob {
-      position: fixed;
-      border-radius: 50%;
-      filter: blur(100px);
-      opacity: 0.15;
-      pointer-events: none;
-      z-index: 0;
-    }
-    .blob-1 { width: 500px; height: 500px; background: var(--accent); top: -100px; left: -100px; animation: drift 12s ease-in-out infinite alternate; }
-    .blob-2 { width: 400px; height: 400px; background: var(--accent2); bottom: -100px; right: -100px; animation: drift 15s ease-in-out infinite alternate-reverse; }
-
-    @keyframes drift {
-      from { transform: translate(0,0) scale(1); }
-      to { transform: translate(40px, 30px) scale(1.1); }
-    }
-
-    .wrapper {
-      position: relative;
-      z-index: 1;
-      max-width: 780px;
+    .container {
+      max-width: 900px;
       margin: 0 auto;
-      padding: 48px 24px 80px;
+      padding: 40px 20px;
     }
 
-    header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 50px; }
-    
-    .logo { display: flex; align-items: center; gap: 12px; }
-    .logo-icon { width: 40px; height: 40px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; }
-    .logo-text { font-size: 22px; font-weight: 800; letter-spacing: -0.5px; }
-    .logo-text span { color: var(--accent); }
+    /* Header */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 60px;
+    }
 
-    /* URLKING Promo Card */
-    .promo-card {
-      background: rgba(17, 17, 24, 0.6);
-      backdrop-filter: blur(12px);
-      border: 1px solid rgba(91,110,245,0.3);
-      border-radius: 20px;
-      padding: 40px;
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer; /* Secret entry point */
+      user-select: none;
+    }
+
+    .logo-icon {
+      width: 44px;
+      height: 44px;
+      background: var(--primary);
+      color: white;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      box-shadow: 0 10px 15px -3px rgba(99, 102, 241, 0.3);
+    }
+
+    .logo-text { font-size: 24px; font-weight: 800; color: var(--text); }
+    .logo-text span { color: var(--primary); }
+
+    /* URLKING Promo (Large Hero Style) */
+    #promoSection {
       text-align: center;
+      padding: 80px 40px;
+      background: var(--surface);
+      border-radius: 32px;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
       margin-bottom: 40px;
-      box-shadow: 0 0 30px rgba(91,110,245,0.1);
       position: relative;
       overflow: hidden;
     }
 
-    .promo-card::before {
+    #promoSection::before {
       content: '';
       position: absolute;
-      top: 0; left: 0; width: 100%; height: 4px;
-      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      top: -50%; left: -50%; width: 200%; height: 200%;
+      background: radial-gradient(circle, rgba(99,102,241,0.05) 0%, transparent 70%);
+      z-index: 0;
     }
 
-    .promo-card h2 {
-      font-size: 28px;
-      font-weight: 800;
-      margin-bottom: 12px;
-      background: linear-gradient(90deg, #fff, #a5b4fc);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-
-    .promo-card p {
-      color: var(--muted);
-      font-family: 'DM Mono', monospace;
-      font-size: 14px;
-      margin-bottom: 24px;
-      line-height: 1.6;
-    }
-
-    .btn-register {
+    .promo-content { position: relative; z-index: 1; }
+    .promo-badge {
       display: inline-block;
-      padding: 14px 32px;
-      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      padding: 6px 16px;
+      background: rgba(99,102,241,0.1);
+      color: var(--primary);
+      border-radius: 100px;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 24px;
+    }
+
+    .promo-content h1 {
+      font-size: 42px;
+      font-weight: 800;
+      letter-spacing: -1px;
+      margin-bottom: 20px;
+      color: var(--text);
+    }
+
+    .promo-content p {
+      font-size: 18px;
+      color: var(--text-muted);
+      max-width: 600px;
+      margin: 0 auto 32px;
+    }
+
+    .btn-cta {
+      display: inline-block;
+      padding: 16px 40px;
+      background: var(--primary);
       color: white;
       text-decoration: none;
       font-weight: 700;
-      border-radius: 12px;
-      transition: all 0.3s;
-      letter-spacing: 0.5px;
-      box-shadow: 0 8px 20px rgba(91,110,245,0.3);
+      border-radius: 14px;
+      transition: 0.2s;
     }
-    .btn-register:hover { transform: translateY(-2px); box-shadow: 0 12px 25px rgba(91,110,245,0.5); }
+    .btn-cta:hover { transform: translateY(-2px); background: var(--primary-hover); }
 
-    /* Auth Card */
+    /* Hidden Auth Modal */
+    #authModal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.4);
+      backdrop-filter: blur(8px);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+    }
+
     .auth-card {
       background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 20px;
-      padding: 40px;
+      padding: 32px;
+      border-radius: 24px;
+      width: 90%;
+      max-width: 380px;
+      box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
       text-align: center;
-      margin-bottom: 40px;
     }
 
-    .auth-card h3 { margin-bottom: 20px; font-size: 20px; }
-    
+    .auth-card h3 { margin-bottom: 20px; font-weight: 700; }
     .auth-input {
       width: 100%;
-      max-width: 300px;
-      padding: 14px 16px;
-      background: rgba(255,255,255,0.03);
+      padding: 14px;
       border: 1px solid var(--border);
-      border-radius: 10px;
-      color: var(--text);
-      font-family: 'DM Mono', monospace;
+      border-radius: 12px;
       margin-bottom: 16px;
+      font-family: 'JetBrains Mono', monospace;
       outline: none;
-      transition: border-color 0.2s;
+      text-align: center;
     }
-    .auth-input:focus { border-color: var(--accent); }
+    .auth-input:focus { border-color: var(--primary); }
 
-    .btn-login {
-      padding: 14px 32px;
-      background: rgba(91,110,245,0.15);
-      border: 1px solid rgba(91,110,245,0.3);
-      color: var(--accent);
-      font-family: 'Syne', sans-serif;
-      font-size: 14px;
+    /* Files Section */
+    #filesSection { display: none; animation: fadeIn 0.5s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+    .files-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      margin-bottom: 24px;
+    }
+
+    .file-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 18px 24px;
+      border-radius: var(--radius);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 12px;
+      transition: 0.2s;
+    }
+    .file-card:hover { border-color: var(--primary); transform: translateX(4px); box-shadow: var(--shadow); }
+
+    .file-icon { font-size: 24px; }
+    .file-info { flex: 1; }
+    .file-name { font-weight: 600; font-size: 15px; color: var(--text); margin-bottom: 2px; }
+    .file-meta { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-muted); }
+
+    .btn-download {
+      padding: 10px 20px;
+      background: #f1f5f9;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 13px;
       font-weight: 700;
       border-radius: 10px;
-      cursor: pointer;
-      transition: all 0.2s;
+      transition: 0.2s;
     }
-    .btn-login:hover { background: rgba(91,110,245,0.25); }
-    
-    .error-msg {
-      color: var(--red);
-      font-family: 'DM Mono', monospace;
-      font-size: 12px;
-      margin-top: 12px;
-      display: none;
-    }
-
-    /* Files Section (Hidden by default) */
-    .files-section { display: none; }
-    .section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
-    .section-title { font-size: 18px; font-weight: 700; }
-    .badge { font-family: 'DM Mono', monospace; font-size: 11px; background: rgba(91,110,245,0.12); color: var(--accent); padding: 4px 10px; border-radius: 100px; border: 1px solid rgba(91,110,245,0.2); }
-
-    .file-row {
-      display: flex; align-items: center; gap: 14px; padding: 16px;
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 12px; margin-bottom: 10px;
-      transition: border-color 0.2s, transform 0.15s;
-    }
-    .file-row:hover { border-color: rgba(91,110,245,0.2); transform: translateX(2px); }
-    .file-row-icon { font-size: 22px; width: 36px; text-align: center; flex-shrink: 0; }
-    .file-row-info { flex: 1; min-width: 0; }
-    .file-row-name { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .file-row-meta { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted); margin-top: 2px; }
-
-    .btn-dl {
-      background: rgba(34,211,165,0.1); border: 1px solid rgba(34,211,165,0.25);
-      color: var(--green); font-family: 'Syne', sans-serif; font-size: 12px;
-      font-weight: 600; padding: 8px 14px; border-radius: 8px; cursor: pointer;
-      text-decoration: none; transition: all 0.2s; white-space: nowrap;
-    }
-    .btn-dl:hover { background: rgba(34,211,165,0.18); }
-
-    .empty { text-align: center; padding: 40px; color: var(--muted); font-family: 'DM Mono', monospace; font-size: 13px; }
+    .btn-download:hover { background: var(--primary); color: white; }
 
     /* Pagination */
-    .pagination { display: flex; justify-content: center; align-items: center; gap: 16px; margin-top: 30px; }
-    .btn-page { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 8px; cursor: pointer; font-family: 'Syne', sans-serif; font-weight: 600; transition: all 0.2s; }
-    .btn-page:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
-    .btn-page:disabled { opacity: 0.4; cursor: not-allowed; }
-    .page-info { font-family: 'DM Mono', monospace; font-size: 13px; color: var(--muted); }
+    .pagination { display: flex; justify-content: center; align-items: center; gap: 20px; margin-top: 40px; }
+    .btn-nav {
+      padding: 10px 20px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn-nav:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    .error-txt { color: #ef4444; font-size: 12px; margin-top: 10px; display: none; }
+
+    @media (max-width: 600px) {
+      .promo-content h1 { font-size: 28px; }
+      .promo-content p { font-size: 15px; }
+    }
   </style>
 </head>
 <body>
 
-<div class="blob blob-1"></div>
-<div class="blob blob-2"></div>
-
-<div class="wrapper">
+<div class="container">
   <header>
-    <div class="logo">
+    <div class="logo" id="secretTrigger">
       <div class="logo-icon">📡</div>
       <div class="logo-text">Tele<span>Store</span></div>
     </div>
+    <div id="logoutBtn" style="display: none;">
+      <button onclick="logout()" style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-weight:600; text-decoration:underline;">Logout</button>
+    </div>
   </header>
 
-  <div class="promo-card">
-    <h2>Upload & Monetize Your Files</h2>
-    <p>Want to upload files up to 2GB for free and earn money with URL shorteners? <br> Join the ultimate platform for creators.</p>
-    <a href="https://urlking.site/" class="btn-register" target="_blank">Register on URLKING Brand →</a>
-  </div>
+  <section id="promoSection">
+    <div class="promo-content">
+      <div class="promo-badge">PRO DIRECTORY</div>
+      <h1>Cloud Storage, Reimagined.</h1>
+      <p>Securely store and manage your Telegram files with the TeleStore engine. High speed, unlimited bandwidth, and zero cost.</p>
+      <a href="https://urlking.site/" class="btn-cta" target="_blank">Monetize with URLKING →</a>
+    </div>
+  </section>
 
-  <div class="auth-card" id="authSection">
-    <h3>Admin Access</h3>
-    <input type="password" id="adminPassword" class="auth-input" placeholder="Enter Secret Key" onkeypress="handleEnter(event)" />
-    <br>
-    <button class="btn-login" onclick="verifyLogin()">View Files</button>
-    <div class="error-msg" id="authError">⚠ Invalid password. Access denied.</div>
-  </div>
-
-  <div class="files-section" id="filesSection">
-    <div class="section-header">
-      <div class="section-title">Directory</div>
-      <div style="display: flex; gap: 10px; align-items: center;">
-        <div class="badge" id="fileCount">0 files</div>
-        <button onclick="logout()" style="background: none; border: none; color: var(--red); font-size: 12px; cursor: pointer; text-decoration: underline;">Logout</button>
+  <section id="filesSection">
+    <div class="files-header">
+      <div>
+        <h2 style="font-size: 24px; font-weight: 800;">Private Directory</h2>
+        <p style="color: var(--text-muted); font-size: 14px;" id="fileCount">0 files available</p>
       </div>
     </div>
-    <div id="filesList">
-      <div class="empty">Loading files...</div>
-    </div>
+    <div id="filesList"></div>
     
-    <div class="pagination" id="paginationControls" style="display: none;">
-      <button class="btn-page" id="btnPrev" onclick="changePage(-1)">← Prev</button>
-      <div class="page-info">Page <span id="currentPage">1</span> of <span id="totalPages">1</span></div>
-      <button class="btn-page" id="btnNext" onclick="changePage(1)">Next →</button>
+    <div class="pagination" id="paginationControls">
+      <button class="btn-nav" id="btnPrev" onclick="changePage(-1)">Previous</button>
+      <span style="font-family: 'JetBrains Mono'; font-size: 14px;" id="pageInfo">Page 1 / 1</span>
+      <button class="btn-nav" id="btnNext" onclick="changePage(1)">Next</button>
     </div>
+  </section>
+</div>
+
+<div id="authModal">
+  <div class="auth-card">
+    <h3>Admin Login</h3>
+    <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">Enter your secret access key</p>
+    <input type="password" id="accessKey" class="auth-input" placeholder="••••••••" onkeypress="handleEnter(event)"/>
+    <button class="btn-cta" style="width: 100%;" onclick="verifyAccess()">Access Files</button>
+    <p class="error-txt" id="authError">Invalid Secret Key!</p>
+    <button onclick="closeModal()" style="margin-top: 15px; background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:12px;">Close</button>
   </div>
 </div>
 
 <script>
-  // CONFIG
   const API_BASE = ''; 
   let currentPage = 1;
-  const limitPerPage = 10;
   let totalPages = 1;
-  let secretKey = localStorage.getItem('telestore_key') || '';
+  let secretKey = localStorage.getItem('telestore_v2_key') || '';
+  let clickCount = 0;
 
-  function getFileIcon(filename) {
-    if (!filename) return '📄';
-    const ext = filename.split('.').pop().toLowerCase();
-    const map = {
-      pdf: '📕', doc: '📝', docx: '📝', txt: '📄', md: '📋',
-      jpg: '🖼️', jpeg: '🖼️', png: '🖼️', gif: '🎞️', webp: '🖼️', svg: '🎨',
-      mp4: '🎬', mov: '🎬', avi: '🎬', mkv: '🎬', webm: '🎬',
-      mp3: '🎵', wav: '🎵', zip: '📦', rar: '📦', apk: '📱', exe: '⚙️',
-    };
-    return map[ext] || '📄';
-  }
-
-  function handleEnter(e) {
-    if (e.key === 'Enter') verifyLogin();
-  }
-
-  function verifyLogin() {
-    const inputKey = document.getElementById('adminPassword').value;
-    if (!inputKey) return;
-    secretKey = inputKey;
-    localStorage.setItem('telestore_key', secretKey);
-    document.getElementById('authError').style.display = 'none';
-    loadFiles(1);
-  }
-
-  function logout() {
-    secretKey = '';
-    localStorage.removeItem('telestore_key');
-    document.getElementById('adminPassword').value = '';
-    document.getElementById('filesSection').style.display = 'none';
-    document.getElementById('authSection').style.display = 'block';
-  }
-
-  async function loadFiles(page = 1) {
-    if (!secretKey) return; // Don't load if no key
-
-    try {
-      const resp = await fetch(`${API_BASE}/files?page=${page}&limit=${limitPerPage}&key=${encodeURIComponent(secretKey)}`);
-      
-      if (resp.status === 403) {
-        document.getElementById('authError').style.display = 'block';
-        localStorage.removeItem('telestore_key');
-        secretKey = '';
-        return;
+  // Secret Shortcut: Logo par 3 baar click karne se modal khulega
+  document.getElementById('secretTrigger').addEventListener('click', () => {
+    clickCount++;
+    if (clickCount === 3) {
+      if (!secretKey) {
+        document.getElementById('authModal').style.display = 'flex';
+        document.getElementById('accessKey').focus();
       }
+      clickCount = 0;
+    }
+    setTimeout(() => clickCount = 0, 1000); // Reset clicks after 1s
+  });
 
-      if (!resp.ok) throw new Error("Server error");
+  function closeModal() {
+    document.getElementById('authModal').style.display = 'none';
+  }
 
-      const data = await resp.json();
-      
-      // Setup UI for success
-      document.getElementById('authSection').style.display = 'none';
-      document.getElementById('filesSection').style.display = 'block';
-      
-      currentPage = data.page;
-      totalPages = data.total_pages;
+  function handleEnter(e) { if (e.key === 'Enter') verifyAccess(); }
 
-      document.getElementById('fileCount').textContent = `${data.total} file${data.total !== 1 ? 's' : ''}`;
-      
-      const list = document.getElementById('filesList');
-      if (data.files.length === 0) {
-        list.innerHTML = '<div class="empty">No files available.</div>';
-        document.getElementById('paginationControls').style.display = 'none';
-      } else {
-        list.innerHTML = data.files.map(f => `
-          <div class="file-row">
-            <div class="file-row-icon">${getFileIcon(f.filename)}</div>
-            <div class="file-row-info">
-              <div class="file-row-name">${f.filename}</div>
-              <div class="file-row-meta">${f.size} · #${f.short_id}</div>
-            </div>
-            <a class="btn-dl" href="${f.download_link}" target="_blank">Download</a>
-          </div>
-        `).join('');
-        
-        // Update Pagination UI
-        document.getElementById('paginationControls').style.display = 'flex';
-        document.getElementById('currentPage').textContent = currentPage;
-        document.getElementById('totalPages').textContent = totalPages;
-        
-        document.getElementById('btnPrev').disabled = (currentPage <= 1);
-        document.getElementById('btnNext').disabled = (currentPage >= totalPages);
-      }
-    } catch (e) {
-      document.getElementById('authError').textContent = '⚠ Backend offline or error.';
+  async function verifyAccess() {
+    const key = document.getElementById('accessKey').value;
+    if (!key) return;
+    
+    // Check with a trial fetch
+    const ok = await loadFiles(1, key);
+    if (ok) {
+      secretKey = key;
+      localStorage.setItem('telestore_v2_key', key);
+      closeModal();
+    } else {
       document.getElementById('authError').style.display = 'block';
     }
   }
 
-  function changePage(direction) {
-    let newPage = currentPage + direction;
-    if (newPage >= 1 && newPage <= totalPages) {
-      loadFiles(newPage);
-      window.scrollTo({ top: document.getElementById('filesSection').getBoundingClientRect().top + window.scrollY - 20, behavior: 'smooth' });
+  function logout() {
+    localStorage.removeItem('telestore_v2_key');
+    location.reload();
+  }
+
+  function getIcon(name) {
+    const ext = name.split('.').pop().toLowerCase();
+    const map = { mp4:'🎬', mkv:'🎬', zip:'📦', rar:'📦', pdf:'📕', jpg:'🖼️', png:'🖼️', mp3:'🎵' };
+    return map[ext] || '📄';
+  }
+
+  async function loadFiles(page, keyToTry = secretKey) {
+    if (!keyToTry) return false;
+
+    try {
+      const res = await fetch(`${API_BASE}/files?page=${page}&limit=10&key=${encodeURIComponent(keyToTry)}`);
+      if (!res.ok) return false;
+
+      const data = await res.json();
+      
+      // Successfully authenticated
+      document.getElementById('promoSection').style.display = 'none';
+      document.getElementById('filesSection').style.display = 'block';
+      document.getElementById('logoutBtn').style.display = 'block';
+
+      currentPage = data.page;
+      totalPages = data.total_pages;
+
+      document.getElementById('fileCount').textContent = `${data.total} files managed`;
+      document.getElementById('pageInfo').textContent = `Page ${currentPage} / ${totalPages}`;
+      document.getElementById('btnPrev').disabled = currentPage <= 1;
+      document.getElementById('btnNext').disabled = currentPage >= totalPages;
+
+      const list = document.getElementById('filesList');
+      list.innerHTML = data.files.map(f => `
+        <div class="file-card">
+          <div class="file-icon">${getIcon(f.filename)}</div>
+          <div class="file-info">
+            <div class="file-name">${f.filename}</div>
+            <div class="file-meta">${f.size} • ID: ${f.short_id}</div>
+          </div>
+          <a href="${f.download_link}" class="btn-download" target="_blank">Download</a>
+        </div>
+      `).join('');
+
+      return true;
+    } catch (e) {
+      return false;
     }
   }
 
-  // Initial check if key exists in local storage
+  function changePage(dir) {
+    loadFiles(currentPage + dir);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  // Auto-load if key exists
   if (secretKey) {
-    loadFiles(currentPage);
+    loadFiles(1);
   }
 </script>
 </body>
