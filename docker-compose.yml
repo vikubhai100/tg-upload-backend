@@ -17,9 +17,19 @@ services:
     restart: unless-stopped
     labels:
       - "traefik.enable=true"
+
+      # Gzip compression band karo — yahi Content-Length destroy karta tha
+      - "traefik.http.middlewares.telestore-nogzip.compress=false"
+
+      # Buffering band karo — direct stream hoga
+      - "traefik.http.middlewares.telestore-buffer.buffering.maxResponseBodyBytes=0"
+
+      # Custom response headers
       - "traefik.http.middlewares.telestore-headers.headers.customResponseHeaders.X-Accel-Buffering=no"
       - "traefik.http.middlewares.telestore-headers.headers.customResponseHeaders.Accept-Ranges=bytes"
-      - "traefik.http.routers.telestore.middlewares=telestore-headers"
+
+      # Sabhi middlewares ek saath apply karo
+      - "traefik.http.routers.telestore.middlewares=telestore-nogzip,telestore-headers"
 
 volumes:
   telestore-data:
