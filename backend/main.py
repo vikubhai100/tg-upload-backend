@@ -237,12 +237,11 @@ async def download_head(short_id: str):
 # - Direct Telegram → client → browser stream
 # ============================================================
 @app.get("/download/{short_id}")
-async def download_file(short_id: str, request: Request):
+async def download_file(short_id: str):
     entry = get_file_entry(short_id)
     if not entry:
         raise HTTPException(status_code=404, detail="File not found")
 
-    # Ye size upload ke time DB mein save hua tha — exact hai
     file_size = int(entry["size"])
     filename_safe = entry["filename"].replace('"', '')
     content_type = entry["content_type"] or "application/octet-stream"
@@ -261,55 +260,32 @@ async def download_file(short_id: str, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Range request parse (IDM / Android multi-connection download)
-    range_header = request.headers.get("Range")
-    start = 0
-    end = file_size - 1
-
-    if range_header:
-        try:
-            parts = range_header.replace("bytes=", "").split("-")
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
-        except:
-            pass
-
-    if start >= file_size or end >= file_size or start > end:
-        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
-
-    limit = end - start + 1
-
-    # Direct Telegram stream — no disk, no buffer
     async def stream_direct():
         try:
             async for chunk in client.iter_download(
                 document,
-                offset=start,
-                limit=limit,
-                request_size=2 * 1024 * 1024  # 2MB per request = fast
+                request_size=2 * 1024 * 1024,
             ):
                 yield bytes(chunk)
         except Exception as e:
             log(f"Stream error: {e}")
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename_safe}"',
-        "Content-Type": content_type,
-        "Accept-Ranges": "bytes",
-        "X-Accel-Buffering": "no",
-        "Cache-Control": "no-store, no-transform",
-        "Connection": "keep-alive",
-    }
+    log(f"STREAMING | {file_size/(1024*1024):.1f} MB")
 
-    if range_header:
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        headers["Content-Length"] = str(limit)
-        log(f"RANGE | {start}-{end}/{file_size}")
-        return StreamingResponse(stream_direct(), status_code=206, headers=headers, media_type=content_type)
-    else:
-        headers["Content-Length"] = str(file_size)
-        log(f"FULL | {file_size/(1024*1024):.1f} MB")
-        return StreamingResponse(stream_direct(), status_code=200, headers=headers, media_type=content_type)
+    # status_code nahi dena — working code ki tarah bilkul
+    # Content-Length DB se exact size — yahi real fix hai
+    return StreamingResponse(
+        stream_direct(),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename_safe}"',
+            "Content-Type": content_type,
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+            "X-Accel-Buffering": "no",
+            "X-Content-Type-Options": "nosniff",
+        },
+        media_type=content_type
+    )
 
 
 def verify_key(key: str):
