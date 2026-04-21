@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>TeleStore — Cloud Storage</title>
+  <title>URLKING — Cloud Storage</title>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <style>
     :root {
@@ -46,7 +46,7 @@
       display: flex;
       align-items: center;
       gap: 12px;
-      cursor: pointer; /* Secret entry point */
+      cursor: pointer;
       user-select: none;
     }
 
@@ -66,7 +66,7 @@
     .logo-text { font-size: 24px; font-weight: 800; color: var(--text); }
     .logo-text span { color: var(--primary); }
 
-    /* URLKING Promo (Large Hero Style) */
+    /* URLKING Promo */
     #promoSection {
       text-align: center;
       padding: 80px 40px;
@@ -172,26 +172,54 @@
       margin-bottom: 24px;
     }
 
+    /* FIX: Improved Structure for File Cards */
     .file-card {
       background: var(--surface);
       border: 1px solid var(--border);
-      padding: 18px 24px;
+      padding: 16px 20px;
       border-radius: var(--radius);
       display: flex;
       align-items: center;
       gap: 16px;
       margin-bottom: 12px;
       transition: 0.2s;
+      overflow: hidden; /* Prevents overflow completely */
     }
-    .file-card:hover { border-color: var(--primary); transform: translateX(4px); box-shadow: var(--shadow); }
+    
+    .file-card:hover { 
+      border-color: var(--primary); 
+      transform: translateX(4px); 
+      box-shadow: var(--shadow); 
+    }
 
-    .file-icon { font-size: 24px; }
-    .file-info { flex: 1; }
-    .file-name { font-weight: 600; font-size: 15px; color: var(--text); margin-bottom: 2px; }
-    .file-meta { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-muted); }
+    .file-icon { 
+      font-size: 24px; 
+      flex-shrink: 0; /* Icon size fix */
+    }
+    
+    .file-info { 
+      flex: 1; 
+      min-width: 0; /* CRITICAL FIX: Allows text to truncate inside flexbox */
+    }
+    
+    .file-name { 
+      font-weight: 600; 
+      font-size: 15px; 
+      color: var(--text); 
+      margin-bottom: 4px;
+      white-space: nowrap; /* Forces single line */
+      overflow: hidden;    /* Hides extra text */
+      text-overflow: ellipsis; /* Adds ... at the end */
+    }
+    
+    .file-meta { 
+      font-family: 'JetBrains Mono', monospace; 
+      font-size: 12px; 
+      color: var(--text-muted); 
+    }
 
     .btn-download {
-      padding: 10px 20px;
+      padding: 10px 16px;
       background: #f1f5f9;
       color: var(--text);
       text-decoration: none;
@@ -199,6 +227,8 @@
       font-weight: 700;
       border-radius: 10px;
       transition: 0.2s;
+      flex-shrink: 0; /* CRITICAL FIX: Keeps button size intact */
+      white-space: nowrap;
     }
     .btn-download:hover { background: var(--primary); color: white; }
 
@@ -216,9 +246,13 @@
 
     .error-txt { color: #ef4444; font-size: 12px; margin-top: 10px; display: none; }
 
+    /* Mobile adjustments */
     @media (max-width: 600px) {
       .promo-content h1 { font-size: 28px; }
       .promo-content p { font-size: 15px; }
+      .file-card { padding: 14px 16px; gap: 12px; }
+      .btn-download { padding: 8px 14px; font-size: 12px; }
+      .file-name { font-size: 14px; }
     }
   </style>
 </head>
@@ -227,8 +261,8 @@
 <div class="container">
   <header>
     <div class="logo" id="secretTrigger">
-      <div class="logo-icon">📡</div>
-      <div class="logo-text">Tele<span>Store</span></div>
+      <div class="logo-icon">☁️</div>
+      <div class="logo-text">URL<span>KING</span></div>
     </div>
     <div id="logoutBtn" style="display: none;">
       <button onclick="logout()" style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-weight:600; text-decoration:underline;">Logout</button>
@@ -237,10 +271,10 @@
 
   <section id="promoSection">
     <div class="promo-content">
-      <div class="promo-badge">PRO DIRECTORY</div>
-      <h1>Cloud Storage, Reimagined.</h1>
-      <p>Securely store and manage your Telegram files with the TeleStore engine. High speed, unlimited bandwidth, and zero cost.</p>
-      <a href="https://urlking.site/" class="btn-cta" target="_blank">Monetize with URLKING →</a>
+      <div class="promo-badge">CLOUD STORAGE</div>
+      <h1>Secure File Storage, Simplified.</h1>
+      <p>Upload, store, and manage your files securely with URLKING Cloud Storage. High speed, unlimited bandwidth, and seamless monetization.</p>
+      <a href="https://urlking.site/" class="btn-cta" target="_blank">Join URLKING Today →</a>
     </div>
   </section>
 
@@ -279,7 +313,7 @@
   let secretKey = localStorage.getItem('telestore_v2_key') || '';
   let clickCount = 0;
 
-  // Secret Shortcut: Logo par 3 baar click karne se modal khulega
+  // Secret shortcut triggers modal
   document.getElementById('secretTrigger').addEventListener('click', () => {
     clickCount++;
     if (clickCount === 3) {
@@ -289,7 +323,7 @@
       }
       clickCount = 0;
     }
-    setTimeout(() => clickCount = 0, 1000); // Reset clicks after 1s
+    setTimeout(() => clickCount = 0, 1000); 
   });
 
   function closeModal() {
@@ -302,7 +336,6 @@
     const key = document.getElementById('accessKey').value;
     if (!key) return;
     
-    // Check with a trial fetch
     const ok = await loadFiles(1, key);
     if (ok) {
       secretKey = key;
@@ -320,7 +353,7 @@
 
   function getIcon(name) {
     const ext = name.split('.').pop().toLowerCase();
-    const map = { mp4:'🎬', mkv:'🎬', zip:'📦', rar:'📦', pdf:'📕', jpg:'🖼️', png:'🖼️', mp3:'🎵' };
+    const map = { mp4:'🎬', mkv:'🎬', zip:'📦', rar:'📦', pdf:'📕', jpg:'🖼️', png:'🖼️', mp3:'🎵', apk:'📱', apks:'📱' };
     return map[ext] || '📄';
   }
 
@@ -333,7 +366,6 @@
 
       const data = await res.json();
       
-      // Successfully authenticated
       document.getElementById('promoSection').style.display = 'none';
       document.getElementById('filesSection').style.display = 'block';
       document.getElementById('logoutBtn').style.display = 'block';
@@ -351,7 +383,7 @@
         <div class="file-card">
           <div class="file-icon">${getIcon(f.filename)}</div>
           <div class="file-info">
-            <div class="file-name">${f.filename}</div>
+            <div class="file-name" title="${f.filename}">${f.filename}</div>
             <div class="file-meta">${f.size} • ID: ${f.short_id}</div>
           </div>
           <a href="${f.download_link}" class="btn-download" target="_blank">Download</a>
@@ -369,7 +401,6 @@
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
-  // Auto-load if key exists
   if (secretKey) {
     loadFiles(1);
   }
