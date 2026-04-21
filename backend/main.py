@@ -54,10 +54,9 @@ if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 # ============================================================
-# TELEGRAM CLIENT — startup pe connect, har request pe reuse
+# TELEGRAM CLIENT
 # ============================================================
 _client = None
-_client_lock = asyncio.Lock() if False else None  # placeholder
 
 async def get_client():
     global _client
@@ -82,7 +81,7 @@ def format_size(size_bytes):
     return f"{size_bytes:.1f} TB"
 
 # ============================================================
-# DATABASE — WAL mode + connection pooling
+# DATABASE — WAL mode
 # ============================================================
 _db_lock = threading.Lock()
 
@@ -101,7 +100,6 @@ def init_db():
         file_reference TEXT,
         dc_id       INTEGER
     )''')
-    # WAL mode — concurrent reads fast, writes non-blocking
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=10000")
@@ -141,7 +139,7 @@ def delete_file_entry(short_id):
         conn.close()
 
 # ============================================================
-# STARTUP — pehle se connect karo
+# STARTUP
 # ============================================================
 @app.on_event("startup")
 async def startup_event():
@@ -163,7 +161,7 @@ async def root():
 async def favicon(): return HTMLResponse("")
 
 # ============================================================
-# PARALLEL HTTP DOWNLOADER (remote upload ke liye)
+# PARALLEL HTTP DOWNLOADER
 # ============================================================
 async def fast_http_download(url: str, output_file: str, max_workers: int = 15):
     async with aiohttp.ClientSession() as session:
@@ -209,8 +207,7 @@ async def fast_http_download(url: str, output_file: str, max_workers: int = 15):
         return total_size
 
 # ============================================================
-# OPTIMIZED UPLOAD — Telethon built-in, workers=4, part_size_kb=512
-# Manual parallel overhead hataya — Telethon khud manage karta hai
+# ✅ FIXED UPLOAD — workers=4 hataya (version compatibility fix)
 # ============================================================
 async def optimized_upload(client, file_path):
     file_size = os.path.getsize(file_path)
@@ -218,13 +215,12 @@ async def optimized_upload(client, file_path):
 
     uploaded = await client.upload_file(
         file_path,
-        part_size_kb=512,   # Telegram ka max — fastest
-        workers=4,           # 4 parallel workers — sweet spot, flood se bachta hai
+        part_size_kb=512,   # Telegram max — fastest
     )
     return uploaded
 
 # ============================================================
-# HEAD — Android/IDM size pata karne ke liye (DB se, no TG call)
+# HEAD — size check ke liye
 # ============================================================
 @app.head("/download/{short_id}")
 async def download_head(short_id: str):
@@ -243,8 +239,7 @@ async def download_head(short_id: str):
     )
 
 # ============================================================
-# DOWNLOAD — Direct stream, no temp file, DB se exact size
-# Gzip Coolify mein band karo — tab Content-Length sahi aayega
+# DOWNLOAD
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_file(short_id: str):
@@ -274,7 +269,7 @@ async def download_file(short_id: str):
         try:
             async for chunk in client.iter_download(
                 document,
-                request_size=4 * 1024 * 1024,  # 4MB chunks — fast download
+                request_size=4 * 1024 * 1024,
             ):
                 yield bytes(chunk)
         except Exception as e:
@@ -343,7 +338,6 @@ async def mock_upload(key: str, file_0: UploadFile = File(...)):
     tmp.close()
 
     try:
-        # 4MB chunks mein receive karo — memory efficient
         def write_sync(chunk):
             with open(tmp_path, 'ab') as f: f.write(chunk)
         while True:
