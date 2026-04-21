@@ -2,24 +2,26 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy backend
-COPY backend/ ./backend/
+# uvloop install — asyncio se 2x fast event loop
+RUN pip install --no-cache-dir -r requirements.txt uvloop
 
-# Copy frontend into a static folder
-COPY frontend/ ./frontend/
+COPY . .
 
-# Serve frontend via FastAPI static files
-RUN pip install --no-cache-dir aiofiles
+RUN mkdir -p /app/data
 
 EXPOSE 9500
 
-ENV BOT_TOKEN=""
-ENV CHANNEL_ID=""
-ENV BASE_URL="http://localhost:9500"
-ENV PORT=9500
-
-CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-9500}"]
+# uvloop use karo — 2x faster async, 2 workers
+CMD ["uvicorn", "backend.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "9500", \
+     "--workers", "2", \
+     "--loop", "uvloop", \
+     "--timeout-keep-alive", "75"]
