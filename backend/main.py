@@ -8,12 +8,12 @@ import math
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 import sys
 
 # 🟢 FAST DOWNLOAD LIBRARIES
-import aiohttp 
+import aiohttp
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -230,12 +230,40 @@ async def parallel_upload(client, file_path):
     return InputFileBig(id=file_id, parts=total_parts, name=file_name)
 
 # ========================================================
-# 📂 🟢 100% PERFECT DOWNLOAD ROUTE (Fixes '?' Size & Speed)
+# ✅ FIX 1: HEAD REQUEST — Android/IDM size pata karne ke liye
+# Ye route hona chahiye GET se PEHLE
+# ========================================================
+@app.head("/download/{short_id}")
+async def download_file_head(short_id: str):
+    entry = get_file_entry(short_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_size = int(entry["size"])
+    filename_safe = entry["filename"].replace('"', '')
+    content_type = entry["content_type"] or "application/octet-stream"
+
+    # Body nahi, sirf headers — downloader ko size milega
+    return Response(
+        status_code=200,
+        headers={
+            "Content-Length": str(file_size),
+            "Content-Type": content_type,
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'attachment; filename="{filename_safe}"',
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+# ========================================================
+# 📂 ✅ FIX 2: PERFECT DOWNLOAD ROUTE
+# Content-Length hamesha set, Range bhi support, speed fast
 # ========================================================
 @app.get("/download/{short_id}")
 async def download_file(short_id: str, request: Request):
     entry = get_file_entry(short_id)
-    if not entry: 
+    if not entry:
         raise HTTPException(status_code=404, detail="File not found")
 
     file_size = int(entry["size"])
@@ -250,10 +278,12 @@ async def download_file(short_id: str, request: Request):
             raise HTTPException(status_code=404, detail="File deleted from Telegram")
 
         document = message.document
-    except Exception as e: 
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # 🟢 MAGIC: Handling Browser/IDM Range Requests for Exact Size
+    # ✅ Range Request handle karo (IDM/Android multi-part download)
     range_header = request.headers.get("Range")
     start = 0
     end = file_size - 1
@@ -266,37 +296,60 @@ async def download_file(short_id: str, request: Request):
         except:
             pass
 
-    if start >= file_size or end >= file_size:
-        return StreamingResponse(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+    # ✅ Invalid range — 416 return karo
+    if start >= file_size or end >= file_size or start > end:
+        return Response(
+            status_code=416,
+            headers={"Content-Range": f"bytes */{file_size}"}
+        )
 
     limit = end - start + 1
     filename_safe = entry["filename"].replace('"', '')
+    content_type = entry["content_type"] or "application/octet-stream"
 
+    # ✅ FIX 3: request_size 2MB kiya — faster streaming from Telegram
     async def stream_from_telegram():
         try:
-            async for chunk in client.iter_download(document, offset=start, limit=limit, request_size=1024 * 1024):
+            async for chunk in client.iter_download(
+                document,
+                offset=start,
+                limit=limit,
+                request_size=2 * 1024 * 1024  # 1MB → 2MB: speed boost
+            ):
                 yield bytes(chunk)
         except Exception as e:
             log(f"Stream interrupted: {e}")
 
-    # 🟢 ANTI-PROXY HEADERS (Ab size hamesha dikhega aur buffer nahi hoga)
-    headers = {
+    # ✅ FIX 4: Base headers — Content-Length HAMESHA set karo
+    base_headers = {
         "Content-Disposition": f'attachment; filename="{filename_safe}"',
-        "Content-Type": entry["content_type"] or "application/octet-stream",
+        "Content-Type": content_type,
         "Accept-Ranges": "bytes",
         "X-Accel-Buffering": "no",
-        "Cache-Control": "no-transform",
+        "Cache-Control": "no-store, no-transform",
         "X-Content-Type-Options": "nosniff",
-        "Connection": "keep-alive"
+        "Connection": "keep-alive",
     }
 
     if range_header:
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        headers["Content-Length"] = str(limit)
-        return StreamingResponse(stream_from_telegram(), status_code=206, headers=headers)
+        # Partial content (206) — IDM/Android parallel download ke liye
+        base_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        base_headers["Content-Length"] = str(limit)
+        log(f"📦 RANGE REQUEST | bytes {start}-{end}/{file_size} | {limit/(1024*1024):.1f}MB")
+        return StreamingResponse(
+            stream_from_telegram(),
+            status_code=206,
+            headers=base_headers
+        )
     else:
-        headers["Content-Length"] = str(file_size)
-        return StreamingResponse(stream_from_telegram(), status_code=200, headers=headers)
+        # Full download — Content-Length full file size
+        base_headers["Content-Length"] = str(file_size)
+        log(f"📦 FULL DOWNLOAD | {file_size/(1024*1024):.1f}MB")
+        return StreamingResponse(
+            stream_from_telegram(),
+            status_code=200,
+            headers=base_headers
+        )
 
 
 # ========================================================
@@ -349,7 +402,7 @@ async def mock_upload(key: str, file_0: UploadFile = File(...)):
             with open(tmp_path, 'ab') as f: f.write(chunk)
 
         while True:
-            chunk = await file_0.read(10 * 1024 * 1024) 
+            chunk = await file_0.read(10 * 1024 * 1024)
             if not chunk: break
             await asyncio.to_thread(write_sync, chunk)
 
@@ -391,7 +444,7 @@ async def mock_remote_upload(request: Request):
         suffix = Path(filename).suffix or ".bin"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         tmp_path = tmp.name
-        tmp.close() 
+        tmp.close()
 
         log(f"📥 PYTHON IDM DOWNLOADING | {filename}")
         file_size = await fast_http_download(url, tmp_path, max_workers=15)
@@ -434,7 +487,7 @@ async def mock_clone(key: str, file_code: str):
     entry = get_file_entry(file_code)
     if not entry: return {"status": 404, "msg": "Source file not found"}
     new_code = str(uuid.uuid4())[:8]
-    save_file_entry(new_code, entry) 
+    save_file_entry(new_code, entry)
     return {"status": 200, "result": {"url": f"{BASE_URL}/download/{new_code}", "filecode": new_code}}
 
 @app.get("/api/file/rename")
