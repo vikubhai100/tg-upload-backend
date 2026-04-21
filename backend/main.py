@@ -17,6 +17,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import InputFileBig
 from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
+from fastapi import Query # Ise upar imports mein add kar lena agar nahi hai toh
 
 LOG_FILE = "/tmp/telestore.log"
 sys.stdout = sys.stderr
@@ -295,15 +296,34 @@ def verify_key(key: str):
     if key != INTERNAL_API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
 
+
 @app.get("/files")
-async def list_files():
+async def list_files(page: int = 1, limit: int = 10, key: str = ""):
+    # Password check
+    if key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid Password")
+
     conn = get_db_connection()
-    rows = conn.execute("SELECT short_id, filename, size FROM files ORDER BY rowid DESC LIMIT 100").fetchall()
+    offset = (page - 1) * limit
+    
+    # Get total count for pagination
+    total_row = conn.execute("SELECT COUNT(*) as count FROM files").fetchone()
+    total_count = total_row["count"]
+    
+    # Fetch paginated rows
+    rows = conn.execute("SELECT short_id, filename, size FROM files ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
     conn.close()
+    
+    total_pages = math.ceil(total_count / limit) if total_count > 0 else 1
+    
     return {
         "files": [{"short_id": r["short_id"], "filename": r["filename"], "size": format_size(r["size"]), "download_link": f"{BASE_URL}/download/{r['short_id']}"} for r in rows],
-        "total": len(rows)
+        "total": total_count,
+        "page": page,
+        "total_pages": total_pages,
+        "limit": limit
     }
+
 
 @app.get("/info/{short_id}")
 async def file_info(short_id: str):
