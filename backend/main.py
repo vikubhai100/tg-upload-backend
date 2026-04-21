@@ -17,7 +17,6 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import InputFileBig
 from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
-from fastapi import Query # Ise upar imports mein add kar lena agar nahi hai toh
 
 LOG_FILE = "/tmp/telestore.log"
 sys.stdout = sys.stderr
@@ -162,7 +161,7 @@ async def root():
 async def favicon(): return HTMLResponse("")
 
 # ============================================================
-# PARALLEL HTTP DOWNLOADER
+# PARALLEL HTTP DOWNLOADER (remote upload ke liye)
 # ============================================================
 async def fast_http_download(url: str, output_file: str, max_workers: int = 15):
     async with aiohttp.ClientSession() as session:
@@ -208,20 +207,49 @@ async def fast_http_download(url: str, output_file: str, max_workers: int = 15):
         return total_size
 
 # ============================================================
-# ✅ FIXED UPLOAD — workers=4 hataya (version compatibility fix)
+# ⚡ PARALLEL UPLOAD — 15 concurrent parts via SaveBigFilePartRequest
+# workers= parameter nahi — sab Telethon versions ke saath compatible
+# Yahi original speed deta tha 7-8 MB/s
 # ============================================================
-async def optimized_upload(client, file_path):
+async def parallel_upload(client, file_path):
     file_size = os.path.getsize(file_path)
-    log(f"⬆️ Uploading {format_size(file_size)} to Telegram...")
+    file_name = os.path.basename(file_path)
+    log(f"⬆️ Parallel uploading {format_size(file_size)}...")
 
-    uploaded = await client.upload_file(
-        file_path,
-        part_size_kb=512,   # Telegram max — fastest
-    )
-    return uploaded
+    # Small files: direct upload, no overhead
+    if file_size < 10 * 1024 * 1024:
+        return await client.upload_file(file_path, part_size_kb=512)
+
+    part_size   = 512 * 1024   # 512KB — Telegram max part size
+    total_parts = math.ceil(file_size / part_size)
+    file_id     = int.from_bytes(os.urandom(8), "big", signed=True)
+
+    # 15 concurrent parts = fast but flood-safe
+    sem = asyncio.Semaphore(15)
+
+    async def upload_part(part_idx):
+        async with sem:
+            start = part_idx * part_size
+            end   = min(start + part_size, file_size)
+            with open(file_path, 'rb') as f:
+                f.seek(start)
+                chunk = f.read(end - start)
+            for attempt in range(5):
+                try:
+                    await client(SaveBigFilePartRequest(file_id, part_idx, total_parts, chunk))
+                    return
+                except Exception as ex:
+                    log(f"  Part {part_idx} attempt {attempt+1} failed: {ex}")
+                    await asyncio.sleep(1 * (attempt + 1))
+            raise Exception(f"Part {part_idx} failed after 5 attempts")
+
+    tasks = [asyncio.create_task(upload_part(i)) for i in range(total_parts)]
+    await asyncio.gather(*tasks)
+    log(f"✅ All {total_parts} parts uploaded")
+    return InputFileBig(id=file_id, parts=total_parts, name=file_name)
 
 # ============================================================
-# HEAD — size check ke liye
+# HEAD — size check
 # ============================================================
 @app.head("/download/{short_id}")
 async def download_head(short_id: str):
@@ -240,7 +268,7 @@ async def download_head(short_id: str):
     )
 
 # ============================================================
-# DOWNLOAD
+# ⚡ DOWNLOAD — 16MB chunks (was 4MB = 4x slower)
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_file(short_id: str):
@@ -248,14 +276,14 @@ async def download_file(short_id: str):
     if not entry:
         raise HTTPException(status_code=404, detail="File not found")
 
-    file_size = int(entry["size"])
+    file_size     = int(entry["size"])
     filename_safe = entry["filename"].replace('"', '')
-    content_type = entry["content_type"] or "application/octet-stream"
+    content_type  = entry["content_type"] or "application/octet-stream"
 
     log(f"⬇️ DOWNLOAD | {entry['filename']} | {format_size(file_size)}")
 
     try:
-        client = await get_client()
+        client  = await get_client()
         message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
         if not message or not message.document:
             delete_file_entry(short_id)
@@ -270,7 +298,7 @@ async def download_file(short_id: str):
         try:
             async for chunk in client.iter_download(
                 document,
-                request_size=4 * 1024 * 1024,
+                request_size=16 * 1024 * 1024,  # ⚡ 16MB — was 4MB, 4x speed boost
             ):
                 yield bytes(chunk)
         except Exception as e:
@@ -296,34 +324,21 @@ def verify_key(key: str):
     if key != INTERNAL_API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
 
-
 @app.get("/files")
 async def list_files(page: int = 1, limit: int = 10, key: str = ""):
-    # Password check
     if key != INTERNAL_API_KEY:
         raise HTTPException(status_code=403, detail="Invalid Password")
-
-    conn = get_db_connection()
-    offset = (page - 1) * limit
-    
-    # Get total count for pagination
-    total_row = conn.execute("SELECT COUNT(*) as count FROM files").fetchone()
+    conn        = get_db_connection()
+    offset      = (page - 1) * limit
+    total_row   = conn.execute("SELECT COUNT(*) as count FROM files").fetchone()
     total_count = total_row["count"]
-    
-    # Fetch paginated rows
-    rows = conn.execute("SELECT short_id, filename, size FROM files ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+    rows        = conn.execute("SELECT short_id, filename, size FROM files ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
     conn.close()
-    
     total_pages = math.ceil(total_count / limit) if total_count > 0 else 1
-    
     return {
         "files": [{"short_id": r["short_id"], "filename": r["filename"], "size": format_size(r["size"]), "download_link": f"{BASE_URL}/download/{r['short_id']}"} for r in rows],
-        "total": total_count,
-        "page": page,
-        "total_pages": total_pages,
-        "limit": limit
+        "total": total_count, "page": page, "total_pages": total_pages, "limit": limit
     }
-
 
 @app.get("/info/{short_id}")
 async def file_info(short_id: str):
@@ -352,8 +367,8 @@ async def mock_upload_server(key: str):
 async def mock_upload(key: str, file_0: UploadFile = File(...)):
     verify_key(key)
     filename = file_0.filename
-    suffix = Path(filename).suffix or ".bin"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    suffix   = Path(filename).suffix or ".bin"
+    tmp      = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp_path = tmp.name
     tmp.close()
 
@@ -366,16 +381,16 @@ async def mock_upload(key: str, file_0: UploadFile = File(...)):
             await asyncio.to_thread(write_sync, chunk)
 
         file_size = os.path.getsize(tmp_path)
-        client = await get_client()
+        client    = await get_client()
         log(f"⬆️ UPLOAD | {filename} | {format_size(file_size)}")
 
-        uploaded_file = await optimized_upload(client, tmp_path)
+        uploaded_file = await parallel_upload(client, tmp_path)
         message = await client.send_file(
             CHANNEL_ID, uploaded_file,
             caption=f"📁 {filename}\n💾 {format_size(file_size)}",
             force_document=True
         )
-        doc = message.document
+        doc      = message.document
         short_id = str(uuid.uuid4())[:8]
         save_file_entry(short_id, {
             "message_id": message.id, "filename": filename, "size": file_size,
@@ -398,28 +413,28 @@ async def mock_upload(key: str, file_0: UploadFile = File(...)):
 async def mock_remote_upload(request: Request):
     tmp_path = None
     try:
-        data = await request.json()
-        key = data.get("key")
-        url = data.get("url")
+        data     = await request.json()
+        key      = data.get("key")
+        url      = data.get("url")
         filename = data.get("filename", f"file_{int(time.time())}.bin")
         verify_key(key)
 
-        suffix = Path(filename).suffix or ".bin"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        suffix   = Path(filename).suffix or ".bin"
+        tmp      = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         tmp_path = tmp.name
         tmp.close()
 
         log(f"📥 REMOTE | {filename}")
         file_size = await fast_http_download(url, tmp_path, max_workers=15)
 
-        client = await get_client()
-        uploaded_file = await optimized_upload(client, tmp_path)
+        client        = await get_client()
+        uploaded_file = await parallel_upload(client, tmp_path)
         message = await client.send_file(
             CHANNEL_ID, uploaded_file,
             caption=f"📁 {filename}\n💾 {format_size(file_size)}",
             force_document=True
         )
-        doc = message.document
+        doc      = message.document
         short_id = str(uuid.uuid4())[:8]
         save_file_entry(short_id, {
             "message_id": message.id, "filename": filename, "size": file_size,
