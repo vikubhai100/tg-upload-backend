@@ -7,17 +7,17 @@ import sqlite3
 import threading
 import math
 from pathlib import Path
-from urllib.parse import quote # Zaroori for Emojis
+from urllib.parse import quote
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import StreamingResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 import sys
 import aiohttp
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import InputFileBig
-from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
+from telethon.tl.functions.upload import SaveBigFilePartRequest
 
 LOG_FILE = "/tmp/telestore.log"
 sys.stdout = sys.stderr
@@ -55,7 +55,7 @@ if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 # ============================================================
-# TELEGRAM CLIENT
+# TELEGRAM CLIENT (Optimized for Multi-Thread)
 # ============================================================
 _client = None
 
@@ -64,11 +64,14 @@ async def get_client():
     if _client and _client.is_connected():
         return _client
     session = StringSession(SESSION_STR) if SESSION_STR else StringSession()
+    
+    # ⚡ Speed & Connection Fixes
     _client = TelegramClient(
         session, API_ID, API_HASH,
-        connection_retries=10,
+        connection_retries=15,
         retry_delay=2,
-        request_retries=5,
+        request_retries=10, 
+        flood_sleep_threshold=15, # Chote flood waits ko ignore karega
     )
     await _client.start(bot_token=BOT_TOKEN)
     return _client
@@ -82,7 +85,7 @@ def format_size(size_bytes):
     return f"{size_bytes:.1f} TB"
 
 # ============================================================
-# DATABASE — WAL mode
+# DATABASE SETUP
 # ============================================================
 _db_lock = threading.Lock()
 
@@ -149,7 +152,7 @@ async def root():
     return HTMLResponse(content="<h1>TeleStore Running</h1>")
 
 # ============================================================
-# ⚡ UPLOAD LOGIC (Optimized 15 Workers)
+# ⚡ UPLOAD LOGIC
 # ============================================================
 async def parallel_upload(client, file_path):
     file_size = os.path.getsize(file_path)
@@ -176,7 +179,7 @@ async def parallel_upload(client, file_path):
     return InputFileBig(id=file_id, parts=total_parts, name=file_name)
 
 # ============================================================
-# ⚡ DOWNLOAD LOGIC (Range Support + Unicode Fix)
+# ⚡ DOWNLOAD LOGIC (CHROME & ADM FULLY SUPPORTED)
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
@@ -187,15 +190,26 @@ async def download_file(request: Request, short_id: str):
     filename_raw = entry["filename"]
     content_type = entry["content_type"] or "application/octet-stream"
 
-    # --- SPEED FIX: Handle Range Header for Multi-Threading ---
+    # --- 🛠️ Chrome & Browser Math Fix ---
     range_header = request.headers.get("Range")
     start_byte = 0
+    end_byte = file_size - 1
+
     if range_header:
         try:
-            # Example: bytes=1024-
-            start_byte = int(range_header.replace("bytes=", "").split("-")[0])
-        except:
+            range_str = range_header.replace("bytes=", "").split("-")
+            start_byte = int(range_str[0]) if range_str[0] else 0
+            if len(range_str) > 1 and range_str[1]:
+                end_byte = int(range_str[1])
+        except Exception:
             start_byte = 0
+            end_byte = file_size - 1
+
+    # Agar browser file size ke bahar ka data maange
+    if start_byte >= file_size:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+
+    content_length = end_byte - start_byte + 1
 
     try:
         client  = await get_client()
@@ -207,35 +221,35 @@ async def download_file(request: Request, short_id: str):
 
         async def stream_direct():
             try:
-                # offset ensures each thread starts at the correct byte
                 async for chunk in client.iter_download(
                     document,
                     offset=start_byte,
-                    request_size=16 * 1024 * 1024, # ⚡ High-speed chunks
+                    request_size=4 * 1024 * 1024, # 4MB keeps browsers stable without timeout
                 ):
                     yield bytes(chunk)
+            except asyncio.CancelledError:
+                # Browser ne download pause ya cancel kar diya (No Crash)
+                pass
             except Exception as e:
                 log(f"Stream error: {e}")
 
-        # --- UNICODE/EMOJI FIX: RFC 5987 Encoding ---
         encoded_filename = quote(filename_raw)
         
         headers = {
-            # Use filename* for special characters/emojis
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
             "Content-Type": content_type,
-            "Content-Length": str(file_size - start_byte),
+            "Content-Length": str(content_length),
             "Accept-Ranges": "bytes",
-            "X-Accel-Buffering": "no", # Critical for Coolify/Nginx speed
-            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no", 
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         }
         
-        # 206 Partial Content is required for multi-thread downloads
-        status_code = 206 if range_header else 200
+        # Proper HTTP 206 execution for Chrome
         if range_header:
-            headers["Content-Range"] = f"bytes {start_byte}-{file_size-1}/{file_size}"
-
-        return StreamingResponse(stream_direct(), status_code=status_code, headers=headers)
+            headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
+            return StreamingResponse(stream_direct(), status_code=206, headers=headers)
+        else:
+            return StreamingResponse(stream_direct(), status_code=200, headers=headers)
 
     except Exception as e:
         log(f"❌ DOWNLOAD ERROR: {e}")
@@ -258,8 +272,8 @@ async def index_forwarded(key: str, message_id: int, filename: str):
         doc = message.document
         short_id = str(uuid.uuid4())[:8]
         save_file_entry(short_id, {
-            "message_id": message.id, "filename": filename, "size": doc.size,
-            "content_type": message.file.mime_type, "channel_id": CHANNEL_ID,
+            "message_id": message.id, "filename": filename, "size": getattr(doc, 'size', 0),
+            "content_type": getattr(message.file, 'mime_type', "application/octet-stream"), "channel_id": CHANNEL_ID,
             "doc_id": doc.id, "access_hash": doc.access_hash,
             "file_reference": doc.file_reference.hex(), "dc_id": doc.dc_id,
         })
