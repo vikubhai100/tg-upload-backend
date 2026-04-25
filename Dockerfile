@@ -1,9 +1,11 @@
-FROM python:3.11-slim
+# 1. 'slim-bookworm' use karein jo ki stable hai (trixie unstable hai)
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# System deps - Yahan maine 'curl' add kar diya hai healthcheck ke liye
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 2. System deps with Retries - Contabo ke flaky network ke liye best hai
+RUN apt-get update -y && \
+    apt-get install -y -o Acquire::Retries=3 --no-install-recommends \
     gcc \
     curl \
     && rm -rf /var/lib/apt/lists/*
