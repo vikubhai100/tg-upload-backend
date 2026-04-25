@@ -363,6 +363,49 @@ async def mock_upload_server(key: str):
     verify_key(key)
     return {"status": 200, "result": f"{BASE_URL}/api/upload?key={key}", "sess_id": "telegram_session"}
 
+# ============================================================
+# ⚡ NEW: INSTANT FORWARD INDEXING API (0 Seconds)
+# ============================================================
+@app.get("/api/index_forwarded")
+async def index_forwarded(key: str, message_id: int, filename: str):
+    verify_key(key)
+    try:
+        client = await get_client()
+        # Fetch the specific message from the channel using the ID from the Node.js bot
+        message = await client.get_messages(CHANNEL_ID, ids=message_id)
+        
+        if not message or not message.document:
+            log(f"❌ INDEX ERROR: Message or document not found for ID {message_id}")
+            return {"error": "Message or Document not found in channel"}
+            
+        doc = message.document
+        file_size = getattr(doc, 'size', 0)
+        
+        # Determine content type (fallback to octet-stream if unknown)
+        content_type = getattr(message.file, 'mime_type', "application/octet-stream")
+        
+        short_id = str(uuid.uuid4())[:8]
+        
+        # Save directly to the database without downloading
+        save_file_entry(short_id, {
+            "message_id": message.id, 
+            "filename": filename, 
+            "size": file_size,
+            "content_type": content_type,
+            "channel_id": CHANNEL_ID,
+            "doc_id": doc.id,
+            "access_hash": doc.access_hash,
+            "file_reference": doc.file_reference.hex(),
+            "dc_id": doc.dc_id,
+        })
+        
+        log(f"✅ INSTANT INDEX DONE | {short_id} | {filename}")
+        return [{"file_code": short_id, "file_status": "OK"}]
+        
+    except Exception as e:
+        log(f"❌ INDEX ERROR: {e}")
+        return {"error": str(e)}
+
 @app.post("/api/upload")
 async def mock_upload(key: str, file_0: UploadFile = File(...)):
     verify_key(key)
