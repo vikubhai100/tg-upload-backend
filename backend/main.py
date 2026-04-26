@@ -48,16 +48,17 @@ app.add_middleware(
 )
 
 # ============================================================
-# ⚡ SMART TOKEN LOADER (Handles both BOT_TOKEN and BOT_TOKENS)
+# ⚡ SUPER SMART TOKEN LOADER (Reads BOT_TOKEN_1, BOT_TOKEN_2, etc.)
 # ============================================================
-BOT_TOKEN_SINGLE = os.getenv("BOT_TOKEN", "").strip()
-BOT_TOKENS_STR   = os.getenv("BOT_TOKENS", "") 
+raw_tokens = []
+# Automatically find all env variables starting with "BOT_TOKEN"
+for key, value in os.environ.items():
+    if key.startswith("BOT_TOKEN"):
+        # split by comma just in case user mixes formats
+        parts = [t.strip() for t in value.split(",") if t.strip()]
+        raw_tokens.extend(parts)
 
-raw_tokens = [t.strip() for t in BOT_TOKENS_STR.split(",") if t.strip()]
-if BOT_TOKEN_SINGLE and BOT_TOKEN_SINGLE not in raw_tokens:
-    raw_tokens.append(BOT_TOKEN_SINGLE)
-
-BOT_TOKENS = list(set(raw_tokens))
+BOT_TOKENS = list(set(raw_tokens)) # Remove duplicates
 
 API_ID           = int(os.getenv("API_ID", "0"))
 API_HASH         = os.getenv("API_HASH", "")
@@ -74,19 +75,21 @@ if FRONTEND_DIR.exists():
 # MULTI-BOT CLIENT POOLING SYSTEM
 # ============================================================
 _clients = []
+_bots_loading = True
 
 async def init_clients():
-    global _clients
-    if _clients: return _clients
+    global _clients, _bots_loading
     
     if not BOT_TOKENS:
-        log("❌ CRITICAL: No BOT_TOKENS or BOT_TOKEN provided in .env!")
-        return []
+        log("❌ CRITICAL ERROR: No Bot Tokens found! Please set BOT_TOKEN_1, BOT_TOKEN_2, etc.")
+        _bots_loading = False
+        return
 
-    log(f"🤖 Initializing {len(BOT_TOKENS)} Bot Clients for Load Balancing...")
+    log(f"🤖 Initializing {len(BOT_TOKENS)} Bot Clients...")
     
     for idx, token in enumerate(BOT_TOKENS):
         try:
+            log(f"🔄 Starting Bot {idx + 1}...")
             session = StringSession("")
             client = TelegramClient(
                 session, API_ID, API_HASH,
@@ -96,17 +99,26 @@ async def init_clients():
                 flood_sleep_threshold=15,
             )
             await client.start(bot_token=token)
-            await client.get_dialogs() # Cache storage channel
+            
+            # Fast Cache method
+            try:
+                await client.get_entity(CHANNEL_ID)
+            except Exception:
+                await client.get_dialogs() # Fallback to get_dialogs
+                
             _clients.append(client)
-            log(f"✅ Bot {idx + 1} connected successfully!")
+            log(f"✅ Bot {idx + 1} Connected and Ready!")
         except Exception as e:
             log(f"⚠️ Bot {idx + 1} initialization failed: {e}")
             
-    return _clients
+    _bots_loading = False
+    log(f"🎯 Total Active Bots in Pool: {len(_clients)}")
 
 def get_random_client():
-    if not _clients:
+    if _bots_loading:
         raise HTTPException(status_code=503, detail="Bots are connecting... Please wait 5 seconds.")
+    if not _clients:
+        raise HTTPException(status_code=500, detail="CRITICAL: No bots connected! Check your Coolify tokens.")
     return random.choice(_clients)
 
 def format_size(size_bytes):
@@ -173,9 +185,9 @@ def delete_file_entry(short_id):
 @app.on_event("startup")
 async def startup_event():
     init_db()
-    # ⚡ FIX FOR BAD GATEWAY (502): Background loading
+    # Background boot
     asyncio.create_task(init_clients())
-    log("🚀 TeleStore Started! Bots are connecting in the background...")
+    log("🚀 TeleStore API Started. Bots are connecting in background...")
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -324,7 +336,6 @@ async def download_file(request: Request, short_id: str):
 
             async def fetch_worker(chunk_info, index):
                 async with sem:
-                    # Har chunk ke liye RANDOM bot use hoga pool me se!
                     worker_client = get_random_client()
                     try:
                         chunk_data = b""
