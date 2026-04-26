@@ -255,6 +255,9 @@ async def download_head(short_id: str):
 # ============================================================
 # 🚀 100% STABLE DOWNLOAD ENGINE 
 # ============================================================
+# ============================================================
+# 🚀 100% STABLE MULTI-BOT DOWNLOAD ENGINE (ANTI-CUT FIX)
+# ============================================================
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
     client_ip = get_client_ip(request)
@@ -288,13 +291,13 @@ async def download_file(request: Request, short_id: str):
         base_client = get_random_client()
         message = await base_client.get_messages(entry["channel_id"], ids=entry["message_id"])
         if not message or not message.document:
-            raise HTTPException(status_code=404, detail="File deleted from Telegram or Bot is not admin in channel")
+            raise HTTPException(status_code=404, detail="File deleted from Telegram or Bot is not admin")
 
         document = message.document
 
         async def stream_direct():
-            chunk_size = 512 * 1024  
-            max_concurrent = 16          
+            chunk_size = 1024 * 1024  # 1MB exact chunk size
+            max_concurrent = 12       # Safe parallel limit          
             
             chunks = []
             curr = start_byte
@@ -311,26 +314,50 @@ async def download_file(request: Request, short_id: str):
             sem = asyncio.Semaphore(max_concurrent)
 
             async def fetch_worker(chunk_info, index):
-                for attempt in range(3):
+                expected_length = chunk_info["length"]
+                start_offset = chunk_info["offset"]
+
+                # ⚡ 10 RETRIES: Ab bot himmat nahi haarega
+                for attempt in range(10):
                     async with sem:
                         worker_client = get_random_client()
                         try:
-                            chunk_data = b""
-                            async for part in worker_client.iter_download(
-                                document, 
-                                offset=chunk_info["offset"], 
-                                request_size=512 * 1024
-                            ):
-                                chunk_data += part
-                                if len(chunk_data) >= chunk_info["length"]:
+                            chunk_data = bytearray()
+                            current_offset = start_offset
+                            remaining = expected_length
+
+                            # ⚡ STRICT BYTE FETCHER: Jab tak poora data nahi milta loop chalega
+                            while remaining > 0:
+                                part = b""
+                                async for p in worker_client.iter_download(
+                                    document,
+                                    offset=current_offset,
+                                    request_size=min(512 * 1024, remaining),
+                                    limit=1
+                                ):
+                                    part = p
+                                    break 
+
+                                if not part:
+                                    break # Agar Telegram ne empty bheja toh break karke retry karega
+
+                                chunk_data.extend(part)
+                                current_offset += len(part)
+                                remaining -= len(part)
+
+                                if current_offset >= file_size:
                                     break
-                            
-                            exact_data = chunk_data[:chunk_info["length"]]
-                            if exact_data: return (index, exact_data)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.5) 
-                return (index, b"") 
+
+                            # Perfect check
+                            if len(chunk_data) == expected_length or current_offset >= file_size:
+                                return (index, bytes(chunk_data))
+
+                        except Exception as e:
+                            log(f"⚠️ Chunk {index} Retry {attempt+1}: {e}")
+                    
+                    await asyncio.sleep(1) # 1 sec wait before retry
+                
+                return (index, b"") # 10 attempts failed
 
             try:
                 while next_chunk_index < len(chunks):
@@ -350,9 +377,14 @@ async def download_file(request: Request, short_id: str):
 
                     while next_chunk_index in downloaded_buffer:
                         data = downloaded_buffer.pop(next_chunk_index)
-                        if not data: raise Exception("Download interrupted.")
+                        
+                        # Agar 10 baar retry karne ke baad bhi data nahi mila, tabhi error dega
+                        if not data: 
+                            raise Exception(f"Download Interrupted: Network unstable.")
+                            
                         next_chunk_index += 1
                         
+                        # Chunks ko smoothly browser ko dena
                         step = 64 * 1024 
                         for i in range(0, len(data), step):
                             yield data[i:i+step]
@@ -381,7 +413,9 @@ async def download_file(request: Request, short_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        log(f"❌ DOWNLOAD ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # ============================================================
 # OTHER ROUTES 
