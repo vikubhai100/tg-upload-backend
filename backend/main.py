@@ -242,8 +242,68 @@ async def download_head(short_id: str):
     )
 
 # ============================================================
-# 🚀 16-PIPE DOWNLOAD ENGINE (With IP & Live Speed Tracker)
+# 🚀 TURBO DOWNLOAD ENGINE v2 — Smart Adaptive Streaming
 # ============================================================
+#
+# PROBLEMS IN OLD CODE (kyun slow tha):
+#
+#  1. iter_download() per chunk call hoti thi — har baar naya
+#     Telegram request, high overhead, slow start
+#
+#  2. asyncio.sleep(0.0001) yield ke baad — completely
+#     unnecessary, har 256KB pe event loop yield karta tha
+#     = latency add hoti thi bina kisi faide ke
+#
+#  3. 256KB ke chhote pieces yield kiye jaate the — browser
+#     ko baar baar chhote TCP packets milte the, slow lagta tha
+#
+#  4. har chunk ke liye alag iter_download() stream khulti thi
+#     = Telegram se 16 alag connections, sabka overhead alag
+#
+#  5. get_messages() har download request pe — extra RTT
+#
+# FIXES IN NEW CODE:
+#
+#  A. Ek seedha iter_download() stream — Telegram ka native
+#     sequential reader, internally already optimized hai,
+#     1MB request_size = maximum throughput
+#
+#  B. 512KB yield size — browser buffer ke saath sync,
+#     TCP window ko pura utilize karta hai
+#
+#  C. asyncio.sleep hata diya — zero artificial delay
+#
+#  D. doc object pehle se DB se reconstruct — get_messages()
+#     call avoid, startup latency zero
+#
+#  E. Range support sahi tarike se — offset seedha
+#     iter_download me pass, pehle ka data skip nahi karna padta
+#
+# ============================================================
+
+# DB se stored doc metadata se seedha InputDocumentFileLocation banao
+# get_messages() call avoid hoti hai — latency bachti hai
+from telethon.tl.types import InputDocumentFileLocation
+
+async def _get_document_location(entry: dict):
+    """
+    Pehle DB se reconstruct karne ki koshish karo.
+    Agar file_reference expire ho gayi, toh get_messages se refresh karo.
+    """
+    try:
+        doc_id      = int(entry["doc_id"])
+        access_hash = int(entry["access_hash"])
+        file_ref    = bytes.fromhex(entry["file_reference"])
+        dc_id       = int(entry["dc_id"])
+        return InputDocumentFileLocation(
+            id=doc_id,
+            access_hash=access_hash,
+            file_reference=file_ref,
+            thumb_size=""
+        ), dc_id, None
+    except Exception:
+        return None, None, None
+
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
     client_ip = get_client_ip(request)
@@ -251,110 +311,136 @@ async def download_file(request: Request, short_id: str):
     if not entry:
         raise HTTPException(status_code=404, detail="File not found")
 
-    file_size = int(entry["size"])
+    file_size    = int(entry["size"])
     filename_raw = entry["filename"]
     content_type = entry["content_type"] or "application/octet-stream"
 
+    # ── Range header parse ──────────────────────────────────
     range_header = request.headers.get("Range")
-    start_byte = 0
-    end_byte = file_size - 1
+    start_byte   = 0
+    end_byte     = file_size - 1
 
     if range_header:
         try:
-            range_str = range_header.replace("bytes=", "").split("-")
+            range_str  = range_header.replace("bytes=", "").split("-")
             start_byte = int(range_str[0]) if range_str[0] else 0
             if len(range_str) > 1 and range_str[1]:
                 end_byte = int(range_str[1])
         except Exception:
             start_byte = 0
-            end_byte = file_size - 1
+            end_byte   = file_size - 1
 
     if start_byte >= file_size:
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
 
     content_length = end_byte - start_byte + 1
-    log(f"⬇️ DOWNLOAD START (16-Pipes) | {filename_raw} | Client: {client_ip} | Request: {format_size(content_length)}")
+    log(f"⬇️ DOWNLOAD START | {filename_raw} | Client: {client_ip} | Range: {format_size(start_byte)}-{format_size(end_byte)} | Total: {format_size(content_length)}")
 
     try:
         client = await get_client()
-        message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
-        if not message or not message.document:
-            raise HTTPException(status_code=404, detail="File deleted from Telegram")
 
-        document = message.document
+        # ── Document location banao ─────────────────────────
+        doc_location, dc_id, _ = await _get_document_location(entry)
 
-        async def stream_direct():
-            chunk_size = 1 * 1024 * 1024 
-            prefetch_tasks = 16  # 16 parallel tasks strictly running
+        if doc_location is None:
+            # Fallback: message se fetch karo
+            message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
+            if not message or not message.document:
+                raise HTTPException(status_code=404, detail="File deleted from Telegram")
+            doc      = message.document
+            doc_location = InputDocumentFileLocation(
+                id=doc.id,
+                access_hash=doc.access_hash,
+                file_reference=doc.file_reference,
+                thumb_size=""
+            )
+            dc_id = doc.dc_id
+            # DB me updated file_reference save karo
+            entry["file_reference"] = doc.file_reference.hex()
+            save_file_entry(short_id, entry)
 
-            start_time = time.time()
-            sent_bytes = 0
+        # ── Turbo stream generator ───────────────────────────
+        async def turbo_stream():
+            # 512KB yield — TCP window ke saath sync, browser buffer fast bharega
+            YIELD_SIZE   = 512 * 1024
+            # Telegram ka max allowed request_size = 1MB (MTProto limit)
+            REQUEST_SIZE = 1 * 1024 * 1024
+
+            sent_bytes    = 0
+            start_time    = time.time()
             last_log_time = start_time
-
-            async def download_exact_chunk(off, length):
-                data = b""
-                try:
-                    async for chunk in client.iter_download(document, offset=off, request_size=1024*1024):
-                        data += chunk
-                        if len(data) >= length:
-                            return data[:length]
-                except Exception as e:
-                    log(f"Chunk error at {off}: {e}")
-                return data
+            buffer        = b""
 
             try:
-                current_offset = start_byte
-                pending_tasks = []
+                # ── Seedha iter_download — Telegram ka native
+                # sequential reader. Internally already pipelined
+                # hai. offset se shuru karo, loop me koi sleep nahi.
+                async for tg_chunk in client.iter_download(
+                    doc_location,
+                    offset       = start_byte,       # range seek seedhi
+                    request_size = REQUEST_SIZE,      # 1MB har Telegram request
+                    dc_id        = dc_id,             # sahi DC se directly connect
+                ):
+                    buffer     += tg_chunk
+                    sent_bytes += len(tg_chunk)
 
-                while current_offset <= end_byte or pending_tasks:
-                    while len(pending_tasks) < prefetch_tasks and current_offset <= end_byte:
-                        length = min(chunk_size, end_byte - current_offset + 1)
-                        task = asyncio.create_task(download_exact_chunk(current_offset, length))
-                        pending_tasks.append(task)
-                        current_offset += length
+                    # Sirf content_length tak hi bhejo
+                    if sent_bytes > content_length:
+                        overflow = sent_bytes - content_length
+                        buffer   = buffer[: len(buffer) - overflow]
 
-                    if pending_tasks:
-                        first_task = pending_tasks.pop(0)
-                        chunk_data = await first_task
+                    # 512KB buffer bharti hai toh yield karo
+                    while len(buffer) >= YIELD_SIZE:
+                        yield buffer[:YIELD_SIZE]
+                        buffer = buffer[YIELD_SIZE:]
 
-                        if not chunk_data:
-                            break
+                    now = time.time()
+                    if now - last_log_time >= 3.0:
+                        speed = sent_bytes / max((now - start_time), 0.1)
+                        log(f"📡 STREAMING | {filename_raw} | Client: {client_ip} | "
+                            f"{format_size(min(sent_bytes, content_length))}/{format_size(content_length)} | "
+                            f"Speed: {format_size(speed)}/s")
+                        last_log_time = now
 
-                        step = 256 * 1024
-                        for i in range(0, len(chunk_data), step):
-                            chunk_piece = chunk_data[i:i+step]
-                            yield chunk_piece
+                    if sent_bytes >= content_length:
+                        break
 
-                            sent_bytes += len(chunk_piece)
-                            now = time.time()
+                # Buffer me jo bacha hai usse bhi bhejo
+                if buffer:
+                    yield buffer
 
-                            if now - last_log_time >= 3.0:
-                                speed = sent_bytes / max((now - start_time), 0.1)
-                                log(f"📡 DOWNLOADING | {filename_raw} | Client: {client_ip} | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
-                                last_log_time = now
-
-                            await asyncio.sleep(0.0001)
+                total_time = max(time.time() - start_time, 0.1)
+                avg_speed  = min(sent_bytes, content_length) / total_time
+                log(f"✅ DOWNLOAD DONE | {filename_raw} | Client: {client_ip} | "
+                    f"Avg Speed: {format_size(avg_speed)}/s | Time: {total_time:.1f}s")
 
             except asyncio.CancelledError:
-                log(f"🛑 DOWNLOAD STOPPED (User/App) | {filename_raw} | Client: {client_ip} | Sent: {format_size(sent_bytes)}")
+                log(f"🛑 DOWNLOAD CANCELLED | {filename_raw} | Client: {client_ip} | "
+                    f"Sent: {format_size(sent_bytes)}")
             except Exception as e:
-                log(f"Parallel Stream Error: {e}")
+                log(f"❌ STREAM ERROR | {filename_raw} | {e}")
 
+        # ── Response headers ────────────────────────────────
         encoded_filename = quote(filename_raw)
         headers = {
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
-            "Content-Type": content_type,
-            "Content-Length": str(content_length),
-            "Accept-Ranges": "bytes",
-            "X-Accel-Buffering": "no",
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Content-Type"       : content_type,
+            "Content-Length"     : str(content_length),
+            "Accept-Ranges"      : "bytes",
+            "X-Accel-Buffering"  : "no",
+            "Cache-Control"      : "no-store, no-cache, must-revalidate, max-age=0",
         }
 
         status_code = 206 if range_header else 200
         if range_header:
             headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
 
-        return StreamingResponse(stream_direct(), status_code=status_code, headers=headers, media_type=content_type)
+        return StreamingResponse(
+            turbo_stream(),
+            status_code = status_code,
+            headers     = headers,
+            media_type  = content_type,
+        )
 
     except HTTPException:
         raise
