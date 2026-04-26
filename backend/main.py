@@ -273,6 +273,9 @@ async def download_head(short_id: str):
 # ============================================================
 # 🚀 MULTI-BOT 16-PIPE DOWNLOAD ENGINE (100% STABLE & RESUMABLE)
 # ============================================================
+# ============================================================
+# 🚀 MULTI-BOT 16-PIPE DOWNLOAD ENGINE (100% SEAMLESS & STABLE)
+# ============================================================
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
     client_ip = get_client_ip(request)
@@ -312,7 +315,7 @@ async def download_file(request: Request, short_id: str):
         document = message.document
 
         async def stream_direct():
-            chunk_size = 512 * 1024  # EXACT 512KB (Telegram API Strict Limit)
+            chunk_size = 512 * 1024  # 512KB chunks
             max_concurrent = 16          
             
             start_time = time.time()
@@ -334,31 +337,34 @@ async def download_file(request: Request, short_id: str):
             sem = asyncio.Semaphore(max_concurrent)
 
             async def fetch_worker(chunk_info, index):
-                # ⚡ AUTO-RETRY LOGIC: 3 baar koshish karega alag-alag bots se
                 for attempt in range(3):
                     async with sem:
                         worker_client = get_random_client()
                         try:
                             chunk_data = b""
+                            # ⚡ FIX: limit=1 hata diya. Jab tak poora data nahi milta, fetch karega
                             async for part in worker_client.iter_download(
                                 document, 
                                 offset=chunk_info["offset"], 
-                                request_size=512 * 1024, 
-                                limit=1
+                                request_size=512 * 1024
                             ):
                                 chunk_data += part
+                                if len(chunk_data) >= chunk_info["length"]:
+                                    break
                             
-                            # Trim the data to the exact requested length
                             exact_data = chunk_data[:chunk_info["length"]]
-                            if exact_data:
+                            
+                            # ⚡ STRICT CHECK: Kya exact length mili ya file end ho gayi?
+                            if len(exact_data) == chunk_info["length"] or (chunk_info["offset"] + len(exact_data) == file_size):
                                 return (index, exact_data)
+                            else:
+                                log(f"⚠️ Chunk {index} incomplete. Expected {chunk_info['length']}, got {len(exact_data)}. Retrying...")
                         except Exception as e:
                             log(f"⚠️ Chunk {index} fetch error (Attempt {attempt+1}): {e}")
                     
-                    await asyncio.sleep(0.5) # Wait before retrying
+                    await asyncio.sleep(0.5) # Wait before retry
                 
-                # Agar 3 baar fail ho gaya toh blank return karega
-                return (index, b"")
+                return (index, b"") # 3 attempts failed
 
             try:
                 while next_chunk_index < len(chunks):
@@ -375,27 +381,32 @@ async def download_file(request: Request, short_id: str):
 
                     for task in done:
                         idx, data = task.result()
-                        downloaded_buffer[idx] = data # Buffer mein save karna zaroori hai
+                        downloaded_buffer[idx] = data
 
-                    # Ensure ki hum chunks ko line se (sequence) mein hi browser ko bhejein
                     while next_chunk_index in downloaded_buffer:
                         data = downloaded_buffer.pop(next_chunk_index)
                         
                         if not data:
-                            log(f"❌ CRITICAL ERROR: Chunk {next_chunk_index} completely failed. Aborting stream.")
-                            raise Exception("Chunk fetch failed after 3 retries.")
+                            log(f"❌ CRITICAL: Chunk {next_chunk_index} failed permanently. Stream aborted.")
+                            raise Exception("Download interrupted. Missing data chunk.")
                             
                         next_chunk_index += 1
-                        yield data
                         
-                        sent_bytes += len(data)
-                        now = time.time()
-                        if now - last_log_time >= 3.0:
-                            speed = sent_bytes / max((now - start_time), 0.1)
-                            log(f"📡 DOWNLOADING | {filename_raw[:15]}... | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
-                            last_log_time = now
+                        # ⚡ FIX: Chunks ko chhote steps me bhejna taaki browser connection cut na kare
+                        step = 64 * 1024 
+                        for i in range(0, len(data), step):
+                            chunk_piece = data[i:i+step]
+                            yield chunk_piece
                             
-                        await asyncio.sleep(0.0001)
+                            sent_bytes += len(chunk_piece)
+                            now = time.time()
+                            if now - last_log_time >= 3.0:
+                                speed = sent_bytes / max((now - start_time), 0.1)
+                                log(f"📡 DOWNLOADING | {filename_raw[:15]}... | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
+                                last_log_time = now
+                                
+                            # Connection ko zinda rakhne ke liye minor sleep
+                            await asyncio.sleep(0.0001)
 
             except asyncio.CancelledError:
                 pass
@@ -425,6 +436,7 @@ async def download_file(request: Request, short_id: str):
     except Exception as e:
         log(f"❌ DOWNLOAD ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # ============================================================
 # OTHER ROUTES 
