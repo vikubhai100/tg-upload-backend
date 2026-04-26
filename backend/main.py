@@ -47,9 +47,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ⚡ NAYA: Ek se zyada bot tokens ko comma se separate karke lenge
+# ⚡ SMART TOKEN LOADER (Handles both BOT_TOKEN and BOT_TOKENS)
+BOT_TOKEN_SINGLE = os.getenv("BOT_TOKEN", "").strip()
 BOT_TOKENS_STR   = os.getenv("BOT_TOKENS", "") 
-BOT_TOKENS       = [t.strip() for t in BOT_TOKENS_STR.split(",") if t.strip()]
+
+# Dono variables ko mix karke ek list banayenge aur khali spaces/duplicates hata denge
+raw_tokens = [t.strip() for t in BOT_TOKENS_STR.split(",") if t.strip()]
+if BOT_TOKEN_SINGLE and BOT_TOKEN_SINGLE not in raw_tokens:
+    raw_tokens.append(BOT_TOKEN_SINGLE)
+
+BOT_TOKENS = list(set(raw_tokens))
 
 API_ID           = int(os.getenv("API_ID", "0"))
 API_HASH         = os.getenv("API_HASH", "")
@@ -72,14 +79,13 @@ async def init_clients():
     if _clients: return _clients
     
     if not BOT_TOKENS:
-        log("❌ CRITICAL: No BOT_TOKENS provided in .env!")
+        log("❌ CRITICAL: No BOT_TOKENS or BOT_TOKEN provided in .env!")
         return []
 
     log(f"🤖 Initializing {len(BOT_TOKENS)} Bot Clients for Load Balancing...")
     
     for idx, token in enumerate(BOT_TOKENS):
         try:
-            # Har bot ke liye ek alag memory session
             session = StringSession("")
             client = TelegramClient(
                 session, API_ID, API_HASH,
@@ -98,7 +104,8 @@ async def init_clients():
     return _clients
 
 def get_random_client():
-    # Load balancing: Har naye task ke liye random bot select karega
+    if not _clients:
+        raise Exception("CRITICAL ERROR: No bots are connected to the server. Check your tokens.")
     return random.choice(_clients)
 
 def format_size(size_bytes):
@@ -284,7 +291,6 @@ async def download_file(request: Request, short_id: str):
     log(f"⬇️ DOWNLOAD START (Multi-Bot) | {filename_raw} | Client: {client_ip} | Request: {format_size(content_length)}")
 
     try:
-        # Pura message fetch karne ke liye koi bhi ek random bot utha lo
         base_client = get_random_client()
         message = await base_client.get_messages(entry["channel_id"], ids=entry["message_id"])
         if not message or not message.document:
@@ -316,8 +322,6 @@ async def download_file(request: Request, short_id: str):
 
             async def fetch_worker(chunk_info, index):
                 async with sem:
-                    # ⚡ MAGIC HERE: Har chunk ke liye pool me se RANDOM bot use hoga!
-                    # Load 5 bots me barabar divide hoga, speed multiply ho jayegi.
                     worker_client = get_random_client()
                     try:
                         chunk_data = b""
