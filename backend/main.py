@@ -270,9 +270,8 @@ async def download_head(short_id: str):
             "Content-Disposition": f"attachment; filename*=UTF-8''{filename_safe}",
         }
     )
-
 # ============================================================
-# 🚀 MULTI-BOT 16-PIPE DOWNLOAD ENGINE
+# 🚀 MULTI-BOT 16-PIPE DOWNLOAD ENGINE (100% STABLE & RESUMABLE)
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
@@ -302,7 +301,7 @@ async def download_file(request: Request, short_id: str):
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
 
     content_length = end_byte - start_byte + 1
-    log(f"⬇️ DOWNLOAD START (Multi-Bot) | {filename_raw} | Client: {client_ip} | Request: {format_size(content_length)}")
+    log(f"⬇️ DOWNLOAD START | {filename_raw} | Client: {client_ip} | Size: {format_size(content_length)}")
 
     try:
         base_client = get_random_client()
@@ -313,7 +312,7 @@ async def download_file(request: Request, short_id: str):
         document = message.document
 
         async def stream_direct():
-            chunk_size = 1 * 1024 * 1024  
+            chunk_size = 512 * 1024  # EXACT 512KB (Telegram API Strict Limit)
             max_concurrent = 16          
             
             start_time = time.time()
@@ -335,16 +334,31 @@ async def download_file(request: Request, short_id: str):
             sem = asyncio.Semaphore(max_concurrent)
 
             async def fetch_worker(chunk_info, index):
-                async with sem:
-                    worker_client = get_random_client()
-                    try:
-                        chunk_data = b""
-                        async for part in worker_client.iter_download(document, offset=chunk_info["offset"], request_size=chunk_info["length"], limit=1):
-                            chunk_data += part
-                        return (index, chunk_data[:chunk_info["length"]])
-                    except Exception as e:
-                        log(f"Chunk fetch error at offset {chunk_info['offset']}: {e}")
-                        return (index, b"")
+                # ⚡ AUTO-RETRY LOGIC: 3 baar koshish karega alag-alag bots se
+                for attempt in range(3):
+                    async with sem:
+                        worker_client = get_random_client()
+                        try:
+                            chunk_data = b""
+                            async for part in worker_client.iter_download(
+                                document, 
+                                offset=chunk_info["offset"], 
+                                request_size=512 * 1024, 
+                                limit=1
+                            ):
+                                chunk_data += part
+                            
+                            # Trim the data to the exact requested length
+                            exact_data = chunk_data[:chunk_info["length"]]
+                            if exact_data:
+                                return (index, exact_data)
+                        except Exception as e:
+                            log(f"⚠️ Chunk {index} fetch error (Attempt {attempt+1}): {e}")
+                    
+                    await asyncio.sleep(0.5) # Wait before retrying
+                
+                # Agar 3 baar fail ho gaya toh blank return karega
+                return (index, b"")
 
             try:
                 while next_chunk_index < len(chunks):
@@ -361,25 +375,27 @@ async def download_file(request: Request, short_id: str):
 
                     for task in done:
                         idx, data = task.result()
-                        if data: downloaded_buffer[idx] = data
+                        downloaded_buffer[idx] = data # Buffer mein save karna zaroori hai
 
+                    # Ensure ki hum chunks ko line se (sequence) mein hi browser ko bhejein
                     while next_chunk_index in downloaded_buffer:
                         data = downloaded_buffer.pop(next_chunk_index)
-                        next_chunk_index += 1
-                        if not data: continue
-
-                        step = 256 * 1024
-                        for i in range(0, len(data), step):
-                            chunk_piece = data[i:i+step]
-                            yield chunk_piece
+                        
+                        if not data:
+                            log(f"❌ CRITICAL ERROR: Chunk {next_chunk_index} completely failed. Aborting stream.")
+                            raise Exception("Chunk fetch failed after 3 retries.")
                             
-                            sent_bytes += len(chunk_piece)
-                            now = time.time()
-                            if now - last_log_time >= 3.0:
-                                speed = sent_bytes / max((now - start_time), 0.1)
-                                log(f"📡 DOWNLOADING | {filename_raw} | Client: {client_ip} | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
-                                last_log_time = now
-                            await asyncio.sleep(0.0001)
+                        next_chunk_index += 1
+                        yield data
+                        
+                        sent_bytes += len(data)
+                        now = time.time()
+                        if now - last_log_time >= 3.0:
+                            speed = sent_bytes / max((now - start_time), 0.1)
+                            log(f"📡 DOWNLOADING | {filename_raw[:15]}... | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
+                            last_log_time = now
+                            
+                        await asyncio.sleep(0.0001)
 
             except asyncio.CancelledError:
                 pass
