@@ -143,12 +143,15 @@ def delete_file_entry(short_id):
         conn.commit()
         conn.close()
 
+# ⚡ YAHAN UPDATE KIYA HAI ⚡
 @app.on_event("startup")
 async def startup_event():
     init_db()
     try:
-        await get_client()
-        log("✅ Telegram connected!")
+        client = await get_client()
+        # Telethon Cache Fix: Start hote hi channel fetch karke memory me save karega
+        await client.get_dialogs()
+        log("✅ Telegram connected and channels cached!")
     except Exception as e:
         log(f"⚠️ Telegram connect failed at startup: {e}")
     log("🚀 TeleStore Started!")
@@ -213,11 +216,11 @@ async def parallel_upload(client, file_path, client_ip="Server"):
 
     tasks = [asyncio.create_task(upload_part(i)) for i in range(total_parts)]
     await asyncio.gather(*tasks)
-    
+
     end_time = time.time()
     final_speed = file_size / max((end_time - start_time), 0.1)
     log(f"✅ UPLOAD DONE | {file_name} | Client: {client_ip} | Avg Speed: {format_size(final_speed)}/s")
-    
+
     return InputFileBig(id=file_id, parts=total_parts, name=file_name)
 
 # ============================================================
@@ -277,13 +280,13 @@ async def download_file(request: Request, short_id: str):
         message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
         if not message or not message.document:
             raise HTTPException(status_code=404, detail="File deleted from Telegram")
-        
+
         document = message.document
 
         async def stream_direct():
             chunk_size = 1 * 1024 * 1024 
             prefetch_tasks = 16  # 16 parallel tasks strictly running
-            
+
             start_time = time.time()
             sent_bytes = 0
             last_log_time = start_time
@@ -302,36 +305,36 @@ async def download_file(request: Request, short_id: str):
             try:
                 current_offset = start_byte
                 pending_tasks = []
-                
+
                 while current_offset <= end_byte or pending_tasks:
                     while len(pending_tasks) < prefetch_tasks and current_offset <= end_byte:
                         length = min(chunk_size, end_byte - current_offset + 1)
                         task = asyncio.create_task(download_exact_chunk(current_offset, length))
                         pending_tasks.append(task)
                         current_offset += length
-                    
+
                     if pending_tasks:
                         first_task = pending_tasks.pop(0)
                         chunk_data = await first_task
-                        
+
                         if not chunk_data:
                             break
-                            
+
                         step = 256 * 1024
                         for i in range(0, len(chunk_data), step):
                             chunk_piece = chunk_data[i:i+step]
                             yield chunk_piece
-                            
+
                             sent_bytes += len(chunk_piece)
                             now = time.time()
-                            
+
                             if now - last_log_time >= 3.0:
                                 speed = sent_bytes / max((now - start_time), 0.1)
                                 log(f"📡 DOWNLOADING | {filename_raw} | Client: {client_ip} | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
                                 last_log_time = now
-                                
+
                             await asyncio.sleep(0.0001)
-                            
+
             except asyncio.CancelledError:
                 log(f"🛑 DOWNLOAD STOPPED (User/App) | {filename_raw} | Client: {client_ip} | Sent: {format_size(sent_bytes)}")
             except Exception as e:
@@ -346,11 +349,11 @@ async def download_file(request: Request, short_id: str):
             "X-Accel-Buffering": "no",
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         }
-        
+
         status_code = 206 if range_header else 200
         if range_header:
             headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
-            
+
         return StreamingResponse(stream_direct(), status_code=status_code, headers=headers, media_type=content_type)
 
     except HTTPException:
@@ -387,10 +390,10 @@ async def index_forwarded(request: Request, key: str, message_id: int, filename:
         client = await get_client()
         message = await client.get_messages(CHANNEL_ID, ids=message_id)
         if not message or not message.document: return {"error": "Not Found"}
-        
+
         doc = message.document
         short_id = str(uuid.uuid4())[:8]
-        
+
         save_file_entry(short_id, {
             "message_id": message.id, "filename": filename, "size": getattr(doc, 'size', 0),
             "content_type": getattr(message.file, 'mime_type', "application/octet-stream"), "channel_id": CHANNEL_ID,
@@ -408,7 +411,7 @@ async def mock_upload(request: Request, key: str, file_0: UploadFile = File(...)
     client_ip = get_client_ip(request)
     filename = file_0.filename
     tmp_path = f"/tmp/{uuid.uuid4()}{Path(filename).suffix}"
-    
+
     try:
         with open(tmp_path, "wb") as f:
             while chunk := await file_0.read(4 * 1024 * 1024):
@@ -417,7 +420,7 @@ async def mock_upload(request: Request, key: str, file_0: UploadFile = File(...)
         client = await get_client()
         uploaded_file = await parallel_upload(client, tmp_path, client_ip=client_ip)
         message = await client.send_file(CHANNEL_ID, uploaded_file, force_document=True)
-        
+
         short_id = str(uuid.uuid4())[:8]
         save_file_entry(short_id, {
             "message_id": message.id, "filename": filename, "size": os.path.getsize(tmp_path),
@@ -451,7 +454,7 @@ async def mock_remote_upload(request: Request):
                 with open(tmp_path, 'wb') as f:
                     async for chunk in res.content.iter_chunked(5 * 1024 * 1024):
                         f.write(chunk)
-        
+
         file_size = os.path.getsize(tmp_path)
         client        = await get_client()
         uploaded_file = await parallel_upload(client, tmp_path, client_ip=client_ip)
