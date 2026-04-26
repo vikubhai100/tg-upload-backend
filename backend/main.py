@@ -403,73 +403,126 @@ async def download_file(request: Request, short_id: str):
 
         async def turbo_stream():
             nonlocal doc_location, dc_id
-            YIELD_SIZE   = 512 * 1024
-            REQUEST_SIZE = 1 * 1024 * 1024
-            sent_bytes    = 0
+            # ═══════════════════════════════════════════════════
+            # PARALLEL DOWNLOAD ENGINE
+            # ───────────────────────────────────────────────────
+            # Telegram ek single stream ko throttle karta hai
+            # ~300KB/s tak. Lekin 4-5 parallel connections pe
+            # throttle nahi lagta — combined speed 3-8 MB/s
+            # milti hai.
+            #
+            # Logic:
+            # 1. File ko PIPE_COUNT = 4 parallel segments mein
+            #    baanto (har pipe 2MB fetch karta hai)
+            # 2. Har pipe asyncio.Queue mein chunks dalta hai
+            # 3. Main loop IN-ORDER yield karta hai —
+            #    browser ko sequential data milta hai
+            # ═══════════════════════════════════════════════════
+
+            PIPE_COUNT   = 4          # parallel Telegram connections
+            PIPE_SIZE    = 2*1024*1024 # har pipe 2MB fetch karta hai
+            YIELD_SIZE   = 512*1024    # browser ko 512KB chunks
+            REQUEST_SIZE = 1*1024*1024 # Telegram se 1MB per request
+
             start_time    = time.time()
             last_log_time = start_time
-            buffer        = b""
+            total_sent    = 0
             loc           = doc_location
             dcid          = dc_id
 
-            # Async generator ke andar try/except kaam nahi karta
-            # isliye chunks queue mein collect karke yield karte hain
-            # aur error ko flag se handle karte hain
-            while True:
-                ref_error   = False
-                other_error = None
+            async def fetch_segment(off, length, q):
+                """Ek segment fetch karke queue mein daalo"""
+                fetched = b""
+                retry   = 0
+                while retry < 3:
+                    try:
+                        async for chunk in client.iter_download(
+                            loc, offset=off,
+                            request_size=REQUEST_SIZE, dc_id=dcid,
+                        ):
+                            fetched += chunk
+                            if len(fetched) >= length:
+                                await q.put(fetched[:length])
+                                return
+                        # Agar loop end ho gaya
+                        if fetched:
+                            await q.put(fetched[:length])
+                        return
+                    except Exception as e:
+                        err = str(e).lower()
+                        if "file reference" in err or "expired" in err:
+                            nonlocal loc, dcid
+                            log(f"🔄 FILE REF EXPIRED in pipe | {filename_raw}")
+                            try:
+                                loc, dcid = await _fresh_location(client, entry, short_id)
+                                if loc is None:
+                                    await q.put(None)
+                                    return
+                                retry += 1
+                                fetched = b""
+                                continue
+                            except Exception:
+                                await q.put(None)
+                                return
+                        else:
+                            log(f"❌ Pipe error at {off}: {e}")
+                            retry += 1
+                            fetched = b""
+                            await asyncio.sleep(0.5 * retry)
+                await q.put(None)  # Max retries exhausted
 
-                try:
-                    async for tg_chunk in client.iter_download(
-                        loc, offset=start_byte + sent_bytes,
-                        request_size=REQUEST_SIZE, dc_id=dcid,
-                    ):
-                        buffer     += tg_chunk
-                        sent_bytes += len(tg_chunk)
-                        if sent_bytes > content_length:
-                            buffer = buffer[: len(buffer) - (sent_bytes - content_length)]
-                        while len(buffer) >= YIELD_SIZE:
-                            yield buffer[:YIELD_SIZE]
-                            buffer = buffer[YIELD_SIZE:]
-                        now = time.time()
-                        if now - last_log_time >= 3.0:
-                            speed = sent_bytes / max((now - start_time), 0.1)
-                            log(f"📡 STREAMING | {filename_raw} | {format_size(min(sent_bytes,content_length))}/{format_size(content_length)} | {format_size(speed)}/s")
-                            last_log_time = now
-                        if sent_bytes >= content_length:
-                            break
-                    # Normal completion
+            # ── Sliding window: PIPE_COUNT pipes ek saath ──────
+            current_offset = start_byte
+            end_offset     = start_byte + content_length
+            pipes          = []  # (queue, expected_length)
+
+            # Pehle PIPE_COUNT pipes start karo
+            for _ in range(PIPE_COUNT):
+                if current_offset >= end_offset:
+                    break
+                seg_len = min(PIPE_SIZE, end_offset - current_offset)
+                q = asyncio.Queue(maxsize=1)
+                asyncio.create_task(fetch_segment(current_offset, seg_len, q))
+                pipes.append((q, seg_len))
+                current_offset += seg_len
+
+            buf = b""
+            while pipes:
+                q, seg_len = pipes.pop(0)
+                data = await q.get()
+
+                if data is None:
+                    log(f"❌ Segment failed | {filename_raw}")
                     break
 
-                except Exception as e:
-                    err = str(e).lower()
-                    if "file reference" in err or "expired" in err:
-                        ref_error = True
-                    else:
-                        other_error = e
+                buf        += data
+                total_sent += len(data)
 
-                if ref_error:
-                    log(f"🔄 FILE REF EXPIRED — Auto refresh | {filename_raw}")
-                    try:
-                        loc, dcid = await _fresh_location(client, entry, short_id)
-                        if loc is None:
-                            log(f"❌ File deleted from Telegram | {filename_raw}")
-                            return
-                        log(f"✅ Refreshed — Retrying | {filename_raw}")
-                        continue  # Retry with fresh reference
-                    except Exception as e2:
-                        log(f"❌ REFRESH FAILED | {filename_raw} | {e2}")
-                        return
+                # Yield 512KB chunks to browser
+                while len(buf) >= YIELD_SIZE:
+                    yield buf[:YIELD_SIZE]
+                    buf = buf[YIELD_SIZE:]
 
-                if other_error:
-                    log(f"❌ STREAM ERROR | {filename_raw} | {other_error}")
-                    return
+                now = time.time()
+                if now - last_log_time >= 3.0:
+                    speed = total_sent / max((now - start_time), 0.1)
+                    log(f"📡 STREAMING | {filename_raw} | {format_size(min(total_sent,content_length))}/{format_size(content_length)} | {format_size(speed)}/s")
+                    last_log_time = now
 
-            if buffer:
-                yield buffer
+                # Agle segment ka task launch karo (sliding window)
+                if current_offset < end_offset:
+                    seg_len = min(PIPE_SIZE, end_offset - current_offset)
+                    nq = asyncio.Queue(maxsize=1)
+                    asyncio.create_task(fetch_segment(current_offset, seg_len, nq))
+                    pipes.append((nq, seg_len))
+                    current_offset += seg_len
+
+            # Bacha hua buffer bhejo
+            if buf:
+                yield buf
 
             total_time = max(time.time() - start_time, 0.1)
-            log(f"✅ DONE | {filename_raw} | {format_size(min(sent_bytes,content_length)/total_time)}/s | {total_time:.1f}s")
+            log(f"✅ DONE | {filename_raw} | {format_size(min(total_sent,content_length)/total_time)}/s | {total_time:.1f}s")
 
         # ── Response headers ────────────────────────────────
         encoded_filename = quote(filename_raw)
