@@ -62,24 +62,53 @@ if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 # ============================================================
-# TELEGRAM CLIENT (16-Thread Optimized)
+# TELEGRAM CLIENTS
+# _bot_client  → Upload ke liye (Bot Token)
+# _user_client → Download ke liye (Session String)
+#                Agar Session String nahi hai toh
+#                download bhi Bot se hoga fallback mein
 # ============================================================
-_client = None
+_bot_client  = None
+_user_client = None
 
-async def get_client():
-    global _client
-    if _client and _client.is_connected():
-        return _client
-    session = StringSession(SESSION_STR) if SESSION_STR else StringSession()
-    _client = TelegramClient(
-        session, API_ID, API_HASH,
+async def get_bot_client():
+    """Upload ke liye — hamesha Bot Token use karta hai"""
+    global _bot_client
+    if _bot_client and _bot_client.is_connected():
+        return _bot_client
+    _bot_client = TelegramClient(
+        StringSession(), API_ID, API_HASH,
         connection_retries=15,
         retry_delay=2,
         request_retries=10,
         flood_sleep_threshold=15,
     )
-    await _client.start(bot_token=BOT_TOKEN)
-    return _client
+    await _bot_client.start(bot_token=BOT_TOKEN)
+    log("🤖 Bot Client connected (Upload ready)")
+    return _bot_client
+
+async def get_user_client():
+    """Download ke liye — Session String use karta hai"""
+    global _user_client
+    if _user_client and _user_client.is_connected():
+        return _user_client
+    if not SESSION_STR:
+        log("⚠️ SESSION_STRING nahi hai — Download bhi Bot se hoga")
+        return await get_bot_client()
+    _user_client = TelegramClient(
+        StringSession(SESSION_STR), API_ID, API_HASH,
+        connection_retries=15,
+        retry_delay=2,
+        request_retries=10,
+        flood_sleep_threshold=15,
+    )
+    await _user_client.start()
+    log("👤 User Client connected (Download turbo ready)")
+    return _user_client
+
+# Backward compat — purane calls ke liye
+async def get_client():
+    return await get_bot_client()
 
 def format_size(size_bytes):
     if size_bytes == 0: return "0 B"
@@ -148,12 +177,22 @@ def delete_file_entry(short_id):
 async def startup_event():
     init_db()
     try:
-        client = await get_client()
-        # Telethon Cache Fix: Start hote hi channel fetch karke memory me save karega
-        await client.get_dialogs()
-        log("✅ Telegram connected and channels cached!")
+        # Bot client — upload ke liye
+        bot = await get_bot_client()
+        await bot.get_dialogs()
+        log("🤖 Bot Client ready!")
     except Exception as e:
-        log(f"⚠️ Telegram connect failed at startup: {e}")
+        log(f"⚠️ Bot Client failed: {e}")
+    try:
+        # User client — download ke liye
+        if SESSION_STR:
+            user = await get_user_client()
+            await user.get_dialogs()
+            log("👤 User Client ready — Turbo Download ON!")
+        else:
+            log("⚠️ SESSION_STRING nahi hai — Download Bot se hoga (slow)")
+    except Exception as e:
+        log(f"⚠️ User Client failed: {e}")
     log("🚀 TeleStore Started!")
 
 @app.get("/", response_class=HTMLResponse)
@@ -337,7 +376,7 @@ async def download_file(request: Request, short_id: str):
     log(f"⬇️ DOWNLOAD START | {filename_raw} | Client: {client_ip} | Range: {format_size(start_byte)}-{format_size(end_byte)} | Total: {format_size(content_length)}")
 
     try:
-        client = await get_client()
+        client = await get_user_client()
 
         # ── Document location banao ─────────────────────────
         doc_location, dc_id, _ = await _get_document_location(entry)
