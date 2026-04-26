@@ -47,11 +47,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================================================
 # ⚡ SMART TOKEN LOADER (Handles both BOT_TOKEN and BOT_TOKENS)
+# ============================================================
 BOT_TOKEN_SINGLE = os.getenv("BOT_TOKEN", "").strip()
 BOT_TOKENS_STR   = os.getenv("BOT_TOKENS", "") 
 
-# Dono variables ko mix karke ek list banayenge aur khali spaces/duplicates hata denge
 raw_tokens = [t.strip() for t in BOT_TOKENS_STR.split(",") if t.strip()]
 if BOT_TOKEN_SINGLE and BOT_TOKEN_SINGLE not in raw_tokens:
     raw_tokens.append(BOT_TOKEN_SINGLE)
@@ -105,7 +106,7 @@ async def init_clients():
 
 def get_random_client():
     if not _clients:
-        raise Exception("CRITICAL ERROR: No bots are connected to the server. Check your tokens.")
+        raise HTTPException(status_code=503, detail="Bots are connecting... Please wait 5 seconds.")
     return random.choice(_clients)
 
 def format_size(size_bytes):
@@ -172,8 +173,9 @@ def delete_file_entry(short_id):
 @app.on_event("startup")
 async def startup_event():
     init_db()
-    await init_clients()
-    log("🚀 TeleStore Started with Multi-Bot System!")
+    # ⚡ FIX FOR BAD GATEWAY (502): Background loading
+    asyncio.create_task(init_clients())
+    log("🚀 TeleStore Started! Bots are connecting in the background...")
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -258,7 +260,7 @@ async def download_head(short_id: str):
     )
 
 # ============================================================
-# 🚀 MULTI-BOT 16-PIPE DOWNLOAD ENGINE (Max Speed, No Bans)
+# 🚀 MULTI-BOT 16-PIPE DOWNLOAD ENGINE
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
@@ -322,6 +324,7 @@ async def download_file(request: Request, short_id: str):
 
             async def fetch_worker(chunk_info, index):
                 async with sem:
+                    # Har chunk ke liye RANDOM bot use hoga pool me se!
                     worker_client = get_random_client()
                     try:
                         chunk_data = b""
