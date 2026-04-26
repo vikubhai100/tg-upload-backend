@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 import sys
 import aiohttp
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.types import InputFileBig
 from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 
@@ -37,7 +38,7 @@ def get_client_ip(request: Request):
     if forwarded: return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "Unknown-IP"
 
-app = FastAPI(title="TeleStore API (Multi-Bot Optimized)")
+app = FastAPI(title="TeleStore API (Diagnostic Mode)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,7 +48,7 @@ app.add_middleware(
 )
 
 # ============================================================
-# ⚡ SUPER SMART TOKEN LOADER (Reads BOT_TOKEN_1, BOT_TOKEN_2, etc.)
+# ⚡ SUPER SMART TOKEN LOADER
 # ============================================================
 raw_tokens = []
 for key, value in os.environ.items():
@@ -69,65 +70,54 @@ if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 # ============================================================
-# MULTI-BOT CLIENT POOLING SYSTEM (WITH PERSISTENT SESSIONS)
+# MULTI-BOT POOLING SYSTEM (WITH X-RAY ERROR LOGGING)
 # ============================================================
 _clients = []
 _bots_loading = True
+_bot_errors = [] # ⚡ YAHAN HUM SARE ERRORS SAVE KARENGE BROWSER KO DIKHANE KE LIYE
 
 async def init_clients():
-    global _clients, _bots_loading
+    global _clients, _bots_loading, _bot_errors
     
     if not BOT_TOKENS:
-        log("❌ CRITICAL ERROR: No Bot Tokens found!")
+        _bot_errors.append("NO_TOKENS_FOUND_IN_ENV")
         _bots_loading = False
         return
 
     log(f"🤖 Initializing {len(BOT_TOKENS)} Bot Clients...")
-    os.makedirs("/app/data", exist_ok=True) # Ensure data folder exists for sessions
     
     for idx, token in enumerate(BOT_TOKENS):
         try:
-            log(f"🔄 Starting Bot {idx + 1}...")
-            
-            # ⚡ FIX 1: Use persistent file sessions. No more temporary bans on restart!
-            session_file = f"/app/data/bot_session_{idx}"
-            
+            # Using StringSession to avoid SQLite disk locking on Coolify
+            session = StringSession("")
             client = TelegramClient(
-                session_file, API_ID, API_HASH,
-                connection_retries=15,
+                session, API_ID, API_HASH,
+                connection_retries=5,
                 retry_delay=2,
-                request_retries=10,
-                flood_sleep_threshold=15,
             )
             await client.start(bot_token=token)
             
-            # ⚡ FIX 2: Append bot to list FIRST. Even if channel fetch fails, bot remains usable.
+            try:
+                await client.get_dialogs() # Cache channel
+            except Exception as cache_err:
+                log(f"Cache warning: {cache_err}")
+                
             _clients.append(client)
-            log(f"✅ Bot {idx + 1} Connected and Ready!")
-            
-            # Run cache fetch in background safely
-            async def cache_channel(c):
-                try:
-                    await c.get_entity(CHANNEL_ID)
-                except Exception:
-                    try:
-                        await c.get_dialogs() 
-                    except Exception as e:
-                        log(f"⚠️ Bot Cache warning (Ignored): {e}")
-            
-            asyncio.create_task(cache_channel(client))
-            
         except Exception as e:
-            log(f"⚠️ Bot {idx + 1} completely failed to connect: {e}")
+            error_msg = f"Token[{idx}] Failed: {str(e)}"
+            log(f"⚠️ {error_msg}")
+            _bot_errors.append(error_msg)
             
     _bots_loading = False
     log(f"🎯 Total Active Bots in Pool: {len(_clients)}")
 
 def get_random_client():
     if _bots_loading:
-        raise HTTPException(status_code=503, detail="Bots are connecting... Please wait 5 seconds.")
+        raise HTTPException(status_code=503, detail="Bots are connecting... Please wait 5 seconds and refresh.")
     if not _clients:
-        raise HTTPException(status_code=500, detail="CRITICAL: No bots connected! Check your Coolify logs for FloodWait errors.")
+        # ⚡ BROWSER MEIN ASLI ERROR DIKHEGA AB
+        error_str = " | ".join(_bot_errors) if _bot_errors else "Unknown Fatal Error"
+        raise HTTPException(status_code=500, detail=f"CRITICAL: No bots connected! REASON: {error_str}")
     return random.choice(_clients)
 
 def format_size(size_bytes):
@@ -138,7 +128,7 @@ def format_size(size_bytes):
     return f"{size_bytes:.1f} TB"
 
 # ============================================================
-# DATABASE — WAL mode
+# DATABASE
 # ============================================================
 _db_lock = threading.Lock()
 
@@ -194,7 +184,6 @@ def delete_file_entry(short_id):
 @app.on_event("startup")
 async def startup_event():
     init_db()
-    # Background boot
     asyncio.create_task(init_clients())
     log("🚀 TeleStore API Started. Bots are connecting in background...")
 
@@ -213,15 +202,10 @@ async def favicon(): return HTMLResponse("")
 async def parallel_upload(client, file_path, client_ip="Server"):
     file_size = os.path.getsize(file_path)
     file_name = os.path.basename(file_path)
-    log(f"⬆️ UPLOAD START | {file_name} | Client: {client_ip} | Size: {format_size(file_size)}")
     start_time = time.time()
 
     if file_size < 10 * 1024 * 1024:
-        res = await client.upload_file(file_path, part_size_kb=512)
-        end_time = time.time()
-        speed = file_size / max((end_time - start_time), 0.1)
-        log(f"✅ UPLOAD DONE | {file_name} | Client: {client_ip} | Speed: {format_size(speed)}/s")
-        return res
+        return await client.upload_file(file_path, part_size_kb=512)
 
     part_size   = 512 * 1024
     total_parts = math.ceil(file_size / part_size)
@@ -230,10 +214,9 @@ async def parallel_upload(client, file_path, client_ip="Server"):
     sem = asyncio.Semaphore(15)
     uploaded_bytes = 0
     lock = asyncio.Lock()
-    last_log_time = time.time()
 
     async def upload_part(part_idx):
-        nonlocal uploaded_bytes, last_log_time
+        nonlocal uploaded_bytes
         async with sem:
             start = part_idx * part_size
             end   = min(start + part_size, file_size)
@@ -244,25 +227,14 @@ async def parallel_upload(client, file_path, client_ip="Server"):
             for attempt in range(5):
                 try:
                     await client(SaveBigFilePartRequest(file_id, part_idx, total_parts, chunk))
-                    async with lock:
-                        uploaded_bytes += chunk_len
-                        now = time.time()
-                        if now - last_log_time >= 3.0: 
-                            speed = uploaded_bytes / max((now - start_time), 0.1)
-                            log(f"📊 UPLOADING | {file_name} | Client: {client_ip} | {format_size(uploaded_bytes)}/{format_size(file_size)} | Speed: {format_size(speed)}/s")
-                            last_log_time = now
+                    async with lock: uploaded_bytes += chunk_len
                     return
-                except Exception as ex:
+                except Exception:
                     await asyncio.sleep(1 * (attempt + 1))
             raise Exception(f"Part {part_idx} failed after 5 attempts")
 
     tasks = [asyncio.create_task(upload_part(i)) for i in range(total_parts)]
     await asyncio.gather(*tasks)
-
-    end_time = time.time()
-    final_speed = file_size / max((end_time - start_time), 0.1)
-    log(f"✅ UPLOAD DONE | {file_name} | Client: {client_ip} | Avg Speed: {format_size(final_speed)}/s")
-
     return InputFileBig(id=file_id, parts=total_parts, name=file_name)
 
 @app.head("/download/{short_id}")
@@ -281,7 +253,7 @@ async def download_head(short_id: str):
     )
 
 # ============================================================
-# 🚀 MULTI-BOT 16-PIPE DOWNLOAD ENGINE (100% SEAMLESS & STABLE)
+# 🚀 100% STABLE DOWNLOAD ENGINE 
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
@@ -311,13 +283,12 @@ async def download_file(request: Request, short_id: str):
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
 
     content_length = end_byte - start_byte + 1
-    log(f"⬇️ DOWNLOAD START | {filename_raw} | Client: {client_ip} | Size: {format_size(content_length)}")
 
     try:
         base_client = get_random_client()
         message = await base_client.get_messages(entry["channel_id"], ids=entry["message_id"])
         if not message or not message.document:
-            raise HTTPException(status_code=404, detail="File deleted from Telegram")
+            raise HTTPException(status_code=404, detail="File deleted from Telegram or Bot is not admin in channel")
 
         document = message.document
 
@@ -325,10 +296,6 @@ async def download_file(request: Request, short_id: str):
             chunk_size = 512 * 1024  
             max_concurrent = 16          
             
-            start_time = time.time()
-            sent_bytes = 0
-            last_log_time = start_time
-
             chunks = []
             curr = start_byte
             while curr <= end_byte:
@@ -359,16 +326,10 @@ async def download_file(request: Request, short_id: str):
                                     break
                             
                             exact_data = chunk_data[:chunk_info["length"]]
-                            
-                            if len(exact_data) == chunk_info["length"] or (chunk_info["offset"] + len(exact_data) == file_size):
-                                return (index, exact_data)
-                            else:
-                                log(f"⚠️ Chunk {index} incomplete. Expected {chunk_info['length']}, got {len(exact_data)}. Retrying...")
-                        except Exception as e:
-                            log(f"⚠️ Chunk {index} fetch error (Attempt {attempt+1}): {e}")
-                    
+                            if exact_data: return (index, exact_data)
+                        except Exception:
+                            pass
                     await asyncio.sleep(0.5) 
-                
                 return (index, b"") 
 
             try:
@@ -380,7 +341,6 @@ async def download_file(request: Request, short_id: str):
                         active_tasks.add(task)
 
                     if not active_tasks: break
-
                     done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
                     active_tasks = pending
 
@@ -390,31 +350,16 @@ async def download_file(request: Request, short_id: str):
 
                     while next_chunk_index in downloaded_buffer:
                         data = downloaded_buffer.pop(next_chunk_index)
-                        
-                        if not data:
-                            log(f"❌ CRITICAL: Chunk {next_chunk_index} failed permanently. Stream aborted.")
-                            raise Exception("Download interrupted. Missing data chunk.")
-                            
+                        if not data: raise Exception("Download interrupted.")
                         next_chunk_index += 1
                         
                         step = 64 * 1024 
                         for i in range(0, len(data), step):
-                            chunk_piece = data[i:i+step]
-                            yield chunk_piece
-                            
-                            sent_bytes += len(chunk_piece)
-                            now = time.time()
-                            if now - last_log_time >= 3.0:
-                                speed = sent_bytes / max((now - start_time), 0.1)
-                                log(f"📡 DOWNLOADING | {filename_raw[:15]}... | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
-                                last_log_time = now
-                                
+                            yield data[i:i+step]
                             await asyncio.sleep(0.0001)
 
             except asyncio.CancelledError:
                 pass
-            except Exception as e:
-                log(f"Parallel Stream Error: {e}")
             finally:
                 for task in active_tasks: task.cancel()
 
@@ -429,15 +374,13 @@ async def download_file(request: Request, short_id: str):
         }
 
         status_code = 206 if range_header else 200
-        if range_header:
-            headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
+        if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
 
         return StreamingResponse(stream_direct(), status_code=status_code, headers=headers, media_type=content_type)
 
     except HTTPException:
         raise
     except Exception as e:
-        log(f"❌ DOWNLOAD ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================
@@ -463,7 +406,6 @@ async def list_files(page: int = 1, limit: int = 10, key: str = ""):
 @app.get("/api/index_forwarded")
 async def index_forwarded(request: Request, key: str, message_id: int, filename: str):
     verify_key(key)
-    client_ip = get_client_ip(request)
     try:
         client = get_random_client()
         message = await client.get_messages(CHANNEL_ID, ids=message_id)
@@ -478,7 +420,6 @@ async def index_forwarded(request: Request, key: str, message_id: int, filename:
             "doc_id": doc.id, "access_hash": doc.access_hash,
             "file_reference": doc.file_reference.hex(), "dc_id": doc.dc_id,
         })
-        log(f"✅ INSTANT INDEX DONE | {short_id} | Client: {client_ip}")
         return [{"file_code": short_id, "file_status": "OK"}]
     except Exception as e:
         return {"error": str(e)}
@@ -486,7 +427,6 @@ async def index_forwarded(request: Request, key: str, message_id: int, filename:
 @app.post("/api/upload")
 async def mock_upload(request: Request, key: str, file_0: UploadFile = File(...)):
     verify_key(key)
-    client_ip = get_client_ip(request)
     filename = file_0.filename
     tmp_path = f"/tmp/{uuid.uuid4()}{Path(filename).suffix}"
 
@@ -496,7 +436,7 @@ async def mock_upload(request: Request, key: str, file_0: UploadFile = File(...)
                 f.write(chunk)
 
         client = get_random_client()
-        uploaded_file = await parallel_upload(client, tmp_path, client_ip=client_ip)
+        uploaded_file = await parallel_upload(client, tmp_path)
         message = await client.send_file(CHANNEL_ID, uploaded_file, force_document=True)
 
         short_id = str(uuid.uuid4())[:8]
@@ -512,7 +452,6 @@ async def mock_upload(request: Request, key: str, file_0: UploadFile = File(...)
 
 @app.post("/api/remote_upload")
 async def mock_remote_upload(request: Request):
-    client_ip = get_client_ip(request)
     tmp_path = None
     try:
         data     = await request.json()
@@ -526,7 +465,6 @@ async def mock_remote_upload(request: Request):
         tmp_path = tmp.name
         tmp.close()
 
-        log(f"📥 REMOTE DOWNLOAD START | {filename} | Client: {client_ip}")
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as res:
                 with open(tmp_path, 'wb') as f:
@@ -535,7 +473,7 @@ async def mock_remote_upload(request: Request):
 
         file_size = os.path.getsize(tmp_path)
         client = get_random_client()
-        uploaded_file = await parallel_upload(client, tmp_path, client_ip=client_ip)
+        uploaded_file = await parallel_upload(client, tmp_path)
         message = await client.send_file(
             CHANNEL_ID, uploaded_file,
             caption=f"📁 {filename}\n💾 {format_size(file_size)}",
@@ -552,10 +490,8 @@ async def mock_remote_upload(request: Request):
             "file_reference": doc.file_reference.hex() if doc else None,
             "dc_id": doc.dc_id if doc else None,
         })
-        log(f"✅ REMOTE DONE | {short_id}")
         return [{"file_code": short_id, "file_status": "OK"}]
     except Exception as e:
-        log(f"❌ REMOTE ERROR: {e}")
         return {"error": str(e)}
     finally:
         if tmp_path and os.path.exists(tmp_path): os.unlink(tmp_path)
