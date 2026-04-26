@@ -16,7 +16,6 @@ from fastapi.staticfiles import StaticFiles
 import sys
 import aiohttp
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 from telethon.tl.types import InputFileBig
 from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 
@@ -51,14 +50,12 @@ app.add_middleware(
 # ⚡ SUPER SMART TOKEN LOADER (Reads BOT_TOKEN_1, BOT_TOKEN_2, etc.)
 # ============================================================
 raw_tokens = []
-# Automatically find all env variables starting with "BOT_TOKEN"
 for key, value in os.environ.items():
     if key.startswith("BOT_TOKEN"):
-        # split by comma just in case user mixes formats
         parts = [t.strip() for t in value.split(",") if t.strip()]
         raw_tokens.extend(parts)
 
-BOT_TOKENS = list(set(raw_tokens)) # Remove duplicates
+BOT_TOKENS = list(set(raw_tokens))
 
 API_ID           = int(os.getenv("API_ID", "0"))
 API_HASH         = os.getenv("API_HASH", "")
@@ -72,7 +69,7 @@ if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 # ============================================================
-# MULTI-BOT CLIENT POOLING SYSTEM
+# MULTI-BOT CLIENT POOLING SYSTEM (WITH PERSISTENT SESSIONS)
 # ============================================================
 _clients = []
 _bots_loading = True
@@ -81,18 +78,22 @@ async def init_clients():
     global _clients, _bots_loading
     
     if not BOT_TOKENS:
-        log("❌ CRITICAL ERROR: No Bot Tokens found! Please set BOT_TOKEN_1, BOT_TOKEN_2, etc.")
+        log("❌ CRITICAL ERROR: No Bot Tokens found!")
         _bots_loading = False
         return
 
     log(f"🤖 Initializing {len(BOT_TOKENS)} Bot Clients...")
+    os.makedirs("/app/data", exist_ok=True) # Ensure data folder exists for sessions
     
     for idx, token in enumerate(BOT_TOKENS):
         try:
             log(f"🔄 Starting Bot {idx + 1}...")
-            session = StringSession("")
+            
+            # ⚡ FIX 1: Use persistent file sessions. No more temporary bans on restart!
+            session_file = f"/app/data/bot_session_{idx}"
+            
             client = TelegramClient(
-                session, API_ID, API_HASH,
+                session_file, API_ID, API_HASH,
                 connection_retries=15,
                 retry_delay=2,
                 request_retries=10,
@@ -100,16 +101,24 @@ async def init_clients():
             )
             await client.start(bot_token=token)
             
-            # Fast Cache method
-            try:
-                await client.get_entity(CHANNEL_ID)
-            except Exception:
-                await client.get_dialogs() # Fallback to get_dialogs
-                
+            # ⚡ FIX 2: Append bot to list FIRST. Even if channel fetch fails, bot remains usable.
             _clients.append(client)
             log(f"✅ Bot {idx + 1} Connected and Ready!")
+            
+            # Run cache fetch in background safely
+            async def cache_channel(c):
+                try:
+                    await c.get_entity(CHANNEL_ID)
+                except Exception:
+                    try:
+                        await c.get_dialogs() 
+                    except Exception as e:
+                        log(f"⚠️ Bot Cache warning (Ignored): {e}")
+            
+            asyncio.create_task(cache_channel(client))
+            
         except Exception as e:
-            log(f"⚠️ Bot {idx + 1} initialization failed: {e}")
+            log(f"⚠️ Bot {idx + 1} completely failed to connect: {e}")
             
     _bots_loading = False
     log(f"🎯 Total Active Bots in Pool: {len(_clients)}")
@@ -118,7 +127,7 @@ def get_random_client():
     if _bots_loading:
         raise HTTPException(status_code=503, detail="Bots are connecting... Please wait 5 seconds.")
     if not _clients:
-        raise HTTPException(status_code=500, detail="CRITICAL: No bots connected! Check your Coolify tokens.")
+        raise HTTPException(status_code=500, detail="CRITICAL: No bots connected! Check your Coolify logs for FloodWait errors.")
     return random.choice(_clients)
 
 def format_size(size_bytes):
@@ -270,9 +279,7 @@ async def download_head(short_id: str):
             "Content-Disposition": f"attachment; filename*=UTF-8''{filename_safe}",
         }
     )
-# ============================================================
-# 🚀 MULTI-BOT 16-PIPE DOWNLOAD ENGINE (100% STABLE & RESUMABLE)
-# ============================================================
+
 # ============================================================
 # 🚀 MULTI-BOT 16-PIPE DOWNLOAD ENGINE (100% SEAMLESS & STABLE)
 # ============================================================
@@ -315,7 +322,7 @@ async def download_file(request: Request, short_id: str):
         document = message.document
 
         async def stream_direct():
-            chunk_size = 512 * 1024  # 512KB chunks
+            chunk_size = 512 * 1024  
             max_concurrent = 16          
             
             start_time = time.time()
@@ -342,7 +349,6 @@ async def download_file(request: Request, short_id: str):
                         worker_client = get_random_client()
                         try:
                             chunk_data = b""
-                            # ⚡ FIX: limit=1 hata diya. Jab tak poora data nahi milta, fetch karega
                             async for part in worker_client.iter_download(
                                 document, 
                                 offset=chunk_info["offset"], 
@@ -354,7 +360,6 @@ async def download_file(request: Request, short_id: str):
                             
                             exact_data = chunk_data[:chunk_info["length"]]
                             
-                            # ⚡ STRICT CHECK: Kya exact length mili ya file end ho gayi?
                             if len(exact_data) == chunk_info["length"] or (chunk_info["offset"] + len(exact_data) == file_size):
                                 return (index, exact_data)
                             else:
@@ -362,9 +367,9 @@ async def download_file(request: Request, short_id: str):
                         except Exception as e:
                             log(f"⚠️ Chunk {index} fetch error (Attempt {attempt+1}): {e}")
                     
-                    await asyncio.sleep(0.5) # Wait before retry
+                    await asyncio.sleep(0.5) 
                 
-                return (index, b"") # 3 attempts failed
+                return (index, b"") 
 
             try:
                 while next_chunk_index < len(chunks):
@@ -392,7 +397,6 @@ async def download_file(request: Request, short_id: str):
                             
                         next_chunk_index += 1
                         
-                        # ⚡ FIX: Chunks ko chhote steps me bhejna taaki browser connection cut na kare
                         step = 64 * 1024 
                         for i in range(0, len(data), step):
                             chunk_piece = data[i:i+step]
@@ -405,7 +409,6 @@ async def download_file(request: Request, short_id: str):
                                 log(f"📡 DOWNLOADING | {filename_raw[:15]}... | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
                                 last_log_time = now
                                 
-                            # Connection ko zinda rakhne ke liye minor sleep
                             await asyncio.sleep(0.0001)
 
             except asyncio.CancelledError:
@@ -436,7 +439,6 @@ async def download_file(request: Request, short_id: str):
     except Exception as e:
         log(f"❌ DOWNLOAD ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ============================================================
 # OTHER ROUTES 
