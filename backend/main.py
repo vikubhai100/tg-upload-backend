@@ -354,7 +354,6 @@ async def download_file(request: Request, short_id: str):
     filename_raw = entry["filename"]
     content_type = entry["content_type"] or "application/octet-stream"
 
-    # ── Range header parse ──────────────────────────────────
     range_header = request.headers.get("Range")
     start_byte   = 0
     end_byte     = file_size - 1
@@ -373,91 +372,104 @@ async def download_file(request: Request, short_id: str):
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
 
     content_length = end_byte - start_byte + 1
-    log(f"⬇️ DOWNLOAD START | {filename_raw} | Client: {client_ip} | Range: {format_size(start_byte)}-{format_size(end_byte)} | Total: {format_size(content_length)}")
+    log(f"⬇️ DOWNLOAD START | {filename_raw} | Client: {client_ip} | Total: {format_size(content_length)}")
+
+    async def _fresh_location(cl, ent, sid):
+        """Telegram se fresh file reference lo aur DB update karo"""
+        msg = await cl.get_messages(int(ent["channel_id"]), ids=int(ent["message_id"]))
+        if not msg or not msg.document:
+            return None, None
+        d = msg.document
+        loc = InputDocumentFileLocation(
+            id=d.id, access_hash=d.access_hash,
+            file_reference=d.file_reference, thumb_size=""
+        )
+        ent["file_reference"] = d.file_reference.hex()
+        ent["doc_id"]         = str(d.id)
+        ent["access_hash"]    = str(d.access_hash)
+        ent["dc_id"]          = d.dc_id
+        save_file_entry(sid, ent)
+        log(f"🔄 FILE REF REFRESHED | {ent['filename']}")
+        return loc, d.dc_id
 
     try:
         client = await get_user_client()
 
-        # ── Document location banao ─────────────────────────
         doc_location, dc_id, _ = await _get_document_location(entry)
-
         if doc_location is None:
-            # Fallback: message se fetch karo
-            message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
-            if not message or not message.document:
+            doc_location, dc_id = await _fresh_location(client, entry, short_id)
+            if doc_location is None:
                 raise HTTPException(status_code=404, detail="File deleted from Telegram")
-            doc      = message.document
-            doc_location = InputDocumentFileLocation(
-                id=doc.id,
-                access_hash=doc.access_hash,
-                file_reference=doc.file_reference,
-                thumb_size=""
-            )
-            dc_id = doc.dc_id
-            # DB me updated file_reference save karo
-            entry["file_reference"] = doc.file_reference.hex()
-            save_file_entry(short_id, entry)
 
-        # ── Turbo stream generator ───────────────────────────
         async def turbo_stream():
-            # 512KB yield — TCP window ke saath sync, browser buffer fast bharega
+            nonlocal doc_location, dc_id
             YIELD_SIZE   = 512 * 1024
-            # Telegram ka max allowed request_size = 1MB (MTProto limit)
             REQUEST_SIZE = 1 * 1024 * 1024
-
             sent_bytes    = 0
             start_time    = time.time()
             last_log_time = start_time
             buffer        = b""
+            loc           = doc_location
+            dcid          = dc_id
 
-            try:
-                # ── Seedha iter_download — Telegram ka native
-                # sequential reader. Internally already pipelined
-                # hai. offset se shuru karo, loop me koi sleep nahi.
-                async for tg_chunk in client.iter_download(
-                    doc_location,
-                    offset       = start_byte,       # range seek seedhi
-                    request_size = REQUEST_SIZE,      # 1MB har Telegram request
-                    dc_id        = dc_id,             # sahi DC se directly connect
-                ):
-                    buffer     += tg_chunk
-                    sent_bytes += len(tg_chunk)
+            # Async generator ke andar try/except kaam nahi karta
+            # isliye chunks queue mein collect karke yield karte hain
+            # aur error ko flag se handle karte hain
+            while True:
+                ref_error   = False
+                other_error = None
 
-                    # Sirf content_length tak hi bhejo
-                    if sent_bytes > content_length:
-                        overflow = sent_bytes - content_length
-                        buffer   = buffer[: len(buffer) - overflow]
+                try:
+                    async for tg_chunk in client.iter_download(
+                        loc, offset=start_byte + sent_bytes,
+                        request_size=REQUEST_SIZE, dc_id=dcid,
+                    ):
+                        buffer     += tg_chunk
+                        sent_bytes += len(tg_chunk)
+                        if sent_bytes > content_length:
+                            buffer = buffer[: len(buffer) - (sent_bytes - content_length)]
+                        while len(buffer) >= YIELD_SIZE:
+                            yield buffer[:YIELD_SIZE]
+                            buffer = buffer[YIELD_SIZE:]
+                        now = time.time()
+                        if now - last_log_time >= 3.0:
+                            speed = sent_bytes / max((now - start_time), 0.1)
+                            log(f"📡 STREAMING | {filename_raw} | {format_size(min(sent_bytes,content_length))}/{format_size(content_length)} | {format_size(speed)}/s")
+                            last_log_time = now
+                        if sent_bytes >= content_length:
+                            break
+                    # Normal completion
+                    break
 
-                    # 512KB buffer bharti hai toh yield karo
-                    while len(buffer) >= YIELD_SIZE:
-                        yield buffer[:YIELD_SIZE]
-                        buffer = buffer[YIELD_SIZE:]
+                except Exception as e:
+                    err = str(e).lower()
+                    if "file reference" in err or "expired" in err:
+                        ref_error = True
+                    else:
+                        other_error = e
 
-                    now = time.time()
-                    if now - last_log_time >= 3.0:
-                        speed = sent_bytes / max((now - start_time), 0.1)
-                        log(f"📡 STREAMING | {filename_raw} | Client: {client_ip} | "
-                            f"{format_size(min(sent_bytes, content_length))}/{format_size(content_length)} | "
-                            f"Speed: {format_size(speed)}/s")
-                        last_log_time = now
+                if ref_error:
+                    log(f"🔄 FILE REF EXPIRED — Auto refresh | {filename_raw}")
+                    try:
+                        loc, dcid = await _fresh_location(client, entry, short_id)
+                        if loc is None:
+                            log(f"❌ File deleted from Telegram | {filename_raw}")
+                            return
+                        log(f"✅ Refreshed — Retrying | {filename_raw}")
+                        continue  # Retry with fresh reference
+                    except Exception as e2:
+                        log(f"❌ REFRESH FAILED | {filename_raw} | {e2}")
+                        return
 
-                    if sent_bytes >= content_length:
-                        break
+                if other_error:
+                    log(f"❌ STREAM ERROR | {filename_raw} | {other_error}")
+                    return
 
-                # Buffer me jo bacha hai usse bhi bhejo
-                if buffer:
-                    yield buffer
+            if buffer:
+                yield buffer
 
-                total_time = max(time.time() - start_time, 0.1)
-                avg_speed  = min(sent_bytes, content_length) / total_time
-                log(f"✅ DOWNLOAD DONE | {filename_raw} | Client: {client_ip} | "
-                    f"Avg Speed: {format_size(avg_speed)}/s | Time: {total_time:.1f}s")
-
-            except asyncio.CancelledError:
-                log(f"🛑 DOWNLOAD CANCELLED | {filename_raw} | Client: {client_ip} | "
-                    f"Sent: {format_size(sent_bytes)}")
-            except Exception as e:
-                log(f"❌ STREAM ERROR | {filename_raw} | {e}")
+            total_time = max(time.time() - start_time, 0.1)
+            log(f"✅ DONE | {filename_raw} | {format_size(min(sent_bytes,content_length)/total_time)}/s | {total_time:.1f}s")
 
         # ── Response headers ────────────────────────────────
         encoded_filename = quote(filename_raw)
