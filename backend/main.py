@@ -244,6 +244,9 @@ async def download_head(short_id: str):
 # ============================================================
 # 🚀 16-PIPE DOWNLOAD ENGINE (With IP & Live Speed Tracker)
 # ============================================================
+# ============================================================
+# 🚀 SMART DOWNLOAD ENGINE (With DC-Awareness & Auto-Retry)
+# ============================================================
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
     client_ip = get_client_ip(request)
@@ -273,7 +276,7 @@ async def download_file(request: Request, short_id: str):
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
 
     content_length = end_byte - start_byte + 1
-    log(f"⬇️ DOWNLOAD START (16-Pipes) | {filename_raw} | Client: {client_ip} | Request: {format_size(content_length)}")
+    log(f"⬇️ DOWNLOAD START | {filename_raw} | Client: {client_ip} | Request: {format_size(content_length)}")
 
     try:
         client = await get_client()
@@ -285,22 +288,31 @@ async def download_file(request: Request, short_id: str):
 
         async def stream_direct():
             chunk_size = 1 * 1024 * 1024 
-            prefetch_tasks = 16  # 16 parallel tasks strictly running
+            
+            # ⚡ FIX 1: DYNAMIC DATA CENTER (DC) PIPES
+            # Agar file server ke bahar se aayi hai (Foreign DC), toh connections kam rakho taaki block na ho
+            bot_dc = getattr(client.session, 'dc_id', 0)
+            file_dc = getattr(document, 'dc_id', 0)
+            prefetch_tasks = 16 if (bot_dc == file_dc or bot_dc == 0) else 4
 
             start_time = time.time()
             sent_bytes = 0
             last_log_time = start_time
 
             async def download_exact_chunk(off, length):
-                data = b""
-                try:
-                    async for chunk in client.iter_download(document, offset=off, request_size=1024*1024):
-                        data += chunk
-                        if len(data) >= length:
-                            return data[:length]
-                except Exception as e:
-                    log(f"Chunk error at {off}: {e}")
-                return data
+                # ⚡ FIX 2: AUTO-RETRY SYSTEM (Aggressive 3 Retries)
+                for attempt in range(3):
+                    data = b""
+                    try:
+                        async for chunk in client.iter_download(document, offset=off, request_size=1024*1024):
+                            data += chunk
+                            if len(data) >= length:
+                                return data[:length]
+                        return data
+                    except Exception as e:
+                        log(f"⚠️ Chunk error at {off} (Attempt {attempt+1}): {e}")
+                        await asyncio.sleep(1.5)  # Wait before retrying foreign DC
+                return b"" # Fail after 3 attempts
 
             try:
                 current_offset = start_byte
@@ -317,7 +329,9 @@ async def download_file(request: Request, short_id: str):
                         first_task = pending_tasks.pop(0)
                         chunk_data = await first_task
 
+                        # ⚡ FIX 3: ABORT PROTECTION
                         if not chunk_data:
+                            log(f"❌ STREAM ABORTED: Cannot fetch chunk for {filename_raw} (DC limit hit)")
                             break
 
                         step = 256 * 1024
@@ -330,13 +344,13 @@ async def download_file(request: Request, short_id: str):
 
                             if now - last_log_time >= 3.0:
                                 speed = sent_bytes / max((now - start_time), 0.1)
-                                log(f"📡 DOWNLOADING | {filename_raw} | Client: {client_ip} | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
+                                log(f"📡 DOWNLOADING ({prefetch_tasks}-Pipes) | {filename_raw} | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
                                 last_log_time = now
 
                             await asyncio.sleep(0.0001)
 
             except asyncio.CancelledError:
-                log(f"🛑 DOWNLOAD STOPPED (User/App) | {filename_raw} | Client: {client_ip} | Sent: {format_size(sent_bytes)}")
+                log(f"🛑 DOWNLOAD STOPPED (User/App) | {filename_raw} | Sent: {format_size(sent_bytes)}")
             except Exception as e:
                 log(f"Parallel Stream Error: {e}")
 
