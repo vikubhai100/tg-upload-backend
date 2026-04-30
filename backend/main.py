@@ -147,25 +147,20 @@ def save_file_entry(short_id, data):
         conn.commit(); conn.close()
 
 async def cache_cleanup_loop():
-    """Har ghante check karega aur 24H purane caches mita dega"""
     await asyncio.sleep(60) 
     while True:
         try:
             cutoff_time = int(time.time()) - (24 * 3600) 
             conn = get_db_connection()
             rows = conn.execute("SELECT short_id, r2_cache_key FROM files WHERE r2_cache_key IS NOT NULL AND last_accessed < ?", (cutoff_time,)).fetchall()
-            
             for row in rows:
                 short_id, cache_key = row["short_id"], row["r2_cache_key"]
-                try:
-                    r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
-                    log(f"🗑️ 24H CACHE CLEARED | {short_id} removed from R2.")
+                try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
                 except: pass
-                
                 conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
                 conn.commit()
             conn.close()
-        except Exception as e: pass
+        except: pass
         await asyncio.sleep(3600)
 
 def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
@@ -179,29 +174,43 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     except Exception as e: raise HTTPException(status_code=500)
 
 # ============================================================
-# 🧠 THE MASTER SPOOLER: TEMP FILE + CACHE (DISK FIX)
+# 🧠 THE MASTER SPOOLER: TEMP FILE + CACHE (ZIDDI AUTO-RESUME FIX)
 # ============================================================
 _active_dl = {} 
 
 async def bg_fetch_and_cache(short_id, entry):
-    """Telegram -> Temp File (Force Flush) -> Cloudflare R2"""
+    """Telegram -> Temp File (With Ultra Auto-Resume) -> Cloudflare R2"""
     tmp_path = f"/tmp/dl_{short_id}.bin"
+    file_size = int(entry["size"])
+    current_offset = 0
+    mode = "wb" # Pehli baar naya file banega
+
     try:
+        log(f"⚙️ SPOOLER START | Fetching {short_id} ({format_size(file_size)}) to Temp...")
         client = await get_client()
-        message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
-        
-        log(f"⚙️ SPOOLER START | Downloading {short_id} to Temp Memory...")
-        
-        # ⚡ FIX: Open file ONCE, write and force flush to disk
-        with open(tmp_path, "wb") as f_out:
-            async for chunk in client.iter_download(message.document, request_size=1024*1024):
-                f_out.write(chunk)
-                f_out.flush() # Force memory to disk immediately
-                _active_dl[short_id]["dl_bytes"] += len(chunk)
-                await asyncio.sleep(0.01) # Keep server breathing
-            
+
+        # ⚡ THE ZIDDI AUTO-RESUME LOOP ⚡
+        while current_offset < file_size:
+            try:
+                message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
+                with open(tmp_path, mode) as f_out:
+                    async for chunk in client.iter_download(message.document, offset=current_offset, request_size=1024*1024):
+                        f_out.write(chunk)
+                        f_out.flush()
+                        os.fsync(f_out.fileno()) # Force write to physical disk
+                        
+                        current_offset += len(chunk)
+                        _active_dl[short_id]["dl_bytes"] = current_offset
+                        await asyncio.sleep(0.01) # Keep VPS smooth
+                        
+            except Exception as e:
+                # Agar Telegram connection tod de, toh hum rukenge nahi!
+                log(f"⚠️ Spooler TG Drop @ {format_size(current_offset)}. Retrying... Err: {e}")
+                mode = "ab" # Ab file ke aage se continue karna hai
+                await asyncio.sleep(2) # 2 second wait karke wapas hamla
+
         _active_dl[short_id]["done"] = True
-        log(f"✅ SPOOLER DONE | {short_id} saved to Temp. Uploading to R2 Cache...")
+        log(f"✅ SPOOLER DONE | {short_id} fully saved to Temp! Uploading to R2...")
         
         # --- UPLOAD TO R2 CACHE ---
         r2_cache_key = f"cache_{short_id}_{uuid.uuid4().hex[:6]}"
@@ -212,14 +221,13 @@ async def bg_fetch_and_cache(short_id, entry):
         conn = get_db_connection()
         conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
         conn.commit(); conn.close()
-        
         log(f"☁️ R2 CACHE SUCCESS | {short_id} cached perfectly!")
         
     except Exception as e:
         _active_dl[short_id]["err"] = True
-        log(f"❌ Spooler Error for {short_id}: {e}")
+        log(f"❌ FATAL Spooler Error for {short_id}: {e}")
     finally:
-        await asyncio.sleep(900) # Give users 15 minutes to stream from Temp before deleting it
+        await asyncio.sleep(900) 
         _active_dl.pop(short_id, None)
         try: os.remove(tmp_path)
         except: pass
@@ -269,7 +277,7 @@ async def download_handle(request: Request, short_id: str):
     content_length = end_byte - start_byte + 1
     log(f"⬇️ SPOOL STREAM START | {filename_raw} | IP: {client_ip}")
 
-    # ⚡ NEVER-GIVE-UP TEMP FILE STREAMER
+    # ⚡ NEVER-GIVE-UP TEMP FILE STREAMER (ERROR SAFE)
     async def temp_file_streamer():
         with open(tmp_path, "rb") as f:
             f.seek(start_byte)
@@ -278,17 +286,22 @@ async def download_handle(request: Request, short_id: str):
             while curr <= end_byte:
                 if await request.is_disconnected(): break
                 
-                # Check if browser reached the part not yet downloaded by Telegram
-                while curr >= _active_dl[short_id]["dl_bytes"]:
-                    if _active_dl[short_id]["done"]: break
-                    if _active_dl[short_id]["err"]: return
-                    await asyncio.sleep(0.2) 
+                target_bytes = _active_dl[short_id]["dl_bytes"]
                 
-                # Full verification if natural completion
-                if _active_dl[short_id]["done"] and curr >= _active_dl[short_id]["dl_bytes"]:
+                while curr >= target_bytes:
+                    if _active_dl[short_id]["done"]: break
+                    if _active_dl[short_id]["err"]: 
+                        # ⚡ FIX: Agar background fail ho jaye, toh browser ko ERROR throw karo,
+                        # taaki usko pata chale ki ye complete nahi, FAIL hua hai!
+                        raise RuntimeError("Backend connection to Telegram dropped")
+                        
+                    await asyncio.sleep(0.2) 
+                    target_bytes = _active_dl[short_id]["dl_bytes"]
+                
+                if _active_dl[short_id]["done"] and curr >= target_bytes:
                     break 
 
-                avail = _active_dl[short_id]["dl_bytes"] - curr
+                avail = target_bytes - curr
                 read_size = min(128 * 1024, end_byte - curr + 1)
                 if not _active_dl[short_id]["done"]:
                     read_size = min(read_size, avail)
@@ -296,10 +309,8 @@ async def download_handle(request: Request, short_id: str):
                 if read_size > 0:
                     data = f.read(read_size)
                     if not data: 
-                        # ⚡ FIX: Agar OS ne flush nahi kiya hai, toh break mat karo! 
-                        # Wait and try reading again. This prevents the 20MB premature cut.
                         await asyncio.sleep(0.1)
-                        f.seek(curr) # Reset pointer
+                        f.seek(curr) 
                         continue
                         
                     yield data
