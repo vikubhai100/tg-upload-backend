@@ -82,9 +82,23 @@ SESSION_STR      = os.getenv("SESSION_STRING", "")
 DB_FILE_SQLITE   = "/app/data/files.db"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "super_secret_key_123")
 
+# ============================================================
+# 📁 FRONTEND SERVING (Wapas Add Kar Diya)
+# ============================================================
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    index = FRONTEND_DIR / "index.html"
+    if index.exists(): 
+        return HTMLResponse(content=index.read_text())
+    return HTMLResponse(content="<h1>TeleStore Backend Running Successfully</h1>")
+
+@app.get("/favicon.ico")
+async def favicon(): 
+    return Response(status_code=204)
 
 # ============================================================
 # DATABASE — Hybrid Support
@@ -108,13 +122,11 @@ def init_db():
         storage_type TEXT DEFAULT 'telegram',
         r2_key      TEXT
     )''')
-
     try:
         conn.execute("ALTER TABLE files ADD COLUMN storage_type TEXT DEFAULT 'telegram'")
         conn.execute("ALTER TABLE files ADD COLUMN r2_key TEXT")
     except:
         pass
-
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.commit()
@@ -187,7 +199,6 @@ async def download_file(request: Request, short_id: str):
             log(f"❌ R2 URL Error: {e}")
             raise HTTPException(status_code=500, detail="R2 Link Generation Failed")
 
-    # TELEGRAM STREAMING Logic
     file_size = int(entry["size"])
     filename_raw = entry["filename"]
     content_type = entry["content_type"] or "application/octet-stream"
@@ -265,7 +276,7 @@ async def download_file(request: Request, short_id: str):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================
-# 🚀 REGISTER R2 FILE (Used by Node.js Finalize)
+# 🚀 REGISTER R2 FILE
 # ============================================================
 @app.post("/api/file/register_r2")
 async def register_r2(key: str, data: dict = Body(...)):
@@ -283,33 +294,26 @@ async def register_r2(key: str, data: dict = Body(...)):
     return {"status": "OK"}
 
 # ============================================================
-# 🗑️ SMART DELETE (Physical Storage Cleanup)
+# 🗑️ SMART DELETE
 # ============================================================
 @app.get("/api/file/delete")
 async def mock_delete(key: str, file_code: str):
     verify_key(key)
-    
-    # 1. DB se details nikaalo
     entry = get_file_entry(file_code)
-    
     if entry:
-        # 2. Agar file R2 par hai, toh Cloudflare se mitao
         if entry.get("storage_type") == "r2" and entry.get("r2_key"):
             try:
                 r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
                 log(f"🗑️ R2 PHYSICAL DELETE | {entry['r2_key']}")
             except Exception as e:
                 log(f"❌ R2 Physical Delete Failed: {e}")
-
-        # 3. DB entry udao
         delete_file_entry(file_code)
         log(f"✅ DB ENTRY DELETED | {file_code}")
         return {"status": 200, "msg": "OK"}
-    
-    return {"status": 404, "msg": "File Not Found"}
+    return {"status": 404, "msg": "Not Found"}
 
 # ============================================================
-# UTILITIES & CLIENT
+# BOT & OTHER UTILITIES
 # ============================================================
 _client = None
 async def get_client():
