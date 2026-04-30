@@ -79,11 +79,9 @@ DB_FILE_SQLITE   = "/app/data/files.db"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "super_secret_key_123")
 
 # ============================================================
-# 📁 FRONTEND SERVING (PATH FIXED)
+# 📁 FRONTEND SERVING
 # ============================================================
-# Agar main.py 'Backend/' ke andar hai, toh humein ek level bahar nikalna hoga
 CURRENT_FILE_PATH = Path(__file__).resolve()
-# Backend folder se bahar niklo (Root par), phir frontend folder mein jao
 FRONTEND_DIR = CURRENT_FILE_PATH.parent.parent / "frontend"
 
 @app.get("/", response_class=HTMLResponse)
@@ -91,20 +89,7 @@ async def serve_index():
     index_file = FRONTEND_DIR / "index.html"
     if index_file.exists():
         return index_file.read_text(encoding="utf-8")
-
-    # Debugging message agar ab bhi na mile
-    return f"""
-    <div style="font-family:sans-serif; padding:40px;">
-        <h2 style="color:red;">Frontend Folder Not Found!</h2>
-        <p>Searching at: <b>{index_file}</b></p>
-        <p>Please ensure your folder structure is like this:</p>
-        <pre>/app
-  /Backend
-    main.py
-  /frontend
-    index.html</pre>
-    </div>
-    """
+    return "<h2>Frontend Not Found</h2>"
 
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
@@ -122,10 +107,16 @@ def init_db():
         content_type TEXT, channel_id INTEGER, doc_id TEXT, access_hash TEXT,
         file_reference TEXT, dc_id INTEGER, storage_type TEXT DEFAULT 'telegram', r2_key TEXT
     )''')
-    try:
-        conn.execute("ALTER TABLE files ADD COLUMN storage_type TEXT DEFAULT 'telegram'")
-        conn.execute("ALTER TABLE files ADD COLUMN r2_key TEXT")
+    
+    try: conn.execute("ALTER TABLE files ADD COLUMN storage_type TEXT DEFAULT 'telegram'")
     except: pass
+    try: conn.execute("ALTER TABLE files ADD COLUMN r2_key TEXT")
+    except: pass
+    try: conn.execute("ALTER TABLE files ADD COLUMN last_accessed INTEGER DEFAULT 0")
+    except: pass
+    try: conn.execute("ALTER TABLE files ADD COLUMN r2_cache_key TEXT")
+    except: pass
+
     conn.execute("PRAGMA journal_mode=WAL")
     conn.commit(); conn.close()
 
@@ -143,18 +134,103 @@ def get_file_entry(short_id):
 def save_file_entry(short_id, data):
     with _db_lock:
         conn = get_db_connection()
-        conn.execute('''REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        existing = conn.execute("SELECT last_accessed, r2_cache_key FROM files WHERE short_id = ?", (short_id,)).fetchone()
+        last_acc = existing["last_accessed"] if existing else int(time.time())
+        cache_key = existing["r2_cache_key"] if existing else None
+
+        conn.execute('''REPLACE INTO files (short_id, message_id, filename, size, content_type, channel_id, doc_id, access_hash, file_reference, dc_id, storage_type, r2_key, last_accessed, r2_cache_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (short_id, data.get("message_id", 0), data.get("filename"), data.get("size"),
              data.get("content_type"), data.get("channel_id", 0), str(data.get("doc_id", "0")),
              str(data.get("access_hash", "0")), str(data.get("file_reference", "0")), 
-             data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key")))
+             data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key))
         conn.commit(); conn.close()
 
 # ============================================================
-# ⬇️ SMART DOWNLOAD ENGINE (FIXED TELEGRAM STREAMING)
+# 🧠 SMART R2 CACHING SYSTEM (BACKGROUND TASKS)
 # ============================================================
+_caching_tasks = set()
+
+async def cache_tg_to_r2(short_id):
+    """Background me Telegram file ko Cloudflare R2 me bhejega, slowly."""
+    try:
+        # ⚡ 60 seconds ka delay taaki user ka current download distub na ho
+        await asyncio.sleep(60) 
+        
+        entry = get_file_entry(short_id)
+        if not entry or entry.get("storage_type") == "r2" or entry.get("r2_cache_key"):
+            return
+        
+        log(f"⚙️ SMART CACHE START | Backing up {short_id} to R2...")
+        client = await get_client()
+        message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
+        if not message or not message.document: return
+
+        tmp_path = f"/tmp/cache_{short_id}_{int(time.time())}.bin"
+        
+        # Download from Telegram slowly
+        with open(tmp_path, "wb") as f:
+            async for chunk in client.iter_download(message.document, request_size=512*1024):
+                f.write(chunk)
+                await asyncio.sleep(0.05) # Yield control to keep server light
+        
+        # Upload to Cloudflare R2
+        r2_cache_key = f"cache_{short_id}_{uuid.uuid4().hex[:6]}"
+        def s3_upload():
+            r2_client.upload_file(tmp_path, R2_BUCKET_NAME, r2_cache_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
+        await asyncio.to_thread(s3_upload)
+        
+        # Update Database with new Cache Key
+        conn = get_db_connection()
+        conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
+        conn.commit(); conn.close()
+        
+        try: os.remove(tmp_path)
+        except: pass
+        log(f"✅ CACHE SUCCESS | {short_id} is now blazingly fast on R2!")
+        
+    except Exception as e:
+        log(f"❌ CACHE FAILED | {short_id} | Err: {e}")
+    finally:
+        _caching_tasks.discard(short_id)
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
+
+async def cache_cleanup_loop():
+    """Har ghante check karega aur 24H purane caches mita dega"""
+    await asyncio.sleep(60) 
+    while True:
+        try:
+            cutoff_time = int(time.time()) - (24 * 3600) 
+            conn = get_db_connection()
+            rows = conn.execute("SELECT short_id, r2_cache_key FROM files WHERE r2_cache_key IS NOT NULL AND last_accessed < ?", (cutoff_time,)).fetchall()
+            
+            for row in rows:
+                short_id, cache_key = row["short_id"], row["r2_cache_key"]
+                try:
+                    r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
+                    log(f"🗑️ 24H CACHE CLEARED | {short_id} removed from R2.")
+                except Exception as e: pass
+                
+                conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
+                conn.commit()
+            conn.close()
+        except Exception as e: pass
+        await asyncio.sleep(3600)
+
+def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
+    try:
+        url = r2_client.generate_presigned_url('get_object', Params={
+            'Bucket': R2_BUCKET_NAME, 'Key': r2_key,
+            'ResponseContentDisposition': f"attachment; filename=\"{filename}\""
+        }, ExpiresIn=7200)
+        log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
+        return RedirectResponse(url=url)
+    except Exception as e: raise HTTPException(status_code=500)
+
 # ============================================================
-# ⬇️ SMART DOWNLOAD ENGINE (BULLETPROOF CHUNK-BY-CHUNK)
+# ⬇️ SMART DOWNLOAD ENGINE (ULTRA-STABLE / SLOW & STEADY)
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_handle(request: Request, short_id: str):
@@ -162,19 +238,20 @@ async def download_handle(request: Request, short_id: str):
     entry = get_file_entry(short_id)
     if not entry: raise HTTPException(status_code=404, detail="File Not Found")
 
-    # 🚀 R2 REDIRECT LOGIC
-    if entry.get("storage_type") == "r2":
-        try:
-            url = r2_client.generate_presigned_url('get_object', Params={
-                'Bucket': R2_BUCKET_NAME, 'Key': entry["r2_key"],
-                'ResponseContentDisposition': f"attachment; filename=\"{entry['filename']}\""
-            }, ExpiresIn=7200)
-            log(f"🚀 R2 REDIRECT | {entry['filename']} | IP: {client_ip}")
-            return RedirectResponse(url=url)
-        except Exception as e:
-            log(f"❌ R2 URL Error: {e}"); raise HTTPException(status_code=500)
+    conn = get_db_connection()
+    conn.execute("UPDATE files SET last_accessed = ? WHERE short_id = ?", (int(time.time()), short_id))
+    conn.commit(); conn.close()
 
-    # 🔵 TELEGRAM STREAMING LOGIC
+    if entry.get("storage_type") == "r2" and entry.get("r2_key"):
+        return redirect_to_r2(entry["r2_key"], entry["filename"], client_ip, "PERMANENT")
+
+    if entry.get("r2_cache_key"):
+        return redirect_to_r2(entry["r2_cache_key"], entry["filename"], client_ip, "CACHED LINK")
+
+    if short_id not in _caching_tasks:
+        _caching_tasks.add(short_id)
+        asyncio.create_task(cache_tg_to_r2(short_id))
+
     file_size = int(entry["size"])
     filename_raw = entry["filename"]
     content_type = entry["content_type"] or "application/octet-stream"
@@ -189,7 +266,7 @@ async def download_handle(request: Request, short_id: str):
         except: pass
 
     content_length = end_byte - start_byte + 1
-    log(f"⬇️ STREAM START | {filename_raw} | IP: {client_ip}")
+    log(f"⬇️ STREAM START (Ultra-Stable) | {filename_raw} | IP: {client_ip}")
 
     try:
         client = await get_client()
@@ -198,63 +275,50 @@ async def download_handle(request: Request, short_id: str):
         document = message.document
 
         async def stream_generator():
-            chunk_size = 1024 * 1024 # 1MB (Telegram's strict limit)
+            # ⚡ ROCK SOLID LOGIC: Very small chunks to prevent TG from closing connection
+            chunk_size = 512 * 1024 # Sirf 512KB fetch karega
             current_offset = start_byte
 
             while current_offset <= end_byte:
-                if await request.is_disconnected():
-                    log(f"🛑 Browser Disconnected | {filename_raw}")
-                    break
-                
+                if await request.is_disconnected(): break
                 chunk_data = b""
-                retries = 10
-                
+                retries = 20 # Retry count badha diya
+
                 for attempt in range(retries):
                     try:
-                        # ⚡ IRONCLAD LOGIC: Hum sirf 1 chunk lenge aur loop tod denge
                         async for chunk in client.iter_download(document, offset=current_offset, request_size=chunk_size):
                             chunk_data = chunk
-                            break # Sirf pehla chunk liya aur Telegram stream se bahar aa gaye
-                        
-                        if chunk_data:
-                            break # Chunk mil gaya, retry loop se bahar nikal aao
-                            
+                            break
+                        if chunk_data: break
                     except Exception as e:
-                        log(f"⚠️ Retry {attempt+1}/{retries} | Offset: {current_offset} | Err: {e}")
-                        await asyncio.sleep(1.5) # Thoda ruk kar exact wahi offset se wapas try karega
-                
-                if not chunk_data:
-                    log(f"❌ Fatal drop at offset {current_offset}")
-                    break # Agar 10 baar me bhi TG ne data nahi diya, tabhi stream band hogi
-                
-                # Agar aakhri chunk file size se aage nikal jaye
-                if current_offset + len(chunk_data) - 1 > end_byte:
-                    excess = (current_offset + len(chunk_data) - 1) - end_byte
-                    chunk_data = chunk_data[:-excess]
+                        log(f"⚠️ Slow Stream Retry {attempt+1}/{retries} | Err: {e}")
+                        await asyncio.sleep(2.0) # Connection tootne par 2 sec aaram karke wapas try karega
 
-                # ⚡ BROWSER ANTI-TIMEOUT: Browser ko 64KB ke tukdo me data do taaki wo active rahe
-                step = 64 * 1024
+                if not chunk_data: break
+                if current_offset + len(chunk_data) - 1 > end_byte:
+                    chunk_data = chunk_data[:(end_byte - current_offset + 1)]
+
+                # ⚡ DRIP FEED: Browser ko sirf 32KB karke data dega aur har chunk me halka sa delay lega
+                step = 32 * 1024 
                 for i in range(0, len(chunk_data), step):
                     if await request.is_disconnected(): break
                     yield chunk_data[i:i+step]
-                    
+                    await asyncio.sleep(0.01) # Browser ko timeout hone se rokenge
+
                 current_offset += len(chunk_data)
 
         headers = {
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename_raw)}",
-            "Content-Type": content_type, 
-            "Content-Length": str(content_length),
-            "Accept-Ranges": "bytes", 
-            "X-Accel-Buffering": "no"
+            "Content-Type": content_type, "Content-Length": str(content_length),
+            "Accept-Ranges": "bytes", "X-Accel-Buffering": "no"
         }
         if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
         return StreamingResponse(stream_generator(), status_code=206 if range_header else 200, headers=headers)
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 
-
 # ============================================================
-# 🚀 UPLOAD & REMOTE LOGIC (MediaFire/DevUpload Friendly)
+# 🚀 UPLOAD & REMOTE LOGIC
 # ============================================================
 async def parallel_upload(client, file_path):
     size = os.path.getsize(file_path)
@@ -299,7 +363,7 @@ async def remote_upload(request: Request):
     except Exception as e: return {"error": str(e)}
 
 # ============================================================
-# 📑 FILE MANAGEMENT (Clone, Rename, Delete, Info)
+# 📑 FILE MANAGEMENT
 # ============================================================
 @app.get("/api/file/clone")
 async def file_clone(key: str, file_code: str):
@@ -312,9 +376,14 @@ async def file_clone(key: str, file_code: str):
 @app.get("/api/file/delete")
 async def file_delete(key: str, file_code: str):
     verify_key(key); entry = get_file_entry(file_code)
-    if entry and entry.get("storage_type") == "r2":
-        try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
-        except: pass
+    if entry:
+        if entry.get("storage_type") == "r2" and entry.get("r2_key"):
+            try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
+            except: pass
+        if entry.get("r2_cache_key"):
+            try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_cache_key"])
+            except: pass
+
     with _db_lock:
         conn = sqlite3.connect(DB_FILE_SQLITE); conn.execute("DELETE FROM files WHERE short_id = ?", (file_code,))
         conn.commit(); conn.close()
@@ -329,7 +398,6 @@ async def register_r2(key: str, data: dict = Body(...)):
     })
     return {"status": "OK"}
 
-# ⚡ Added the /api/file/info route for Node.js fallback 
 @app.get("/api/file/info")
 async def file_info(key: str, file_code: str):
     verify_key(key)
@@ -380,4 +448,7 @@ async def list_files(key: str, page: int = 1, limit: int = 10):
     }
 
 @app.on_event("startup")
-async def on_startup(): init_db(); log("✅ URLKING HYBRID SYSTEM ONLINE")
+async def on_startup(): 
+    init_db()
+    asyncio.create_task(cache_cleanup_loop()) 
+    log("✅ URLKING HYBRID SYSTEM & SMART CACHE ONLINE")
