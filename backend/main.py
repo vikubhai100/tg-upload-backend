@@ -245,8 +245,7 @@ async def download_head(short_id: str):
 # 🚀 16-PIPE DOWNLOAD ENGINE (With IP & Live Speed Tracker)
 # ============================================================
 # ============================================================
-# ============================================================
-# 🚀 SMART DOWNLOAD ENGINE (With Resume Support & Safe Pipes)
+# 🛡️ 2GB ROCK-SOLID DOWNLOAD ENGINE (Ultimate Stability)
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
@@ -273,11 +272,8 @@ async def download_file(request: Request, short_id: str):
             start_byte = 0
             end_byte = file_size - 1
 
-    if start_byte >= file_size:
-        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
-
     content_length = end_byte - start_byte + 1
-    log(f"⬇️ DOWNLOAD START | {filename_raw} | Client: {client_ip} | Request: {format_size(content_length)}")
+    log(f"⬇️ 2GB STABLE DOWNLOAD START | {filename_raw} | Client: {client_ip} | Req: {format_size(content_length)}")
 
     try:
         client = await get_client()
@@ -290,31 +286,41 @@ async def download_file(request: Request, short_id: str):
         async def stream_direct():
             chunk_size = 1 * 1024 * 1024 
 
-            # ⚡ FIX 1: Safe Pipes (Local = 8, Foreign = 2)
+            # ⚡ FIX 1: THE SWEET SPOT (4 Pipes for Foreign DC)
             bot_dc = getattr(client.session, 'dc_id', 0)
             file_dc = getattr(document, 'dc_id', 0)
-            prefetch_tasks = 8 if (bot_dc == file_dc or bot_dc == 0) else 2
+            
+            # Local ke liye 8 Pipes, Foreign ke liye 4 Pipes (Best balance for 2GB)
+            prefetch_tasks = 8 if (bot_dc == file_dc or bot_dc == 0) else 4
 
             start_time = time.time()
             sent_bytes = 0
             last_log_time = start_time
 
             async def download_exact_chunk(off, length):
-                # ⚡ FIX 2: 5 Retries with Exponential Wait
-                for attempt in range(5):
-                    data = b""
+                # ⚡ FIX 2: SILENT RECOVERY (15 Retries with 20s Timeout)
+                for attempt in range(15):
                     try:
-                        async for chunk in client.iter_download(document, offset=off, request_size=1024*1024):
-                            data += chunk
-                            if len(data) >= length:
-                                return data[:length]
+                        async def fetch_data():
+                            buffer = b""
+                            async for chunk in client.iter_download(document, offset=off, request_size=1024*1024):
+                                buffer += chunk
+                                if len(buffer) >= length:
+                                    return buffer[:length]
+                            return buffer
+                        
+                        # 20 second tak data ka wait karega, warna pipe restart karega
+                        data = await asyncio.wait_for(fetch_data(), timeout=20.0)
                         return data
+                    except asyncio.TimeoutError:
+                        log(f"⚠️ Telegram Socket Hung at {off}. Silent Restart (Attempt {attempt+1})...")
+                        await asyncio.sleep(1.0)
                     except Exception as e:
-                        log(f"⚠️ Chunk error at {off} (Attempt {attempt+1}): {e}")
-                        await asyncio.sleep(1.5 * (attempt + 1))  # 1.5s, 3.0s, 4.5s...
+                        log(f"⚠️ Chunk Error at {off} (Attempt {attempt+1}): {e}")
+                        await asyncio.sleep(2.0)
                 
-                # ⚡ FIX 3: NEVER RETURN EMPTY! Raise error to force browser RESUME
-                raise Exception(f"Failed to fetch chunk at {off} after 5 attempts")
+                # Agar 15 koshisho ke baad bhi na ho, tabhi stream gitegi
+                raise Exception(f"Fatal error: Cannot fetch chunk at {off} after 15 attempts")
 
             try:
                 current_offset = start_byte
@@ -331,10 +337,8 @@ async def download_file(request: Request, short_id: str):
                         first_task = pending_tasks.pop(0)
                         chunk_data = await first_task
 
-                        # ⚡ FIX 4: Hard drop connection if empty data is received
                         if not chunk_data and current_offset <= end_byte:
-                            log(f"❌ STREAM ABORTED: Missing chunk for {filename_raw}. Forcing network error.")
-                            raise Exception("Incomplete chunk received, forcing resume state.")
+                            raise Exception("Received empty chunk data from Telegram.")
 
                         step = 256 * 1024
                         for i in range(0, len(chunk_data), step):
@@ -351,21 +355,16 @@ async def download_file(request: Request, short_id: str):
 
                             await asyncio.sleep(0.0001)
 
-            except asyncio.CancelledError:
-                log(f"🛑 DOWNLOAD CANCELLED | {filename_raw} | Sent: {format_size(sent_bytes)}")
-                raise # Jaruri hai taaki FastAPI connection close kare
             except Exception as e:
                 log(f"❌ STREAM BROKEN: {e}")
-                raise # IDM/Browser ko error denge taaki wo resume kar sake
+                raise
 
-        encoded_filename = quote(filename_raw)
         headers = {
-            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename_raw)}",
             "Content-Type": content_type,
             "Content-Length": str(content_length),
             "Accept-Ranges": "bytes",
             "X-Accel-Buffering": "no",
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         }
 
         status_code = 206 if range_header else 200
@@ -379,7 +378,6 @@ async def download_file(request: Request, short_id: str):
     except Exception as e:
         log(f"❌ DOWNLOAD ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ============================================================
 # OTHER ROUTES (INTACT)
