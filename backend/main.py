@@ -91,7 +91,7 @@ async def serve_index():
     index_file = FRONTEND_DIR / "index.html"
     if index_file.exists():
         return index_file.read_text(encoding="utf-8")
-    
+
     # Debugging message agar ab bhi na mile
     return f"""
     <div style="font-family:sans-serif; padding:40px;">
@@ -196,7 +196,7 @@ async def download_handle(request: Request, short_id: str):
             chunk_size = 4 * 1024 * 1024
             max_pipes = 16
             sent_bytes = 0
-            
+
             async def download_part(off, length):
                 async def fetch():
                     b = b""
@@ -279,7 +279,7 @@ async def remote_upload(request: Request):
     except Exception as e: return {"error": str(e)}
 
 # ============================================================
-# 📑 FILE MANAGEMENT (Clone, Rename, Delete)
+# 📑 FILE MANAGEMENT (Clone, Rename, Delete, Info)
 # ============================================================
 @app.get("/api/file/clone")
 async def file_clone(key: str, file_code: str):
@@ -308,6 +308,31 @@ async def register_r2(key: str, data: dict = Body(...)):
         "r2_key": data["r2_key"], "content_type": "application/octet-stream"
     })
     return {"status": "OK"}
+
+# ⚡ Added the /api/file/info route for Node.js fallback 
+@app.get("/api/file/info")
+async def file_info(key: str, file_code: str):
+    verify_key(key)
+    entry = get_file_entry(file_code)
+    if entry:
+        return {"result": [{"name": entry["filename"], "size": entry["size"], "storage": entry.get("storage_type", "telegram")}]}
+    return {"result": []}
+
+@app.get("/api/index_forwarded")
+async def index_forwarded(key: str, message_id: int, filename: str):
+    verify_key(key)
+    client = await get_client()
+    message = await client.get_messages(CHANNEL_ID, ids=message_id)
+    if not message or not message.document: return {"error": "Not Found"}
+    short_id = str(uuid.uuid4())[:8]
+    save_file_entry(short_id, {
+        "message_id": message.id, "filename": filename, "size": message.document.size,
+        "content_type": message.file.mime_type, "channel_id": CHANNEL_ID,
+        "doc_id": message.document.id, "access_hash": message.document.access_hash,
+        "file_reference": message.document.file_reference.hex(), "dc_id": message.document.dc_id,
+        "storage_type": "telegram"
+    })
+    return [{"file_code": short_id, "file_status": "OK"}]
 
 # ============================================================
 # 🛠️ UTILITIES
