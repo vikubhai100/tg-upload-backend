@@ -245,7 +245,8 @@ async def download_head(short_id: str):
 # 🚀 16-PIPE DOWNLOAD ENGINE (With IP & Live Speed Tracker)
 # ============================================================
 # ============================================================
-# 🚀 SMART DOWNLOAD ENGINE (With DC-Awareness & Auto-Retry)
+# ============================================================
+# 🚀 SMART DOWNLOAD ENGINE (With Resume Support & Safe Pipes)
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
@@ -288,20 +289,19 @@ async def download_file(request: Request, short_id: str):
 
         async def stream_direct():
             chunk_size = 1 * 1024 * 1024 
-            
-            # ⚡ FIX 1: DYNAMIC DATA CENTER (DC) PIPES
-            # Agar file server ke bahar se aayi hai (Foreign DC), toh connections kam rakho taaki block na ho
+
+            # ⚡ FIX 1: Safe Pipes (Local = 8, Foreign = 2)
             bot_dc = getattr(client.session, 'dc_id', 0)
             file_dc = getattr(document, 'dc_id', 0)
-            prefetch_tasks = 16 if (bot_dc == file_dc or bot_dc == 0) else 4
+            prefetch_tasks = 8 if (bot_dc == file_dc or bot_dc == 0) else 2
 
             start_time = time.time()
             sent_bytes = 0
             last_log_time = start_time
 
             async def download_exact_chunk(off, length):
-                # ⚡ FIX 2: AUTO-RETRY SYSTEM (Aggressive 3 Retries)
-                for attempt in range(3):
+                # ⚡ FIX 2: 5 Retries with Exponential Wait
+                for attempt in range(5):
                     data = b""
                     try:
                         async for chunk in client.iter_download(document, offset=off, request_size=1024*1024):
@@ -311,8 +311,10 @@ async def download_file(request: Request, short_id: str):
                         return data
                     except Exception as e:
                         log(f"⚠️ Chunk error at {off} (Attempt {attempt+1}): {e}")
-                        await asyncio.sleep(1.5)  # Wait before retrying foreign DC
-                return b"" # Fail after 3 attempts
+                        await asyncio.sleep(1.5 * (attempt + 1))  # 1.5s, 3.0s, 4.5s...
+                
+                # ⚡ FIX 3: NEVER RETURN EMPTY! Raise error to force browser RESUME
+                raise Exception(f"Failed to fetch chunk at {off} after 5 attempts")
 
             try:
                 current_offset = start_byte
@@ -329,10 +331,10 @@ async def download_file(request: Request, short_id: str):
                         first_task = pending_tasks.pop(0)
                         chunk_data = await first_task
 
-                        # ⚡ FIX 3: ABORT PROTECTION
-                        if not chunk_data:
-                            log(f"❌ STREAM ABORTED: Cannot fetch chunk for {filename_raw} (DC limit hit)")
-                            break
+                        # ⚡ FIX 4: Hard drop connection if empty data is received
+                        if not chunk_data and current_offset <= end_byte:
+                            log(f"❌ STREAM ABORTED: Missing chunk for {filename_raw}. Forcing network error.")
+                            raise Exception("Incomplete chunk received, forcing resume state.")
 
                         step = 256 * 1024
                         for i in range(0, len(chunk_data), step):
@@ -350,9 +352,11 @@ async def download_file(request: Request, short_id: str):
                             await asyncio.sleep(0.0001)
 
             except asyncio.CancelledError:
-                log(f"🛑 DOWNLOAD STOPPED (User/App) | {filename_raw} | Sent: {format_size(sent_bytes)}")
+                log(f"🛑 DOWNLOAD CANCELLED | {filename_raw} | Sent: {format_size(sent_bytes)}")
+                raise # Jaruri hai taaki FastAPI connection close kare
             except Exception as e:
-                log(f"Parallel Stream Error: {e}")
+                log(f"❌ STREAM BROKEN: {e}")
+                raise # IDM/Browser ko error denge taaki wo resume kar sake
 
         encoded_filename = quote(filename_raw)
         headers = {
@@ -375,6 +379,7 @@ async def download_file(request: Request, short_id: str):
     except Exception as e:
         log(f"❌ DOWNLOAD ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # ============================================================
 # OTHER ROUTES (INTACT)
