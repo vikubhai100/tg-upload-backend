@@ -79,16 +79,32 @@ DB_FILE_SQLITE   = "/app/data/files.db"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "super_secret_key_123")
 
 # ============================================================
-# 📁 FRONTEND SERVING
+# 📁 FRONTEND SERVING (PATH FIXED)
 # ============================================================
-CURRENT_DIR = Path(__file__).parent
-FRONTEND_DIR = CURRENT_DIR / "frontend"
+# Agar main.py 'Backend/' ke andar hai, toh humein ek level bahar nikalna hoga
+CURRENT_FILE_PATH = Path(__file__).resolve()
+# Backend folder se bahar niklo (Root par), phir frontend folder mein jao
+FRONTEND_DIR = CURRENT_FILE_PATH.parent.parent / "frontend"
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     index_file = FRONTEND_DIR / "index.html"
-    if index_file.exists(): return index_file.read_text()
-    return "<h1>URLKING Backend: Frontend not found. Please upload index.html to /frontend folder</h1>"
+    if index_file.exists():
+        return index_file.read_text(encoding="utf-8")
+    
+    # Debugging message agar ab bhi na mile
+    return f"""
+    <div style="font-family:sans-serif; padding:40px;">
+        <h2 style="color:red;">Frontend Folder Not Found!</h2>
+        <p>Searching at: <b>{index_file}</b></p>
+        <p>Please ensure your folder structure is like this:</p>
+        <pre>/app
+  /Backend
+    main.py
+  /frontend
+    index.html</pre>
+    </div>
+    """
 
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
@@ -143,7 +159,6 @@ async def download_handle(request: Request, short_id: str):
     entry = get_file_entry(short_id)
     if not entry: raise HTTPException(status_code=404, detail="File Not Found")
 
-    # 🚀 R2 Redirect Logic
     if entry.get("storage_type") == "r2":
         try:
             url = r2_client.generate_presigned_url('get_object', Params={
@@ -155,7 +170,6 @@ async def download_handle(request: Request, short_id: str):
         except Exception as e:
             log(f"❌ R2 URL Error: {e}"); raise HTTPException(status_code=500)
 
-    # 🔵 Telegram Streaming Logic (16-Pipe)
     file_size = int(entry["size"])
     filename_raw = entry["filename"]
     content_type = entry["content_type"] or "application/octet-stream"
@@ -226,8 +240,6 @@ async def parallel_upload(client, file_path):
     size = os.path.getsize(file_path)
     name = os.path.basename(file_path)
     if size < 10*1024*1024: return await client.upload_file(file_path)
-    
-    # Big file upload logic
     f_id = int.from_bytes(os.urandom(8), "big", signed=True)
     parts = math.ceil(size / (512*1024))
     sem = asyncio.Semaphore(15)
@@ -247,14 +259,11 @@ async def remote_upload(request: Request):
         verify_key(data.get("key"))
         url = data.get("url")
         filename = data.get("filename", f"file_{int(time.time())}.bin")
-        
         tmp_path = f"/tmp/{uuid.uuid4()}"
-        log(f"📥 REMOTE DOWNLOADING | {filename}")
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as r:
                 with open(tmp_path, 'wb') as f:
                     async for chunk in r.content.iter_chunked(5*1024*1024): f.write(chunk)
-        
         client = await get_client()
         up_file = await parallel_upload(client, tmp_path)
         msg = await client.send_file(CHANNEL_ID, up_file, force_document=True)
@@ -274,8 +283,7 @@ async def remote_upload(request: Request):
 # ============================================================
 @app.get("/api/file/clone")
 async def file_clone(key: str, file_code: str):
-    verify_key(key)
-    entry = get_file_entry(file_code)
+    verify_key(key); entry = get_file_entry(file_code)
     if not entry: return {"status": 404}
     new_id = str(uuid.uuid4())[:8]
     save_file_entry(new_id, entry)
@@ -283,15 +291,12 @@ async def file_clone(key: str, file_code: str):
 
 @app.get("/api/file/delete")
 async def file_delete(key: str, file_code: str):
-    verify_key(key)
-    entry = get_file_entry(file_code)
+    verify_key(key); entry = get_file_entry(file_code)
     if entry and entry.get("storage_type") == "r2":
         try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
         except: pass
-    
     with _db_lock:
-        conn = sqlite3.connect(DB_FILE_SQLITE)
-        conn.execute("DELETE FROM files WHERE short_id = ?", (file_code,))
+        conn = sqlite3.connect(DB_FILE_SQLITE); conn.execute("DELETE FROM files WHERE short_id = ?", (file_code,))
         conn.commit(); conn.close()
     return {"status": 200, "msg": "OK"}
 
@@ -319,8 +324,7 @@ def verify_key(key: str):
 
 @app.get("/files")
 async def list_files(key: str, page: int = 1, limit: int = 10):
-    verify_key(key)
-    conn = get_db_connection()
+    verify_key(key); conn = get_db_connection()
     offset = (page - 1) * limit
     total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     rows = conn.execute("SELECT * FROM files ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
