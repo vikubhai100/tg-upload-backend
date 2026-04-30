@@ -244,8 +244,7 @@ async def download_head(short_id: str):
 # ============================================================
 # 🚀 16-PIPE DOWNLOAD ENGINE (With IP & Live Speed Tracker)
 # ============================================================
-# ============================================================
-# 🛡️ 2GB ROCK-SOLID DOWNLOAD ENGINE (Ultimate Stability)
+# 🧠 SMART ADAPTIVE DOWNLOAD ENGINE (Auto-Adjust & Anti-Crash)
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_file(request: Request, short_id: str):
@@ -273,7 +272,7 @@ async def download_file(request: Request, short_id: str):
             end_byte = file_size - 1
 
     content_length = end_byte - start_byte + 1
-    log(f"⬇️ 2GB STABLE DOWNLOAD START | {filename_raw} | Client: {client_ip} | Req: {format_size(content_length)}")
+    log(f"⬇️ SMART DOWNLOAD START | {filename_raw} | Client: {client_ip}")
 
     try:
         client = await get_client()
@@ -284,50 +283,48 @@ async def download_file(request: Request, short_id: str):
         document = message.document
 
         async def stream_direct():
-            chunk_size = 1 * 1024 * 1024 
-
-            # ⚡ FIX 1: THE SWEET SPOT (4 Pipes for Foreign DC)
+            chunk_size = 1024 * 1024  # 1MB Chunks
+            
+            # Base pipes: Start with moderate pipes so server doesn't crash
             bot_dc = getattr(client.session, 'dc_id', 0)
             file_dc = getattr(document, 'dc_id', 0)
-            
-            # Local ke liye 8 Pipes, Foreign ke liye 4 Pipes (Best balance for 2GB)
-            prefetch_tasks = 8 if (bot_dc == file_dc or bot_dc == 0) else 4
+            max_pipes = 6 if (bot_dc == file_dc or bot_dc == 0) else 3
 
             start_time = time.time()
             sent_bytes = 0
             last_log_time = start_time
 
             async def download_exact_chunk(off, length):
-                # ⚡ FIX 2: SILENT RECOVERY (15 Retries with 20s Timeout)
-                for attempt in range(15):
+                for attempt in range(5):
                     try:
                         async def fetch_data():
                             buffer = b""
-                            async for chunk in client.iter_download(document, offset=off, request_size=1024*1024):
+                            async for chunk in client.iter_download(document, offset=off, request_size=512*1024):
                                 buffer += chunk
                                 if len(buffer) >= length:
                                     return buffer[:length]
                             return buffer
                         
-                        # 20 second tak data ka wait karega, warna pipe restart karega
-                        data = await asyncio.wait_for(fetch_data(), timeout=20.0)
-                        return data
+                        return await asyncio.wait_for(fetch_data(), timeout=20.0)
                     except asyncio.TimeoutError:
-                        log(f"⚠️ Telegram Socket Hung at {off}. Silent Restart (Attempt {attempt+1})...")
                         await asyncio.sleep(1.0)
                     except Exception as e:
-                        log(f"⚠️ Chunk Error at {off} (Attempt {attempt+1}): {e}")
                         await asyncio.sleep(2.0)
-                
-                # Agar 15 koshisho ke baad bhi na ho, tabhi stream gitegi
-                raise Exception(f"Fatal error: Cannot fetch chunk at {off} after 15 attempts")
+                raise Exception(f"Failed chunk at {off}")
 
             try:
                 current_offset = start_byte
                 pending_tasks = []
 
                 while current_offset <= end_byte or pending_tasks:
-                    while len(pending_tasks) < prefetch_tasks and current_offset <= end_byte:
+                    # 🛑 SMART FEATURE 1: Disconnect Monitor
+                    # Agar user ka network gaya ya usne tab close kiya, toh turant ruk jao!
+                    if await request.is_disconnected():
+                        log(f"🛑 USER DISCONNECTED | {filename_raw}. Freeing server resources instantly!")
+                        break
+
+                    # Task Spawner
+                    while len(pending_tasks) < max_pipes and current_offset <= end_byte:
                         length = min(chunk_size, end_byte - current_offset + 1)
                         task = asyncio.create_task(download_exact_chunk(current_offset, length))
                         pending_tasks.append(task)
@@ -338,11 +335,19 @@ async def download_file(request: Request, short_id: str):
                         chunk_data = await first_task
 
                         if not chunk_data and current_offset <= end_byte:
-                            raise Exception("Received empty chunk data from Telegram.")
+                            raise Exception("Telegram sent empty data")
 
-                        step = 256 * 1024
+                        # Send data in small 128KB pieces
+                        step = 128 * 1024
                         for i in range(0, len(chunk_data), step):
+                            # 🛑 SMART FEATURE 2: TCP Backpressure Verification
+                            if await request.is_disconnected():
+                                break
+
                             chunk_piece = chunk_data[i:i+step]
+                            
+                            # Yahan magic hoga: Agar user ka internet slow hai, toh yeh 'yield' automatic slow ho jayega.
+                            # Isse loop hold ho jayega aur Telegram se naye chunks tab tak download nahi honge jab tak user purana data receive na kar le.
                             yield chunk_piece
 
                             sent_bytes += len(chunk_piece)
@@ -350,13 +355,13 @@ async def download_file(request: Request, short_id: str):
 
                             if now - last_log_time >= 3.0:
                                 speed = sent_bytes / max((now - start_time), 0.1)
-                                log(f"📡 DOWNLOADING ({prefetch_tasks}-Pipes) | {filename_raw} | {format_size(sent_bytes)}/{format_size(content_length)} | Speed: {format_size(speed)}/s")
+                                log(f"📡 SMART STREAMING | {filename_raw} | Speed: {format_size(speed)}/s")
                                 last_log_time = now
 
                             await asyncio.sleep(0.0001)
 
             except Exception as e:
-                log(f"❌ STREAM BROKEN: {e}")
+                log(f"❌ STREAM CLOSED: {e}")
                 raise
 
         headers = {
@@ -376,7 +381,7 @@ async def download_file(request: Request, short_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        log(f"❌ DOWNLOAD ERROR: {e}")
+        log(f"❌ GLOBAL ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================
