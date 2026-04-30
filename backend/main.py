@@ -146,53 +146,9 @@ def save_file_entry(short_id, data):
              data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key))
         conn.commit(); conn.close()
 
-# ============================================================
-# 🧠 SMART R2 CACHING SYSTEM
-# ============================================================
-_caching_tasks = set()
-
-async def cache_tg_to_r2(short_id):
-    try:
-        await asyncio.sleep(60) # 60 sec wait taaki user ki bandwidth affect na ho
-        
-        entry = get_file_entry(short_id)
-        if not entry or entry.get("storage_type") == "r2" or entry.get("r2_cache_key"):
-            return
-        
-        log(f"⚙️ SMART CACHE START | Backing up {short_id} to R2...")
-        client = await get_client()
-        message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
-        if not message or not message.document: return
-
-        tmp_path = f"/tmp/cache_{short_id}_{int(time.time())}.bin"
-        
-        with open(tmp_path, "wb") as f:
-            async for chunk in client.iter_download(message.document, request_size=1024*1024):
-                f.write(chunk)
-                await asyncio.sleep(0.01) 
-        
-        r2_cache_key = f"cache_{short_id}_{uuid.uuid4().hex[:6]}"
-        def s3_upload():
-            r2_client.upload_file(tmp_path, R2_BUCKET_NAME, r2_cache_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
-        await asyncio.to_thread(s3_upload)
-        
-        conn = get_db_connection()
-        conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
-        conn.commit(); conn.close()
-        
-        try: os.remove(tmp_path)
-        except: pass
-        log(f"✅ CACHE SUCCESS | {short_id} is now blazingly fast on R2!")
-        
-    except Exception as e:
-        log(f"❌ CACHE FAILED | {short_id} | Err: {e}")
-    finally:
-        _caching_tasks.discard(short_id)
-        if 'tmp_path' in locals() and os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except: pass
 
 async def cache_cleanup_loop():
+    """Har ghante check karega aur 24H purane caches mita dega"""
     await asyncio.sleep(60) 
     while True:
         try:
@@ -224,8 +180,54 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     except Exception as e: raise HTTPException(status_code=500)
 
 # ============================================================
-# ⬇️ SMART DOWNLOAD ENGINE (NO API SPAM + TRUE RESUME)
+# 🧠 THE USER'S MASTER IDEA: TEMP FILE SPOOLING + CACHE
 # ============================================================
+_active_dl = {} # Track active temp downloads
+
+async def bg_fetch_and_cache(short_id, entry):
+    """Telegram -> Temp File -> Cloudflare R2"""
+    tmp_path = f"/tmp/dl_{short_id}.bin"
+    try:
+        client = await get_client()
+        message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
+        
+        # Open file to clear old data
+        with open(tmp_path, "wb") as f: pass 
+        
+        log(f"⚙️ SPOOLER START | Downloading {short_id} to Temp Memory...")
+        
+        # ⚡ Telegram runs at MAX SPEED, no browser blocks!
+        async for chunk in client.iter_download(message.document, request_size=1024*1024):
+            with open(tmp_path, "ab") as f:
+                f.write(chunk)
+            _active_dl[short_id]["dl_bytes"] += len(chunk)
+            await asyncio.sleep(0) # Keep server smooth
+            
+        _active_dl[short_id]["done"] = True
+        log(f"✅ SPOOLER DONE | {short_id} saved to Temp. Uploading to R2 Cache...")
+        
+        # --- UPLOAD TO R2 CACHE ---
+        r2_cache_key = f"cache_{short_id}_{uuid.uuid4().hex[:6]}"
+        def s3_up():
+            r2_client.upload_file(tmp_path, R2_BUCKET_NAME, r2_cache_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
+        await asyncio.to_thread(s3_up)
+        
+        conn = get_db_connection()
+        conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
+        conn.commit(); conn.close()
+        
+        log(f"☁️ R2 CACHE SUCCESS | {short_id} cached perfectly!")
+        
+    except Exception as e:
+        _active_dl[short_id]["err"] = True
+        log(f"❌ Spooler Error for {short_id}: {e}")
+    finally:
+        # File ko 15 minute rehne do taaki current users download kar lein, fir delete karo
+        await asyncio.sleep(900) 
+        _active_dl.pop(short_id, None)
+        try: os.remove(tmp_path)
+        except: pass
+
 @app.get("/download/{short_id}")
 async def download_handle(request: Request, short_id: str):
     client_ip = get_client_ip(request)
@@ -236,15 +238,27 @@ async def download_handle(request: Request, short_id: str):
     conn.execute("UPDATE files SET last_accessed = ? WHERE short_id = ?", (int(time.time()), short_id))
     conn.commit(); conn.close()
 
+    # Agar R2 par hai toh direct wahan bhejo
     if entry.get("storage_type") == "r2" and entry.get("r2_key"):
         return redirect_to_r2(entry["r2_key"], entry["filename"], client_ip, "PERMANENT")
 
     if entry.get("r2_cache_key"):
         return redirect_to_r2(entry["r2_cache_key"], entry["filename"], client_ip, "CACHED LINK")
 
-    if short_id not in _caching_tasks:
-        _caching_tasks.add(short_id)
-        asyncio.create_task(cache_tg_to_r2(short_id))
+    # 🚀 START SPOOLING (THE TEMP FILE MAGIC)
+    tmp_path = f"/tmp/dl_{short_id}.bin"
+    if short_id not in _active_dl:
+        _active_dl[short_id] = {"dl_bytes": 0, "done": False, "err": False}
+        asyncio.create_task(bg_fetch_and_cache(short_id, entry))
+
+    # Wait for file to start creating
+    for _ in range(50):
+        if os.path.exists(tmp_path) and _active_dl[short_id]["dl_bytes"] > 0:
+            break
+        await asyncio.sleep(0.2)
+
+    if not os.path.exists(tmp_path):
+        raise HTTPException(500, "Failed to connect to Telegram Core")
 
     file_size = int(entry["size"])
     filename_raw = entry["filename"]
@@ -260,52 +274,46 @@ async def download_handle(request: Request, short_id: str):
         except: pass
 
     content_length = end_byte - start_byte + 1
-    log(f"⬇️ STREAM START (Solid Fallback) | {filename_raw} | IP: {client_ip}")
+    log(f"⬇️ SPOOL STREAM START | {filename_raw} | IP: {client_ip}")
 
-    try:
-        client = await get_client()
-        message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
-        if not message or not message.document: raise HTTPException(status_code=404)
-        document = message.document
+    # ⚡ BROWSER KO TEMP FILE SE DATA DO (Asynchronous Reading)
+    async def temp_file_streamer():
+        with open(tmp_path, "rb") as f:
+            f.seek(start_byte)
+            curr = start_byte
+            
+            while curr <= end_byte:
+                if await request.is_disconnected(): break
+                
+                # Check if browser reached the part not yet downloaded by Telegram
+                while curr >= _active_dl[short_id]["dl_bytes"]:
+                    if _active_dl[short_id]["done"]: break
+                    if _active_dl[short_id]["err"]: 
+                        log("⚠️ Telegram drop detected during temp reading.")
+                        return
+                    await asyncio.sleep(0.5) # Wait for Telegram to download more
+                
+                # Read 128KB at a time
+                avail = _active_dl[short_id]["dl_bytes"] - curr
+                read_size = min(128 * 1024, end_byte - curr + 1)
+                if not _active_dl[short_id]["done"]:
+                    read_size = min(read_size, avail)
+                
+                if read_size > 0:
+                    data = f.read(read_size)
+                    if not data: break
+                    yield data
+                    curr += len(data)
+                elif _active_dl[short_id]["done"]:
+                    break
 
-        async def stream_generator():
-            current_offset = start_byte
-            chunk_size = 1024 * 1024 # Standard 1MB chunks
-
-            while current_offset <= end_byte:
-                try:
-                    # ⚡ NORMAL FLOW: Ek single continuous pipe khul gaya
-                    async for chunk in client.iter_download(document, offset=current_offset, request_size=chunk_size):
-                        if await request.is_disconnected():
-                            return # User canceled
-                        
-                        # Browser ko active rakhne ke liye 64KB ke tukdon me data
-                        step = 64 * 1024
-                        for i in range(0, len(chunk), step):
-                            if await request.is_disconnected(): return
-                            yield chunk[i:i+step]
-                            
-                        current_offset += len(chunk)
-                        
-                        if current_offset > end_byte:
-                            return # Download complete
-                            
-                    return # Natural loop exit
-
-                except Exception as e:
-                    # ⚡ ERROR HANDLING: Telegram ne connection toda toh sirf 2 sec rukenge aur wapas aayenge
-                    if await request.is_disconnected(): return
-                    log(f"⚠️ Stream Break @ {current_offset}. Resuming... | Err: {e}")
-                    await asyncio.sleep(2)
-
-        headers = {
-            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename_raw)}",
-            "Content-Type": content_type, "Content-Length": str(content_length),
-            "Accept-Ranges": "bytes", "X-Accel-Buffering": "no"
-        }
-        if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
-        return StreamingResponse(stream_generator(), status_code=206 if range_header else 200, headers=headers)
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename_raw)}",
+        "Content-Type": content_type, "Content-Length": str(content_length),
+        "Accept-Ranges": "bytes", "X-Accel-Buffering": "no"
+    }
+    if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
+    return StreamingResponse(temp_file_streamer(), status_code=206 if range_header else 200, headers=headers)
 
 # ============================================================
 # 🚀 UPLOAD & REMOTE LOGIC
@@ -441,4 +449,4 @@ async def list_files(key: str, page: int = 1, limit: int = 10):
 async def on_startup(): 
     init_db()
     asyncio.create_task(cache_cleanup_loop()) 
-    log("✅ URLKING HYBRID SYSTEM & SMART CACHE ONLINE")
+    log("✅ URLKING HYBRID SYSTEM (SPOOLER) ONLINE")
