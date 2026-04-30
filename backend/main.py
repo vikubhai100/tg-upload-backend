@@ -174,45 +174,40 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     except Exception as e: raise HTTPException(status_code=500)
 
 # ============================================================
-# 🧠 THE MASTER SPOOLER: TEMP FILE + CACHE (ZIDDI AUTO-RESUME FIX)
+# 🧠 THE MASTER SPOOLER: TEMP FILE + CACHE (SAFE)
 # ============================================================
 _active_dl = {} 
 
 async def bg_fetch_and_cache(short_id, entry):
-    """Telegram -> Temp File (With Ultra Auto-Resume) -> Cloudflare R2"""
     tmp_path = f"/tmp/dl_{short_id}.bin"
     file_size = int(entry["size"])
     current_offset = 0
-    mode = "wb" # Pehli baar naya file banega
+    mode = "wb" 
 
     try:
         log(f"⚙️ SPOOLER START | Fetching {short_id} ({format_size(file_size)}) to Temp...")
         client = await get_client()
 
-        # ⚡ THE ZIDDI AUTO-RESUME LOOP ⚡
         while current_offset < file_size:
             try:
                 message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
                 with open(tmp_path, mode) as f_out:
                     async for chunk in client.iter_download(message.document, offset=current_offset, request_size=1024*1024):
                         f_out.write(chunk)
-                        f_out.flush()
-                        os.fsync(f_out.fileno()) # Force write to physical disk
+                        f_out.flush() 
                         
                         current_offset += len(chunk)
                         _active_dl[short_id]["dl_bytes"] = current_offset
-                        await asyncio.sleep(0.01) # Keep VPS smooth
+                        await asyncio.sleep(0.01) 
                         
             except Exception as e:
-                # Agar Telegram connection tod de, toh hum rukenge nahi!
                 log(f"⚠️ Spooler TG Drop @ {format_size(current_offset)}. Retrying... Err: {e}")
-                mode = "ab" # Ab file ke aage se continue karna hai
-                await asyncio.sleep(2) # 2 second wait karke wapas hamla
+                mode = "ab" 
+                await asyncio.sleep(2) 
 
         _active_dl[short_id]["done"] = True
         log(f"✅ SPOOLER DONE | {short_id} fully saved to Temp! Uploading to R2...")
         
-        # --- UPLOAD TO R2 CACHE ---
         r2_cache_key = f"cache_{short_id}_{uuid.uuid4().hex[:6]}"
         def s3_up():
             r2_client.upload_file(tmp_path, R2_BUCKET_NAME, r2_cache_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
@@ -224,11 +219,11 @@ async def bg_fetch_and_cache(short_id, entry):
         log(f"☁️ R2 CACHE SUCCESS | {short_id} cached perfectly!")
         
     except Exception as e:
-        _active_dl[short_id]["err"] = True
+        if short_id in _active_dl: _active_dl[short_id]["err"] = True
         log(f"❌ FATAL Spooler Error for {short_id}: {e}")
     finally:
-        await asyncio.sleep(900) 
-        _active_dl.pop(short_id, None)
+        await asyncio.sleep(1800) # Safe 30 mins window for browser to finish reading
+        if short_id in _active_dl: _active_dl.pop(short_id, None)
         try: os.remove(tmp_path)
         except: pass
 
@@ -254,7 +249,7 @@ async def download_handle(request: Request, short_id: str):
         asyncio.create_task(bg_fetch_and_cache(short_id, entry))
 
     for _ in range(50):
-        if os.path.exists(tmp_path) and _active_dl[short_id]["dl_bytes"] > 0:
+        if os.path.exists(tmp_path) and _active_dl.get(short_id, {}).get("dl_bytes", 0) > 0:
             break
         await asyncio.sleep(0.2)
 
@@ -277,7 +272,6 @@ async def download_handle(request: Request, short_id: str):
     content_length = end_byte - start_byte + 1
     log(f"⬇️ SPOOL STREAM START | {filename_raw} | IP: {client_ip}")
 
-    # ⚡ NEVER-GIVE-UP TEMP FILE STREAMER (ERROR SAFE)
     async def temp_file_streamer():
         with open(tmp_path, "rb") as f:
             f.seek(start_byte)
@@ -286,24 +280,29 @@ async def download_handle(request: Request, short_id: str):
             while curr <= end_byte:
                 if await request.is_disconnected(): break
                 
-                target_bytes = _active_dl[short_id]["dl_bytes"]
+                info = _active_dl.get(short_id)
+                if not info: 
+                    # If popped from memory prematurely
+                    break 
+                
+                target_bytes = info["dl_bytes"]
                 
                 while curr >= target_bytes:
-                    if _active_dl[short_id]["done"]: break
-                    if _active_dl[short_id]["err"]: 
-                        # ⚡ FIX: Agar background fail ho jaye, toh browser ko ERROR throw karo,
-                        # taaki usko pata chale ki ye complete nahi, FAIL hua hai!
+                    info = _active_dl.get(short_id)
+                    if not info or info["done"]: break
+                    if info["err"]: 
                         raise RuntimeError("Backend connection to Telegram dropped")
                         
                     await asyncio.sleep(0.2) 
-                    target_bytes = _active_dl[short_id]["dl_bytes"]
+                    target_bytes = _active_dl.get(short_id, {}).get("dl_bytes", 0)
                 
-                if _active_dl[short_id]["done"] and curr >= target_bytes:
+                info = _active_dl.get(short_id, {})
+                if info.get("done", False) and curr >= target_bytes:
                     break 
 
                 avail = target_bytes - curr
                 read_size = min(128 * 1024, end_byte - curr + 1)
-                if not _active_dl[short_id]["done"]:
+                if not info.get("done", False):
                     read_size = min(read_size, avail)
                 
                 if read_size > 0:
@@ -430,7 +429,7 @@ async def index_forwarded(key: str, message_id: int, filename: str):
     return [{"file_code": short_id, "file_status": "OK"}]
 
 # ============================================================
-# 🛠️ UTILITIES
+# 🛠️ UTILITIES & STARTUP
 # ============================================================
 _client = None
 async def get_client():
@@ -454,8 +453,9 @@ async def list_files(key: str, page: int = 1, limit: int = 10):
         "total": total, "page": page, "total_pages": math.ceil(total / limit) if total > 0 else 1
     }
 
+# ⚠️ YAHAN HAI WO STARTUP EVENT JO PEHLE MISSING THA!
 @app.on_event("startup")
 async def on_startup(): 
     init_db()
     asyncio.create_task(cache_cleanup_loop()) 
-    log("✅ URLKING HYBRID SYSTEM (SPOOLER V2) ONLINE")
+    log("✅ URLKING HYBRID SYSTEM (SPOOLER V3) ONLINE & READY")
