@@ -151,7 +151,7 @@ def save_file_entry(short_id, data):
         conn.commit(); conn.close()
 
 # ============================================================
-# ⬇️ SMART DOWNLOAD ENGINE (16-PIPE + R2 REDIRECT)
+# ⬇️ SMART DOWNLOAD ENGINE (FIXED TELEGRAM STREAMING)
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_handle(request: Request, short_id: str):
@@ -159,6 +159,7 @@ async def download_handle(request: Request, short_id: str):
     entry = get_file_entry(short_id)
     if not entry: raise HTTPException(status_code=404, detail="File Not Found")
 
+    # 🚀 R2 Redirect Logic (Unchanged)
     if entry.get("storage_type") == "r2":
         try:
             url = r2_client.generate_presigned_url('get_object', Params={
@@ -170,6 +171,7 @@ async def download_handle(request: Request, short_id: str):
         except Exception as e:
             log(f"❌ R2 URL Error: {e}"); raise HTTPException(status_code=500)
 
+    # 🔵 Telegram Streaming Logic
     file_size = int(entry["size"])
     filename_raw = entry["filename"]
     content_type = entry["content_type"] or "application/octet-stream"
@@ -193,10 +195,11 @@ async def download_handle(request: Request, short_id: str):
         document = message.document
 
         async def stream_generator():
-            chunk_size = 4 * 1024 * 1024
-            max_pipes = 16
+            # ⚡ FIX: Telegram API strictly limits request_size to 1MB. 
+            chunk_size = 1024 * 1024  # Wapas 1MB kar diya
+            max_pipes = 10            # Safe parallel limit
             sent_bytes = 0
-
+            
             async def download_part(off, length):
                 async def fetch():
                     b = b""
@@ -204,20 +207,22 @@ async def download_handle(request: Request, short_id: str):
                         b += c
                         if len(b) >= length: return b[:length]
                     return b
-                return await asyncio.wait_for(fetch(), timeout=60.0)
+                return await asyncio.wait_for(fetch(), timeout=45.0)
 
             try:
                 curr = start_byte
                 pending = []
                 while curr <= end_byte or pending:
                     if await request.is_disconnected(): break
+                    
                     while len(pending) < max_pipes and curr <= end_byte:
                         l = min(chunk_size, end_byte - curr + 1)
                         pending.append(asyncio.create_task(download_part(curr, l)))
                         curr += l
+                        
                     if pending:
                         data = await pending.pop(0)
-                        step = 512 * 1024
+                        step = 256 * 1024 # Browser ko 256KB ke smooth tukdo mein data bhejo
                         for i in range(0, len(data), step):
                             if await request.is_disconnected(): break
                             yield data[i:i+step]
@@ -232,6 +237,7 @@ async def download_handle(request: Request, short_id: str):
         if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
         return StreamingResponse(stream_generator(), status_code=206 if range_header else 200, headers=headers)
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
 
 # ============================================================
 # 🚀 UPLOAD & REMOTE LOGIC (MediaFire/DevUpload Friendly)
