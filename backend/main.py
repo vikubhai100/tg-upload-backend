@@ -154,7 +154,7 @@ def save_file_entry(short_id, data):
 # ⬇️ SMART DOWNLOAD ENGINE (FIXED TELEGRAM STREAMING)
 # ============================================================
 # ============================================================
-# ⬇️ SMART DOWNLOAD ENGINE (ULTRA-STABLE AUTO-RESUME)
+# ⬇️ SMART DOWNLOAD ENGINE (BULLETPROOF CHUNK-BY-CHUNK)
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_handle(request: Request, short_id: str):
@@ -198,29 +198,47 @@ async def download_handle(request: Request, short_id: str):
         document = message.document
 
         async def stream_generator():
-            # 🛡️ ANTI-DROP LOGIC: Sequential fetching with strict Auto-Resume
-            chunk_size = 1024 * 1024  # Safe 1MB Chunk (Best for Telegram)
+            chunk_size = 1024 * 1024 # 1MB (Telegram's strict limit)
             current_offset = start_byte
 
-            for attempt in range(15): # Agar connection toota, toh 15 baar retry karega
-                try:
-                    async for chunk in client.iter_download(document, offset=current_offset, request_size=chunk_size):
-                        if await request.is_disconnected():
-                            log(f"🛑 User Cancelled/Disconnected | {filename_raw}")
-                            return
+            while current_offset <= end_byte:
+                if await request.is_disconnected():
+                    log(f"🛑 Browser Disconnected | {filename_raw}")
+                    break
+                
+                chunk_data = b""
+                retries = 10
+                
+                for attempt in range(retries):
+                    try:
+                        # ⚡ IRONCLAD LOGIC: Hum sirf 1 chunk lenge aur loop tod denge
+                        async for chunk in client.iter_download(document, offset=current_offset, request_size=chunk_size):
+                            chunk_data = chunk
+                            break # Sirf pehla chunk liya aur Telegram stream se bahar aa gaye
                         
-                        yield chunk
-                        current_offset += len(chunk)
-                        
-                        if current_offset > end_byte:
-                            return # Target bytes reached
-                    return # File fully downloaded naturally
-                except BaseException as e:
-                    if await request.is_disconnected():
-                        return # User ne khud download cancel kiya
+                        if chunk_data:
+                            break # Chunk mil gaya, retry loop se bahar nikal aao
+                            
+                    except Exception as e:
+                        log(f"⚠️ Retry {attempt+1}/{retries} | Offset: {current_offset} | Err: {e}")
+                        await asyncio.sleep(1.5) # Thoda ruk kar exact wahi offset se wapas try karega
+                
+                if not chunk_data:
+                    log(f"❌ Fatal drop at offset {current_offset}")
+                    break # Agar 10 baar me bhi TG ne data nahi diya, tabhi stream band hogi
+                
+                # Agar aakhri chunk file size se aage nikal jaye
+                if current_offset + len(chunk_data) - 1 > end_byte:
+                    excess = (current_offset + len(chunk_data) - 1) - end_byte
+                    chunk_data = chunk_data[:-excess]
+
+                # ⚡ BROWSER ANTI-TIMEOUT: Browser ko 64KB ke tukdo me data do taaki wo active rahe
+                step = 64 * 1024
+                for i in range(0, len(chunk_data), step):
+                    if await request.is_disconnected(): break
+                    yield chunk_data[i:i+step]
                     
-                    log(f"⚠️ Stream Drop at {format_size(current_offset)}. Retrying... ({attempt+1}/15) | Error: {e}")
-                    await asyncio.sleep(2) # 2 sec ruk kar WAHIN SE file resume karega!
+                current_offset += len(chunk_data)
 
         headers = {
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename_raw)}",
@@ -232,6 +250,7 @@ async def download_handle(request: Request, short_id: str):
         if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
         return StreamingResponse(stream_generator(), status_code=206 if range_header else 200, headers=headers)
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # ============================================================
