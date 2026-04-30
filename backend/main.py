@@ -50,6 +50,14 @@ def log(msg):
     except:
         pass
 
+def format_size(size_bytes):
+    if size_bytes == 0: return "0 B"
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} TB"
+
 def get_client_ip(request: Request):
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
@@ -100,8 +108,7 @@ def init_db():
         storage_type TEXT DEFAULT 'telegram',
         r2_key      TEXT
     )''')
-    
-    # Auto-Migration for existing DBs
+
     try:
         conn.execute("ALTER TABLE files ADD COLUMN storage_type TEXT DEFAULT 'telegram'")
         conn.execute("ALTER TABLE files ADD COLUMN r2_key TEXT")
@@ -163,7 +170,6 @@ async def download_file(request: Request, short_id: str):
     if not entry:
         raise HTTPException(status_code=404, detail="File not found")
 
-    # 🚀 R2 DIRECT DOWNLOAD REDIRECT
     if entry.get("storage_type") == "r2":
         try:
             log(f"🚀 R2 REDIRECT | {entry['filename']} | Client: {client_ip}")
@@ -181,7 +187,7 @@ async def download_file(request: Request, short_id: str):
             log(f"❌ R2 URL Error: {e}")
             raise HTTPException(status_code=500, detail="R2 Link Generation Failed")
 
-    # 🔵 TELEGRAM STREAMING
+    # TELEGRAM STREAMING Logic
     file_size = int(entry["size"])
     filename_raw = entry["filename"]
     content_type = entry["content_type"] or "application/octet-stream"
@@ -211,7 +217,7 @@ async def download_file(request: Request, short_id: str):
             bot_dc = getattr(client.session, 'dc_id', 0)
             file_dc = getattr(document, 'dc_id', 0)
             max_pipes = 16 if (bot_dc == file_dc or bot_dc == 0) else 8
-            
+
             start_time = time.time()
             sent_bytes = 0
             last_log_time = start_time
@@ -277,7 +283,33 @@ async def register_r2(key: str, data: dict = Body(...)):
     return {"status": "OK"}
 
 # ============================================================
-# UTILITIES & RE-STATED ROUTES
+# 🗑️ SMART DELETE (Physical Storage Cleanup)
+# ============================================================
+@app.get("/api/file/delete")
+async def mock_delete(key: str, file_code: str):
+    verify_key(key)
+    
+    # 1. DB se details nikaalo
+    entry = get_file_entry(file_code)
+    
+    if entry:
+        # 2. Agar file R2 par hai, toh Cloudflare se mitao
+        if entry.get("storage_type") == "r2" and entry.get("r2_key"):
+            try:
+                r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
+                log(f"🗑️ R2 PHYSICAL DELETE | {entry['r2_key']}")
+            except Exception as e:
+                log(f"❌ R2 Physical Delete Failed: {e}")
+
+        # 3. DB entry udao
+        delete_file_entry(file_code)
+        log(f"✅ DB ENTRY DELETED | {file_code}")
+        return {"status": 200, "msg": "OK"}
+    
+    return {"status": 404, "msg": "File Not Found"}
+
+# ============================================================
+# UTILITIES & CLIENT
 # ============================================================
 _client = None
 async def get_client():
@@ -289,12 +321,6 @@ async def get_client():
 
 def verify_key(key: str):
     if key != INTERNAL_API_KEY: raise HTTPException(status_code=403)
-
-@app.get("/api/file/delete")
-async def mock_delete(key: str, file_code: str):
-    verify_key(key)
-    delete_file_entry(file_code)
-    return {"status": 200, "msg": "OK"}
 
 @app.get("/api/file/rename")
 async def mock_rename(key: str, file_code: str, name: str):
