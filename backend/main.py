@@ -147,15 +147,13 @@ def save_file_entry(short_id, data):
         conn.commit(); conn.close()
 
 # ============================================================
-# 🧠 SMART R2 CACHING SYSTEM (BACKGROUND TASKS)
+# 🧠 SMART R2 CACHING SYSTEM
 # ============================================================
 _caching_tasks = set()
 
 async def cache_tg_to_r2(short_id):
-    """Background me Telegram file ko Cloudflare R2 me bhejega, slowly."""
     try:
-        # ⚡ 60 seconds ka delay taaki user ka current download distub na ho
-        await asyncio.sleep(60) 
+        await asyncio.sleep(60) # 60 sec wait taaki user ki bandwidth affect na ho
         
         entry = get_file_entry(short_id)
         if not entry or entry.get("storage_type") == "r2" or entry.get("r2_cache_key"):
@@ -168,19 +166,16 @@ async def cache_tg_to_r2(short_id):
 
         tmp_path = f"/tmp/cache_{short_id}_{int(time.time())}.bin"
         
-        # Download from Telegram slowly
         with open(tmp_path, "wb") as f:
-            async for chunk in client.iter_download(message.document, request_size=512*1024):
+            async for chunk in client.iter_download(message.document, request_size=1024*1024):
                 f.write(chunk)
-                await asyncio.sleep(0.05) # Yield control to keep server light
+                await asyncio.sleep(0.01) 
         
-        # Upload to Cloudflare R2
         r2_cache_key = f"cache_{short_id}_{uuid.uuid4().hex[:6]}"
         def s3_upload():
             r2_client.upload_file(tmp_path, R2_BUCKET_NAME, r2_cache_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
         await asyncio.to_thread(s3_upload)
         
-        # Update Database with new Cache Key
         conn = get_db_connection()
         conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
         conn.commit(); conn.close()
@@ -198,7 +193,6 @@ async def cache_tg_to_r2(short_id):
             except: pass
 
 async def cache_cleanup_loop():
-    """Har ghante check karega aur 24H purane caches mita dega"""
     await asyncio.sleep(60) 
     while True:
         try:
@@ -211,7 +205,7 @@ async def cache_cleanup_loop():
                 try:
                     r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
                     log(f"🗑️ 24H CACHE CLEARED | {short_id} removed from R2.")
-                except Exception as e: pass
+                except: pass
                 
                 conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
                 conn.commit()
@@ -230,7 +224,7 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     except Exception as e: raise HTTPException(status_code=500)
 
 # ============================================================
-# ⬇️ SMART DOWNLOAD ENGINE (ULTRA-STABLE / SLOW & STEADY)
+# ⬇️ SMART DOWNLOAD ENGINE (NO API SPAM + TRUE RESUME)
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_handle(request: Request, short_id: str):
@@ -266,7 +260,7 @@ async def download_handle(request: Request, short_id: str):
         except: pass
 
     content_length = end_byte - start_byte + 1
-    log(f"⬇️ STREAM START (Ultra-Stable) | {filename_raw} | IP: {client_ip}")
+    log(f"⬇️ STREAM START (Solid Fallback) | {filename_raw} | IP: {client_ip}")
 
     try:
         client = await get_client()
@@ -275,37 +269,34 @@ async def download_handle(request: Request, short_id: str):
         document = message.document
 
         async def stream_generator():
-            # ⚡ ROCK SOLID LOGIC: Very small chunks to prevent TG from closing connection
-            chunk_size = 512 * 1024 # Sirf 512KB fetch karega
             current_offset = start_byte
+            chunk_size = 1024 * 1024 # Standard 1MB chunks
 
             while current_offset <= end_byte:
-                if await request.is_disconnected(): break
-                chunk_data = b""
-                retries = 20 # Retry count badha diya
+                try:
+                    # ⚡ NORMAL FLOW: Ek single continuous pipe khul gaya
+                    async for chunk in client.iter_download(document, offset=current_offset, request_size=chunk_size):
+                        if await request.is_disconnected():
+                            return # User canceled
+                        
+                        # Browser ko active rakhne ke liye 64KB ke tukdon me data
+                        step = 64 * 1024
+                        for i in range(0, len(chunk), step):
+                            if await request.is_disconnected(): return
+                            yield chunk[i:i+step]
+                            
+                        current_offset += len(chunk)
+                        
+                        if current_offset > end_byte:
+                            return # Download complete
+                            
+                    return # Natural loop exit
 
-                for attempt in range(retries):
-                    try:
-                        async for chunk in client.iter_download(document, offset=current_offset, request_size=chunk_size):
-                            chunk_data = chunk
-                            break
-                        if chunk_data: break
-                    except Exception as e:
-                        log(f"⚠️ Slow Stream Retry {attempt+1}/{retries} | Err: {e}")
-                        await asyncio.sleep(2.0) # Connection tootne par 2 sec aaram karke wapas try karega
-
-                if not chunk_data: break
-                if current_offset + len(chunk_data) - 1 > end_byte:
-                    chunk_data = chunk_data[:(end_byte - current_offset + 1)]
-
-                # ⚡ DRIP FEED: Browser ko sirf 32KB karke data dega aur har chunk me halka sa delay lega
-                step = 32 * 1024 
-                for i in range(0, len(chunk_data), step):
-                    if await request.is_disconnected(): break
-                    yield chunk_data[i:i+step]
-                    await asyncio.sleep(0.01) # Browser ko timeout hone se rokenge
-
-                current_offset += len(chunk_data)
+                except Exception as e:
+                    # ⚡ ERROR HANDLING: Telegram ne connection toda toh sirf 2 sec rukenge aur wapas aayenge
+                    if await request.is_disconnected(): return
+                    log(f"⚠️ Stream Break @ {current_offset}. Resuming... | Err: {e}")
+                    await asyncio.sleep(2)
 
         headers = {
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename_raw)}",
@@ -315,7 +306,6 @@ async def download_handle(request: Request, short_id: str):
         if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
         return StreamingResponse(stream_generator(), status_code=206 if range_header else 200, headers=headers)
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-
 
 # ============================================================
 # 🚀 UPLOAD & REMOTE LOGIC
