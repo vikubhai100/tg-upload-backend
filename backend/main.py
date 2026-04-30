@@ -283,12 +283,12 @@ async def download_file(request: Request, short_id: str):
         document = message.document
 
         async def stream_direct():
-            chunk_size = 1024 * 1024  # 1MB Chunks
+            chunk_size = 4 * 1024 * 1024  # 4MB Chunks (was 1MB)
             
-            # Base pipes: Start with moderate pipes so server doesn't crash
+            # More pipes = faster parallel download from Telegram
             bot_dc = getattr(client.session, 'dc_id', 0)
             file_dc = getattr(document, 'dc_id', 0)
-            max_pipes = 6 if (bot_dc == file_dc or bot_dc == 0) else 3
+            max_pipes = 16 if (bot_dc == file_dc or bot_dc == 0) else 8  # was 6/3
 
             start_time = time.time()
             sent_bytes = 0
@@ -299,13 +299,13 @@ async def download_file(request: Request, short_id: str):
                     try:
                         async def fetch_data():
                             buffer = b""
-                            async for chunk in client.iter_download(document, offset=off, request_size=512*1024):
+                            async for chunk in client.iter_download(document, offset=off, request_size=4*1024*1024):
                                 buffer += chunk
                                 if len(buffer) >= length:
                                     return buffer[:length]
                             return buffer
                         
-                        return await asyncio.wait_for(fetch_data(), timeout=20.0)
+                        return await asyncio.wait_for(fetch_data(), timeout=60.0)  # was 20s, 4MB chunks need more time
                     except asyncio.TimeoutError:
                         await asyncio.sleep(1.0)
                     except Exception as e:
@@ -337,17 +337,14 @@ async def download_file(request: Request, short_id: str):
                         if not chunk_data and current_offset <= end_byte:
                             raise Exception("Telegram sent empty data")
 
-                        # Send data in small 128KB pieces
-                        step = 128 * 1024
+                        # Send data in larger 512KB pieces (was 128KB — less loop overhead)
+                        step = 512 * 1024
                         for i in range(0, len(chunk_data), step):
                             # 🛑 SMART FEATURE 2: TCP Backpressure Verification
                             if await request.is_disconnected():
                                 break
 
                             chunk_piece = chunk_data[i:i+step]
-                            
-                            # Yahan magic hoga: Agar user ka internet slow hai, toh yeh 'yield' automatic slow ho jayega.
-                            # Isse loop hold ho jayega aur Telegram se naye chunks tab tak download nahi honge jab tak user purana data receive na kar le.
                             yield chunk_piece
 
                             sent_bytes += len(chunk_piece)
@@ -357,8 +354,7 @@ async def download_file(request: Request, short_id: str):
                                 speed = sent_bytes / max((now - start_time), 0.1)
                                 log(f"📡 SMART STREAMING | {filename_raw} | Speed: {format_size(speed)}/s")
                                 last_log_time = now
-
-                            await asyncio.sleep(0.0001)
+                            # asyncio.sleep REMOVED — yeh har piece pe slow kar raha tha
 
             except Exception as e:
                 log(f"❌ STREAM CLOSED: {e}")
