@@ -107,7 +107,7 @@ def init_db():
         content_type TEXT, channel_id INTEGER, doc_id TEXT, access_hash TEXT,
         file_reference TEXT, dc_id INTEGER, storage_type TEXT DEFAULT 'telegram', r2_key TEXT
     )''')
-    
+
     try: conn.execute("ALTER TABLE files ADD COLUMN storage_type TEXT DEFAULT 'telegram'")
     except: pass
     try: conn.execute("ALTER TABLE files ADD COLUMN r2_key TEXT")
@@ -142,15 +142,15 @@ def save_file_entry(short_id, data):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (short_id, data.get("message_id", 0), data.get("filename"), data.get("size"),
              data.get("content_type"), data.get("channel_id", 0), str(data.get("doc_id", "0")),
-             str(data.get("access_hash", "0")), str(data.get("file_reference", "0")), 
+             str(data.get("access_hash", "0")), str(data.get("file_reference", "0")),
              data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key))
         conn.commit(); conn.close()
 
 async def cache_cleanup_loop():
-    await asyncio.sleep(60) 
+    await asyncio.sleep(60)
     while True:
         try:
-            cutoff_time = int(time.time()) - (24 * 3600) 
+            cutoff_time = int(time.time()) - (24 * 3600)
             conn = get_db_connection()
             rows = conn.execute("SELECT short_id, r2_cache_key FROM files WHERE r2_cache_key IS NOT NULL AND last_accessed < ?", (cutoff_time,)).fetchall()
             for row in rows:
@@ -176,13 +176,13 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
 # ============================================================
 # 🧠 THE MASTER SPOOLER: TEMP FILE + CACHE (SAFE)
 # ============================================================
-_active_dl = {} 
+_active_dl = {}
 
 async def bg_fetch_and_cache(short_id, entry):
     tmp_path = f"/tmp/dl_{short_id}.bin"
     file_size = int(entry["size"])
     current_offset = 0
-    mode = "wb" 
+    mode = "wb"
 
     try:
         log(f"⚙️ SPOOLER START | Fetching {short_id} ({format_size(file_size)}) to Temp...")
@@ -194,35 +194,35 @@ async def bg_fetch_and_cache(short_id, entry):
                 with open(tmp_path, mode) as f_out:
                     async for chunk in client.iter_download(message.document, offset=current_offset, request_size=1024*1024):
                         f_out.write(chunk)
-                        f_out.flush() 
-                        
+                        f_out.flush()
+
                         current_offset += len(chunk)
                         _active_dl[short_id]["dl_bytes"] = current_offset
-                        await asyncio.sleep(0.01) 
-                        
+                        await asyncio.sleep(0.01)
+
             except Exception as e:
                 log(f"⚠️ Spooler TG Drop @ {format_size(current_offset)}. Retrying... Err: {e}")
-                mode = "ab" 
-                await asyncio.sleep(2) 
+                mode = "ab"
+                await asyncio.sleep(2)
 
         _active_dl[short_id]["done"] = True
         log(f"✅ SPOOLER DONE | {short_id} fully saved to Temp! Uploading to R2...")
-        
+
         r2_cache_key = f"cache_{short_id}_{uuid.uuid4().hex[:6]}"
         def s3_up():
             r2_client.upload_file(tmp_path, R2_BUCKET_NAME, r2_cache_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
         await asyncio.to_thread(s3_up)
-        
+
         conn = get_db_connection()
         conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
         conn.commit(); conn.close()
         log(f"☁️ R2 CACHE SUCCESS | {short_id} cached perfectly!")
-        
+
     except Exception as e:
         if short_id in _active_dl: _active_dl[short_id]["err"] = True
         log(f"❌ FATAL Spooler Error for {short_id}: {e}")
     finally:
-        await asyncio.sleep(1800) # Safe 30 mins window for browser to finish reading
+        await asyncio.sleep(1800)
         if short_id in _active_dl: _active_dl.pop(short_id, None)
         try: os.remove(tmp_path)
         except: pass
@@ -276,42 +276,41 @@ async def download_handle(request: Request, short_id: str):
         with open(tmp_path, "rb") as f:
             f.seek(start_byte)
             curr = start_byte
-            
+
             while curr <= end_byte:
                 if await request.is_disconnected(): break
-                
+
                 info = _active_dl.get(short_id)
-                if not info: 
-                    # If popped from memory prematurely
-                    break 
-                
+                if not info:
+                    break
+
                 target_bytes = info["dl_bytes"]
-                
+
                 while curr >= target_bytes:
                     info = _active_dl.get(short_id)
                     if not info or info["done"]: break
-                    if info["err"]: 
+                    if info["err"]:
                         raise RuntimeError("Backend connection to Telegram dropped")
-                        
-                    await asyncio.sleep(0.2) 
+
+                    await asyncio.sleep(0.2)
                     target_bytes = _active_dl.get(short_id, {}).get("dl_bytes", 0)
-                
+
                 info = _active_dl.get(short_id, {})
                 if info.get("done", False) and curr >= target_bytes:
-                    break 
+                    break
 
                 avail = target_bytes - curr
                 read_size = min(128 * 1024, end_byte - curr + 1)
                 if not info.get("done", False):
                     read_size = min(read_size, avail)
-                
+
                 if read_size > 0:
                     data = f.read(read_size)
-                    if not data: 
+                    if not data:
                         await asyncio.sleep(0.1)
-                        f.seek(curr) 
+                        f.seek(curr)
                         continue
-                        
+
                     yield data
                     curr += len(data)
 
@@ -404,6 +403,42 @@ async def register_r2(key: str, data: dict = Body(...)):
     })
     return {"status": "OK"}
 
+# ============================================================
+# ✏️ FILE RENAME — NODE BOT YAHI CALL KARTA HAI
+# ============================================================
+@app.get("/api/file/rename")
+async def file_rename(key: str, file_code: str, name: str):
+    """
+    Node bot se call hota hai jab user file rename karta hai.
+    DB mein filename update karta hai taaki download pe naya naam aaye.
+    """
+    verify_key(key)
+
+    # Sanitize: dangerous characters hata do
+    safe_name = name.strip().replace("/", "_").replace("\\", "_").replace("\x00", "")
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    with _db_lock:
+        conn = get_db_connection()
+        result = conn.execute(
+            "UPDATE files SET filename = ? WHERE short_id = ?",
+            (safe_name, file_code)
+        )
+        conn.commit()
+        changed = result.rowcount
+        conn.close()
+
+    if changed == 0:
+        log(f"⚠️ RENAME MISS | {file_code} not found in DB")
+        return {"status": 404, "msg": "File not found"}
+
+    log(f"✏️ RENAME OK | {file_code} → {safe_name}")
+    return {"status": 200, "msg": "OK", "new_name": safe_name}
+
+# ============================================================
+# ℹ️ FILE INFO
+# ============================================================
 @app.get("/api/file/info")
 async def file_info(key: str, file_code: str):
     verify_key(key)
@@ -453,9 +488,8 @@ async def list_files(key: str, page: int = 1, limit: int = 10):
         "total": total, "page": page, "total_pages": math.ceil(total / limit) if total > 0 else 1
     }
 
-# ⚠️ YAHAN HAI WO STARTUP EVENT JO PEHLE MISSING THA!
 @app.on_event("startup")
-async def on_startup(): 
+async def on_startup():
     init_db()
-    asyncio.create_task(cache_cleanup_loop()) 
+    asyncio.create_task(cache_cleanup_loop())
     log("✅ URLKING HYBRID SYSTEM (SPOOLER V3) ONLINE & READY")
