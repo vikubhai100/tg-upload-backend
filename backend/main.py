@@ -165,27 +165,14 @@ async def cache_cleanup_loop():
 
 def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     try:
-        # 1. AWS SDK se normal R2 endpoint wala presigned URL generate karein
-        raw_url = r2_client.generate_presigned_url('get_object', Params={
+        url = r2_client.generate_presigned_url('get_object', Params={
             'Bucket': R2_BUCKET_NAME, 'Key': r2_key,
             'ResponseContentDisposition': f"attachment; filename=\"{filename}\""
-        }, ExpiresIn=900) # Expiry 15 minute (900s) kar di hai for better security
-        
-        # 2. URL mein se default Cloudflare host ko apne Custom Domain se replace karein
-        # R2_ENDPOINT me scheme (https://) aur domain dono hain. Hum bas base URL replace karenge.
-        # Aapka custom domain: https://db.urlking.site
-        CUSTOM_DOMAIN = "https://db.urlking.site"
-        
-        # boto3 jo URL banayega wo is format me hoga: https://<endpoint>/<bucket_name>/<key>
-        # Cloudflare R2 me path style format use hota hai.
-        old_base = f"{R2_ENDPOINT}/{R2_BUCKET_NAME}"
-        custom_url = raw_url.replace(old_base, CUSTOM_DOMAIN)
-
+        }, ExpiresIn=7200)
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
-        return RedirectResponse(url=custom_url)
-    except Exception as e:
-        log(f"❌ ERROR in presigned URL generation: {e}")
-        raise HTTPException(status_code=500)
+        return RedirectResponse(url=url)
+    except Exception as e: raise HTTPException(status_code=500)
+
 
 
 # ============================================================
