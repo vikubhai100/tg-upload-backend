@@ -351,63 +351,74 @@ async def download_handle(request: Request, short_id: str):
     return StreamingResponse(temp_file_streamer(), status_code=206 if range_header else 200, headers=headers)
 
 # ============================================================
-# 🚀 UPLOAD & REMOTE LOGIC
+# 🚀 UPLOAD & REMOTE LOGIC (Telegram Hang Fix)
 # ============================================================
 async def parallel_upload(client, file_path):
     size = os.path.getsize(file_path)
     name = os.path.basename(file_path)
-    if size < 10*1024*1024: return await client.upload_file(file_path)
+    if size < 10 * 1024 * 1024: 
+        return await client.upload_file(file_path)
+        
     f_id = int.from_bytes(os.urandom(8), "big", signed=True)
-    parts = math.ceil(size / (512*1024))
-    sem = asyncio.Semaphore(15)
+    parts = math.ceil(size / (512 * 1024))
+    
+    # 🔥 BUG FIX: Semaphore 15 se 4 kar diya taaki Telegram IP block/hang na kare
+    sem = asyncio.Semaphore(4) 
+    
     async def up_part(idx):
         async with sem:
             with open(file_path, 'rb') as f:
-                f.seek(idx * 512*1024)
-                chunk = f.read(512*1024)
+                f.seek(idx * 512 * 1024)
+                chunk = f.read(512 * 1024)
             await client(SaveBigFilePartRequest(f_id, idx, parts, chunk))
+            
     await asyncio.gather(*[up_part(i) for i in range(parts)])
     return InputFileBig(id=f_id, parts=parts, name=name)
+
+
 # ============================================================
-# 📤 DIRECT WEB UPLOAD (Website Dashboard ke liye)
+# 📤 DIRECT WEB UPLOAD (RAM Freeze Fix)
 # ============================================================
 @app.post("/api/upload")
 async def api_upload(request: Request):
     try:
-        # 1. API Key Check (Query params ya Form dono me check karega)
+        # 1. API Key Check
         key = request.query_params.get("key")
         form = await request.form()
-        if not key:
-            key = form.get("key")
-            
+        key = key or form.get("key")
         verify_key(key)
         
-        # 2. Smart File Extractor (Frontend kisi bhi naam se bheje, ye pakad lega)
+        # 2. File Grabber
         file_obj = None
         for k, v in form.items():
-            if hasattr(v, "filename") and v.filename:
+            if hasattr(v, "filename") and getattr(v, "filename", None):
                 file_obj = v
                 break
                 
         if not file_obj:
-            return JSONResponse(status_code=400, content=[{"error": "No file detected in request"}])
+            return JSONResponse(status_code=400, content=[{"error": "No file detected"}])
 
-        filename = file_obj.filename
-        content_type = file_obj.content_type
+        filename = getattr(file_obj, "filename", f"file_{int(time.time())}.bin")
+        content_type = getattr(file_obj, "content_type", "application/octet-stream")
         
-        # 3. File ko Temp Folder me save karna
-        tmp_path = f"/tmp/{uuid.uuid4()}_{filename.replace(' ', '_')}"
-        with open(tmp_path, "wb") as buffer:
-            buffer.write(await file_obj.read())
-            
-        # 4. 🛡️ SMART DEDUPLICATION (Hash Check)
+        # 3. 🔥 BUG FIX: CHUNKED SAVING (RAM Safe)
+        # Ab file ek sath RAM me nahi jayegi, 2MB ke tukdo me disk me jayegi. Upload freeze nahi hoga!
+        tmp_path = f"/tmp/upload_{uuid.uuid4().hex[:8]}.bin"
+        with open(tmp_path, "wb") as f:
+            while True:
+                chunk = await file_obj.read(2 * 1024 * 1024) # Read 2MB at a time
+                if not chunk:
+                    break
+                f.write(chunk)
+                
+        # 4. 🛡️ SMART DEDUPLICATION
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
         conn = get_db_connection()
         existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
         conn.close()
         
         if existing:
-            os.unlink(tmp_path) # Temp file hatao
+            os.unlink(tmp_path) 
             new_short_id = str(uuid.uuid4())[:8]
             save_file_entry(new_short_id, {
                 "message_id": existing["message_id"],
@@ -425,13 +436,12 @@ async def api_upload(request: Request):
                 "r2_cache_key": existing.get("r2_cache_key")
             })
             log(f"♻️ WEB DUPLICATE CLONED | Reused ID: {new_short_id}")
-            return JSONResponse(content=[{"file_code": new_short_id, "file_status": "OK"}])
+            return JSONResponse(content=[{"file_code": new_short_id, "file_status": "OK", "status": "success"}])
             
         # 5. 🚀 UPLOAD TO TELEGRAM
         client = await get_client()
         file_size = os.path.getsize(tmp_path)
         
-        # BUG FIX: Chhoti file (<10MB) ke liye seedha path bhejenge taaki script atke nahi
         if file_size < 10 * 1024 * 1024:
             msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
         else:
@@ -450,15 +460,11 @@ async def api_upload(request: Request):
         
         os.unlink(tmp_path)
         log(f"✅ NEW WEB UPLOAD | ID: {short_id}")
-        return JSONResponse(content=[{"file_code": short_id, "file_status": "OK"}])
+        return JSONResponse(content=[{"file_code": short_id, "file_status": "OK", "status": "success"}])
         
     except Exception as e:
         log(f"❌ API UPLOAD CRASH: {str(e)}")
-        # Fail safe: Error aane par server rukega nahi
-        return JSONResponse(status_code=500, content=[{"error": str(e)}])
-
-    
-    
+        return JSONResponse(status_code=500, content=[{"error": f"Server Error: {str(e)}"}])
 
 @app.post("/api/remote_upload")
 async def remote_upload(request: Request):
