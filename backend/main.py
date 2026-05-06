@@ -368,61 +368,97 @@ async def parallel_upload(client, file_path):
             await client(SaveBigFilePartRequest(f_id, idx, parts, chunk))
     await asyncio.gather(*[up_part(i) for i in range(parts)])
     return InputFileBig(id=f_id, parts=parts, name=name)
-
-# 💡 NAYA ROUTE: Web Dashboard se direct small files (< 100MB) upload receive karne ke liye
+# ============================================================
+# 📤 DIRECT WEB UPLOAD (Website Dashboard ke liye)
+# ============================================================
 @app.post("/api/upload")
-async def api_upload(key: str, file: UploadFile = File(...)):
-    verify_key(key)
-    
-    tmp_path = f"/tmp/{uuid.uuid4()}_{file.filename}"
-    with open(tmp_path, "wb") as buffer:
-        while chunk := await file.read(5 * 1024 * 1024):
-            buffer.write(chunk)
+async def api_upload(request: Request):
+    try:
+        # 1. API Key Check (Query params ya Form dono me check karega)
+        key = request.query_params.get("key")
+        form = await request.form()
+        if not key:
+            key = form.get("key")
             
-    # 🛡️ DUPLICATE CHECK (Virtual Cloning)
-    file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
-    conn = get_db_connection()
-    existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
-    conn.close()
-    
-    if existing:
-        os.unlink(tmp_path) # Temp file hata do
-        new_short_id = str(uuid.uuid4())[:8]
-        save_file_entry(new_short_id, {
-            "message_id": existing["message_id"],
-            "filename": file.filename,
-            "size": existing["size"],
-            "content_type": file.content_type,
-            "channel_id": existing["channel_id"],
-            "doc_id": existing["doc_id"],
-            "access_hash": existing["access_hash"],
-            "file_reference": existing["file_reference"],
-            "dc_id": existing["dc_id"],
-            "storage_type": existing["storage_type"],
-            "r2_key": existing["r2_key"],
-            "file_hash": file_hash,
-            "r2_cache_key": existing.get("r2_cache_key")
-        })
-        log(f"♻️ WEB DUPLICATE CLONED | Reused ID: {new_short_id}")
-        return [{"file_code": new_short_id, "file_status": "OK"}]
+        verify_key(key)
         
-    client = await get_client()
-    up_file = await parallel_upload(client, tmp_path)
-    msg = await client.send_file(CHANNEL_ID, up_file, force_document=True)
+        # 2. Smart File Extractor (Frontend kisi bhi naam se bheje, ye pakad lega)
+        file_obj = None
+        for k, v in form.items():
+            if hasattr(v, "filename") and v.filename:
+                file_obj = v
+                break
+                
+        if not file_obj:
+            return JSONResponse(status_code=400, content=[{"error": "No file detected in request"}])
+
+        filename = file_obj.filename
+        content_type = file_obj.content_type
+        
+        # 3. File ko Temp Folder me save karna
+        tmp_path = f"/tmp/{uuid.uuid4()}_{filename.replace(' ', '_')}"
+        with open(tmp_path, "wb") as buffer:
+            buffer.write(await file_obj.read())
+            
+        # 4. 🛡️ SMART DEDUPLICATION (Hash Check)
+        file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
+        conn = get_db_connection()
+        existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
+        conn.close()
+        
+        if existing:
+            os.unlink(tmp_path) # Temp file hatao
+            new_short_id = str(uuid.uuid4())[:8]
+            save_file_entry(new_short_id, {
+                "message_id": existing["message_id"],
+                "filename": filename,
+                "size": existing["size"],
+                "content_type": content_type,
+                "channel_id": existing["channel_id"],
+                "doc_id": existing["doc_id"],
+                "access_hash": existing["access_hash"],
+                "file_reference": existing["file_reference"],
+                "dc_id": existing["dc_id"],
+                "storage_type": existing["storage_type"],
+                "r2_key": existing["r2_key"],
+                "file_hash": file_hash,
+                "r2_cache_key": existing.get("r2_cache_key")
+            })
+            log(f"♻️ WEB DUPLICATE CLONED | Reused ID: {new_short_id}")
+            return JSONResponse(content=[{"file_code": new_short_id, "file_status": "OK"}])
+            
+        # 5. 🚀 UPLOAD TO TELEGRAM
+        client = await get_client()
+        file_size = os.path.getsize(tmp_path)
+        
+        # BUG FIX: Chhoti file (<10MB) ke liye seedha path bhejenge taaki script atke nahi
+        if file_size < 10 * 1024 * 1024:
+            msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
+        else:
+            up_file = await parallel_upload(client, tmp_path)
+            msg = await client.send_file(CHANNEL_ID, up_file, force_document=True)
+        
+        short_id = str(uuid.uuid4())[:8]
+        save_file_entry(short_id, {
+            "message_id": msg.id, "filename": filename, "size": file_size,
+            "content_type": content_type, "channel_id": CHANNEL_ID,
+            "doc_id": msg.document.id, "access_hash": msg.document.access_hash,
+            "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id,
+            "file_hash": file_hash,
+            "storage_type": "telegram"
+        })
+        
+        os.unlink(tmp_path)
+        log(f"✅ NEW WEB UPLOAD | ID: {short_id}")
+        return JSONResponse(content=[{"file_code": short_id, "file_status": "OK"}])
+        
+    except Exception as e:
+        log(f"❌ API UPLOAD CRASH: {str(e)}")
+        # Fail safe: Error aane par server rukega nahi
+        return JSONResponse(status_code=500, content=[{"error": str(e)}])
+
     
-    short_id = str(uuid.uuid4())[:8]
-    save_file_entry(short_id, {
-        "message_id": msg.id, "filename": file.filename, "size": os.path.getsize(tmp_path),
-        "content_type": file.content_type, "channel_id": CHANNEL_ID,
-        "doc_id": msg.document.id, "access_hash": msg.document.access_hash,
-        "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id,
-        "file_hash": file_hash,
-        "storage_type": "telegram"
-    })
     
-    os.unlink(tmp_path)
-    log(f"✅ NEW WEB UPLOAD | ID: {short_id}")
-    return [{"file_code": short_id, "file_status": "OK"}]
 
 @app.post("/api/remote_upload")
 async def remote_upload(request: Request):
