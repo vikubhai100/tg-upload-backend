@@ -10,6 +10,7 @@ import boto3
 import sys
 import aiohttp
 import hashlib
+import aiofiles # 💡 NAYA: RAM aur Disk ko freeze hone se bachane ke liye
 from pathlib import Path
 from urllib.parse import quote
 from botocore.config import Config
@@ -85,7 +86,6 @@ INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "super_secret_key_123")
 def calculate_hash(file_path):
     hasher = hashlib.md5()
     with open(file_path, 'rb') as f:
-        # 8MB ke chunks me read karega taaki RAM full na ho
         while chunk := f.read(8192 * 1024): 
             hasher.update(chunk)
     return hasher.hexdigest()
@@ -151,7 +151,6 @@ def save_file_entry(short_id, data):
         existing = conn.execute("SELECT last_accessed, r2_cache_key FROM files WHERE short_id = ?", (short_id,)).fetchone()
         last_acc = existing["last_accessed"] if existing else int(time.time())
 
-        # Safe cache key retrieval: prioritize incoming data's cache key if it exists, else keep existing
         cache_key = data.get("r2_cache_key") or (existing["r2_cache_key"] if existing else None)
         file_hash = data.get("file_hash")
 
@@ -173,7 +172,6 @@ async def cache_cleanup_loop():
             for row in rows:
                 short_id, cache_key = row["short_id"], row["r2_cache_key"]
 
-                # Verify no other short_id is actively using this cache before deleting
                 count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ?", (cache_key,)).fetchone()[0]
                 if count <= 1:
                     try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
@@ -213,10 +211,10 @@ async def bg_fetch_and_cache(short_id, entry):
         while current_offset < file_size:
             try:
                 message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
-                with open(tmp_path, mode) as f_out:
+                async with aiofiles.open(tmp_path, mode) as f_out:
                     async for chunk in client.iter_download(message.document, offset=current_offset, request_size=1024*1024):
-                        f_out.write(chunk)
-                        f_out.flush()
+                        await f_out.write(chunk)
+                        await f_out.flush()
 
                         current_offset += len(chunk)
                         _active_dl[short_id]["dl_bytes"] = current_offset
@@ -238,7 +236,6 @@ async def bg_fetch_and_cache(short_id, entry):
         conn = get_db_connection()
         conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
 
-        # Apply cache key to any potential clones pointing to the same document
         doc_id = entry.get("doc_id")
         if doc_id:
             conn.execute("UPDATE files SET r2_cache_key = ? WHERE doc_id = ? AND r2_cache_key IS NULL", (r2_cache_key, doc_id))
@@ -351,74 +348,81 @@ async def download_handle(request: Request, short_id: str):
     return StreamingResponse(temp_file_streamer(), status_code=206 if range_header else 200, headers=headers)
 
 # ============================================================
-# 🚀 UPLOAD & REMOTE LOGIC (Telegram Hang Fix)
+# 🚀 UPLOAD & REMOTE LOGIC (RAM & TELEGRAM HANG FIX ⚡)
 # ============================================================
 async def parallel_upload(client, file_path):
     size = os.path.getsize(file_path)
     name = os.path.basename(file_path)
-    if size < 10 * 1024 * 1024: 
+    if size < 10*1024*1024: 
         return await client.upload_file(file_path)
         
     f_id = int.from_bytes(os.urandom(8), "big", signed=True)
-    parts = math.ceil(size / (512 * 1024))
+    parts = math.ceil(size / (512*1024))
     
-    # 🔥 BUG FIX: Semaphore 15 se 4 kar diya taaki Telegram IP block/hang na kare
+    # 🔥 FIX: Semaphore limit to 4 taaki Telegram API limit (FloodWait) na maare
     sem = asyncio.Semaphore(4) 
     
     async def up_part(idx):
         async with sem:
-            with open(file_path, 'rb') as f:
-                f.seek(idx * 512 * 1024)
-                chunk = f.read(512 * 1024)
+            # 💡 FIX: aiofiles ka use kiya chunked upload ke liye
+            async with aiofiles.open(file_path, 'rb') as f:
+                await f.seek(idx * 512 * 1024)
+                chunk = await f.read(512 * 1024)
             await client(SaveBigFilePartRequest(f_id, idx, parts, chunk))
             
     await asyncio.gather(*[up_part(i) for i in range(parts)])
     return InputFileBig(id=f_id, parts=parts, name=name)
 
-
 # ============================================================
-# 📤 DIRECT WEB UPLOAD (RAM Freeze Fix)
+# 📤 DIRECT WEB UPLOAD (100% UNBLOCKING STREAM)
 # ============================================================
 @app.post("/api/upload")
-async def api_upload(request: Request):
+async def api_upload(
+    request: Request,
+    key: str = None,
+    file: UploadFile = File(None),
+    files: UploadFile = File(None, alias="files[]"),
+    document: UploadFile = File(None)
+):
     try:
-        # 1. API Key Check
-        key = request.query_params.get("key")
-        form = await request.form()
-        key = key or form.get("key")
+        # 1. Capture API Key safely
+        if not key:
+            key = request.query_params.get("key")
         verify_key(key)
-        
-        # 2. File Grabber
-        file_obj = None
-        for k, v in form.items():
-            if hasattr(v, "filename") and getattr(v, "filename", None):
-                file_obj = v
-                break
-                
-        if not file_obj:
-            return JSONResponse(status_code=400, content=[{"error": "No file detected"}])
 
-        filename = getattr(file_obj, "filename", f"file_{int(time.time())}.bin")
-        content_type = getattr(file_obj, "content_type", "application/octet-stream")
+        # 2. FastAPI's Native File Parsing (Bypasses manual form reading blocks)
+        target_file = file or files or document
         
-        # 3. 🔥 BUG FIX: CHUNKED SAVING (RAM Safe)
-        # Ab file ek sath RAM me nahi jayegi, 2MB ke tukdo me disk me jayegi. Upload freeze nahi hoga!
-        tmp_path = f"/tmp/upload_{uuid.uuid4().hex[:8]}.bin"
-        with open(tmp_path, "wb") as f:
-            while True:
-                chunk = await file_obj.read(2 * 1024 * 1024) # Read 2MB at a time
-                if not chunk:
+        # Safe fallback for unexpected form field names
+        if not target_file:
+            form = await request.form()
+            for k, v in form.items():
+                if hasattr(v, "filename") and getattr(v, "filename", None):
+                    target_file = v
                     break
-                f.write(chunk)
-                
+
+        if not target_file:
+            return JSONResponse(status_code=400, content=[{"error": "No file detected in request"}])
+
+        filename = getattr(target_file, "filename", f"file_{int(time.time())}.bin")
+        content_type = getattr(target_file, "content_type", "application/octet-stream")
+
+        tmp_path = f"/tmp/upload_{uuid.uuid4().hex[:8]}.bin"
+
+        # 3. 🚀 RAM-SAFE ASYNC CHUNKED WRITING
+        # Ye loop server ko 1 millisecond ke liye bhi nahi rokega! Browser pura upload aram se karega.
+        async with aiofiles.open(tmp_path, "wb") as f:
+            while chunk := await target_file.read(2 * 1024 * 1024): # 2MB chunks
+                await f.write(chunk)
+
         # 4. 🛡️ SMART DEDUPLICATION
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
         conn = get_db_connection()
         existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
         conn.close()
-        
+
         if existing:
-            os.unlink(tmp_path) 
+            os.unlink(tmp_path)
             new_short_id = str(uuid.uuid4())[:8]
             save_file_entry(new_short_id, {
                 "message_id": existing["message_id"],
@@ -437,17 +441,17 @@ async def api_upload(request: Request):
             })
             log(f"♻️ WEB DUPLICATE CLONED | Reused ID: {new_short_id}")
             return JSONResponse(content=[{"file_code": new_short_id, "file_status": "OK", "status": "success"}])
-            
+
         # 5. 🚀 UPLOAD TO TELEGRAM
         client = await get_client()
         file_size = os.path.getsize(tmp_path)
-        
+
         if file_size < 10 * 1024 * 1024:
             msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
         else:
             up_file = await parallel_upload(client, tmp_path)
             msg = await client.send_file(CHANNEL_ID, up_file, force_document=True)
-        
+
         short_id = str(uuid.uuid4())[:8]
         save_file_entry(short_id, {
             "message_id": msg.id, "filename": filename, "size": file_size,
@@ -457,14 +461,15 @@ async def api_upload(request: Request):
             "file_hash": file_hash,
             "storage_type": "telegram"
         })
-        
+
         os.unlink(tmp_path)
         log(f"✅ NEW WEB UPLOAD | ID: {short_id}")
         return JSONResponse(content=[{"file_code": short_id, "file_status": "OK", "status": "success"}])
-        
+
     except Exception as e:
         log(f"❌ API UPLOAD CRASH: {str(e)}")
         return JSONResponse(status_code=500, content=[{"error": f"Server Error: {str(e)}"}])
+
 
 @app.post("/api/remote_upload")
 async def remote_upload(request: Request):
@@ -477,8 +482,9 @@ async def remote_upload(request: Request):
 
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as r:
-                with open(tmp_path, 'wb') as f:
-                    async for chunk in r.content.iter_chunked(5*1024*1024): f.write(chunk)
+                async with aiofiles.open(tmp_path, 'wb') as f:
+                    async for chunk in r.content.iter_chunked(5*1024*1024): 
+                        await f.write(chunk)
 
         # 🛡️ DUPLICATE CHECK
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
@@ -544,14 +550,12 @@ async def file_delete(key: str, file_code: str):
         with _db_lock:
             conn = get_db_connection()
 
-            # Safe delete check for permanent R2 files
             if entry.get("storage_type") == "r2" and entry.get("r2_key"):
                 count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_key = ?", (entry["r2_key"],)).fetchone()[0]
                 if count <= 1:
                     try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
                     except: pass
 
-            # Safe delete check for cached R2 files
             if entry.get("r2_cache_key"):
                 count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ?", (entry["r2_cache_key"],)).fetchone()[0]
                 if count <= 1:
@@ -570,7 +574,7 @@ async def register_r2(key: str, data: dict = Body(...)):
     save_file_entry(data["short_id"], {
         "filename": data["filename"], "size": data["size"], "storage_type": "r2",
         "r2_key": data["r2_key"], "content_type": "application/octet-stream",
-        "file_hash": data.get("file_hash") # 💡 Ye bhi add kar diya
+        "file_hash": data.get("file_hash") 
     })
     return {"status": "OK"}
 
