@@ -326,18 +326,18 @@ async def parallel_upload(client, file_path):
     name = os.path.basename(file_path)
     if size < 10*1024*1024: 
         return await client.upload_file(file_path)
-        
+
     f_id = int.from_bytes(os.urandom(8), "big", signed=True)
     parts = math.ceil(size / (512*1024))
     sem = asyncio.Semaphore(4) 
-    
+
     async def up_part(idx):
         async with sem:
             async with aiofiles.open(file_path, 'rb') as f:
                 await f.seek(idx * 512*1024)
                 chunk = await f.read(512*1024)
             await client(SaveBigFilePartRequest(f_id, idx, parts, chunk))
-            
+
     await asyncio.gather(*[up_part(i) for i in range(parts)])
     return InputFileBig(id=f_id, parts=parts, name=name)
 
@@ -581,6 +581,22 @@ async def get_client():
 
 def verify_key(key: str):
     if key != INTERNAL_API_KEY: raise HTTPException(status_code=403)
+
+# ============================================================
+# 📂 FETCH FILES DIRECTORY (Jo route miss ho gaya tha)
+# ============================================================
+@app.get("/files")
+async def list_files(key: str, page: int = 1, limit: int = 10):
+    verify_key(key)
+    conn = get_db_connection()
+    offset = (page - 1) * limit
+    total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    rows = conn.execute("SELECT * FROM files ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+    conn.close()
+    return {
+        "files": [{"short_id": r["short_id"], "filename": r["filename"], "size": format_size(r["size"]), "download_link": f"{BASE_URL}/download/{r['short_id']}"} for r in rows],
+        "total": total, "page": page, "total_pages": math.ceil(total / limit) if total > 0 else 1
+    }
 
 @app.on_event("startup")
 async def on_startup():
