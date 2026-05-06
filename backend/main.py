@@ -9,6 +9,7 @@ import math
 import boto3
 import sys
 import aiohttp
+import hashlib
 from pathlib import Path
 from urllib.parse import quote
 from botocore.config import Config
@@ -79,6 +80,17 @@ DB_FILE_SQLITE   = "/app/data/files.db"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "super_secret_key_123")
 
 # ============================================================
+# 🛡️ DEDUPLICATION HELPER
+# ============================================================
+def calculate_hash(file_path):
+    hasher = hashlib.md5()
+    with open(file_path, 'rb') as f:
+        # 8MB ke chunks me read karega taaki RAM full na ho
+        while chunk := f.read(8192 * 1024): 
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+# ============================================================
 # 📁 FRONTEND SERVING
 # ============================================================
 CURRENT_FILE_PATH = Path(__file__).resolve()
@@ -116,6 +128,8 @@ def init_db():
     except: pass
     try: conn.execute("ALTER TABLE files ADD COLUMN r2_cache_key TEXT")
     except: pass
+    try: conn.execute("ALTER TABLE files ADD COLUMN file_hash TEXT")
+    except: pass
 
     conn.execute("PRAGMA journal_mode=WAL")
     conn.commit(); conn.close()
@@ -136,14 +150,17 @@ def save_file_entry(short_id, data):
         conn = get_db_connection()
         existing = conn.execute("SELECT last_accessed, r2_cache_key FROM files WHERE short_id = ?", (short_id,)).fetchone()
         last_acc = existing["last_accessed"] if existing else int(time.time())
-        cache_key = existing["r2_cache_key"] if existing else None
+        
+        # Safe cache key retrieval: prioritize incoming data's cache key if it exists, else keep existing
+        cache_key = data.get("r2_cache_key") or (existing["r2_cache_key"] if existing else None)
+        file_hash = data.get("file_hash")
 
-        conn.execute('''REPLACE INTO files (short_id, message_id, filename, size, content_type, channel_id, doc_id, access_hash, file_reference, dc_id, storage_type, r2_key, last_accessed, r2_cache_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        conn.execute('''REPLACE INTO files (short_id, message_id, filename, size, content_type, channel_id, doc_id, access_hash, file_reference, dc_id, storage_type, r2_key, last_accessed, r2_cache_key, file_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (short_id, data.get("message_id", 0), data.get("filename"), data.get("size"),
              data.get("content_type"), data.get("channel_id", 0), str(data.get("doc_id", "0")),
              str(data.get("access_hash", "0")), str(data.get("file_reference", "0")),
-             data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key))
+             data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key, file_hash))
         conn.commit(); conn.close()
 
 async def cache_cleanup_loop():
@@ -155,8 +172,13 @@ async def cache_cleanup_loop():
             rows = conn.execute("SELECT short_id, r2_cache_key FROM files WHERE r2_cache_key IS NOT NULL AND last_accessed < ?", (cutoff_time,)).fetchall()
             for row in rows:
                 short_id, cache_key = row["short_id"], row["r2_cache_key"]
-                try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
-                except: pass
+                
+                # Verify no other short_id is actively using this cache before deleting
+                count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ?", (cache_key,)).fetchone()[0]
+                if count <= 1:
+                    try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
+                    except: pass
+                
                 conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
                 conn.commit()
             conn.close()
@@ -172,8 +194,6 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
         return RedirectResponse(url=url)
     except Exception as e: raise HTTPException(status_code=500)
-
-
 
 # ============================================================
 # 🧠 THE MASTER SPOOLER: TEMP FILE + CACHE (SAFE)
@@ -217,6 +237,12 @@ async def bg_fetch_and_cache(short_id, entry):
 
         conn = get_db_connection()
         conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
+        
+        # Apply cache key to any potential clones pointing to the same document
+        doc_id = entry.get("doc_id")
+        if doc_id:
+            conn.execute("UPDATE files SET r2_cache_key = ? WHERE doc_id = ? AND r2_cache_key IS NULL", (r2_cache_key, doc_id))
+        
         conn.commit(); conn.close()
         log(f"☁️ R2 CACHE SUCCESS | {short_id} cached perfectly!")
 
@@ -351,21 +377,53 @@ async def remote_upload(request: Request):
         url = data.get("url")
         filename = data.get("filename", f"file_{int(time.time())}.bin")
         tmp_path = f"/tmp/{uuid.uuid4()}"
+        
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as r:
                 with open(tmp_path, 'wb') as f:
                     async for chunk in r.content.iter_chunked(5*1024*1024): f.write(chunk)
+                    
+        # 🛡️ DUPLICATE CHECK
+        file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
+        conn = get_db_connection()
+        existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
+        conn.close()
+        
+        if existing:
+            os.unlink(tmp_path)
+            new_short_id = str(uuid.uuid4())[:8]
+            save_file_entry(new_short_id, {
+                "message_id": existing["message_id"], 
+                "filename": filename, 
+                "size": existing["size"],
+                "content_type": existing["content_type"],
+                "channel_id": existing["channel_id"],
+                "doc_id": existing["doc_id"],
+                "access_hash": existing["access_hash"],
+                "file_reference": existing["file_reference"],
+                "dc_id": existing["dc_id"],
+                "storage_type": existing["storage_type"],
+                "r2_key": existing["r2_key"],
+                "file_hash": file_hash,
+                "r2_cache_key": existing.get("r2_cache_key")
+            })
+            log(f"♻️ REMOTE DUPLICATE CLONED | Reused Telegram Data. New ID: {new_short_id} | Name: {filename}")
+            return [{"file_code": new_short_id, "file_status": "OK"}]
+            
         client = await get_client()
         up_file = await parallel_upload(client, tmp_path)
         msg = await client.send_file(CHANNEL_ID, up_file, force_document=True)
         short_id = str(uuid.uuid4())[:8]
+        
         save_file_entry(short_id, {
             "message_id": msg.id, "filename": filename, "size": os.path.getsize(tmp_path),
             "content_type": "application/octet-stream", "channel_id": CHANNEL_ID,
             "doc_id": msg.document.id, "access_hash": msg.document.access_hash,
-            "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id
+            "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id,
+            "file_hash": file_hash
         })
         os.unlink(tmp_path)
+        log(f"✅ NEW REMOTE UPLOAD | ID: {short_id}")
         return [{"file_code": short_id, "file_status": "OK"}]
     except Exception as e: return {"error": str(e)}
 
@@ -382,18 +440,31 @@ async def file_clone(key: str, file_code: str):
 
 @app.get("/api/file/delete")
 async def file_delete(key: str, file_code: str):
-    verify_key(key); entry = get_file_entry(file_code)
+    verify_key(key)
+    entry = get_file_entry(file_code)
+    
     if entry:
-        if entry.get("storage_type") == "r2" and entry.get("r2_key"):
-            try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
-            except: pass
-        if entry.get("r2_cache_key"):
-            try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_cache_key"])
-            except: pass
+        with _db_lock:
+            conn = get_db_connection()
+            
+            # Safe delete check for permanent R2 files
+            if entry.get("storage_type") == "r2" and entry.get("r2_key"):
+                count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_key = ?", (entry["r2_key"],)).fetchone()[0]
+                if count <= 1:
+                    try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
+                    except: pass
+            
+            # Safe delete check for cached R2 files
+            if entry.get("r2_cache_key"):
+                count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ?", (entry["r2_cache_key"],)).fetchone()[0]
+                if count <= 1:
+                    try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_cache_key"])
+                    except: pass
 
-    with _db_lock:
-        conn = sqlite3.connect(DB_FILE_SQLITE); conn.execute("DELETE FROM files WHERE short_id = ?", (file_code,))
-        conn.commit(); conn.close()
+            conn.execute("DELETE FROM files WHERE short_id = ?", (file_code,))
+            conn.commit()
+            conn.close()
+            
     return {"status": 200, "msg": "OK"}
 
 @app.post("/api/file/register_r2")
@@ -406,17 +477,11 @@ async def register_r2(key: str, data: dict = Body(...)):
     return {"status": "OK"}
 
 # ============================================================
-# ✏️ FILE RENAME — NODE BOT YAHI CALL KARTA HAI
+# ✏️ FILE RENAME
 # ============================================================
 @app.get("/api/file/rename")
 async def file_rename(key: str, file_code: str, name: str):
-    """
-    Node bot se call hota hai jab user file rename karta hai.
-    DB mein filename update karta hai taaki download pe naya naam aaye.
-    """
     verify_key(key)
-
-    # Sanitize: dangerous characters hata do
     safe_name = name.strip().replace("/", "_").replace("\\", "_").replace("\x00", "")
     if not safe_name:
         raise HTTPException(status_code=400, detail="Invalid filename")
@@ -455,6 +520,37 @@ async def index_forwarded(key: str, message_id: int, filename: str):
     client = await get_client()
     message = await client.get_messages(CHANNEL_ID, ids=message_id)
     if not message or not message.document: return {"error": "Not Found"}
+    
+    doc_id_str = str(message.document.id)
+    
+    # 🛡️ DUPLICATE CHECK
+    conn = get_db_connection()
+    existing = conn.execute("SELECT * FROM files WHERE doc_id = ?", (doc_id_str,)).fetchone()
+    conn.close()
+    
+    if existing:
+        try: await client.delete_messages(CHANNEL_ID, [message_id])
+        except: pass
+        
+        new_short_id = str(uuid.uuid4())[:8]
+        save_file_entry(new_short_id, {
+            "message_id": existing["message_id"],
+            "filename": filename,
+            "size": existing["size"],
+            "content_type": existing["content_type"],
+            "channel_id": existing["channel_id"],
+            "doc_id": existing["doc_id"],
+            "access_hash": existing["access_hash"],
+            "file_reference": existing["file_reference"],
+            "dc_id": existing["dc_id"],
+            "storage_type": existing["storage_type"],
+            "r2_key": existing["r2_key"],
+            "file_hash": existing.get("file_hash"),
+            "r2_cache_key": existing.get("r2_cache_key")
+        })
+        log(f"♻️ FORWARD DUPLICATE CLONED | Msg {message_id} Deleted. New ID: {new_short_id} | Name: {filename}")
+        return [{"file_code": new_short_id, "file_status": "OK"}]
+
     short_id = str(uuid.uuid4())[:8]
     save_file_entry(short_id, {
         "message_id": message.id, "filename": filename, "size": message.document.size,
@@ -463,6 +559,7 @@ async def index_forwarded(key: str, message_id: int, filename: str):
         "file_reference": message.document.file_reference.hex(), "dc_id": message.document.dc_id,
         "storage_type": "telegram"
     })
+    log(f"✅ NEW FORWARDED FILE | ID: {short_id}")
     return [{"file_code": short_id, "file_status": "OK"}]
 
 # ============================================================
