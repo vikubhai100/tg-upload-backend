@@ -185,7 +185,7 @@
       transition: 0.2s;
       overflow: hidden; /* Prevents overflow completely */
     }
-    
+
     .file-card:hover { 
       border-color: var(--primary); 
       transform: translateX(4px); 
@@ -196,12 +196,12 @@
       font-size: 24px; 
       flex-shrink: 0; /* Icon size fix */
     }
-    
+
     .file-info { 
       flex: 1; 
       min-width: 0; /* CRITICAL FIX: Allows text to truncate inside flexbox */
     }
-    
+
     .file-name { 
       font-weight: 600; 
       font-size: 15px; 
@@ -211,7 +211,7 @@
       overflow: hidden;    /* Hides extra text */
       text-overflow: ellipsis; /* Adds ... at the end */
     }
-    
+
     .file-meta { 
       font-family: 'JetBrains Mono', monospace; 
       font-size: 12px; 
@@ -286,7 +286,7 @@
       </div>
     </div>
     <div id="filesList"></div>
-    
+
     <div class="pagination" id="paginationControls">
       <button class="btn-nav" id="btnPrev" onclick="changePage(-1)">Previous</button>
       <span style="font-family: 'JetBrains Mono'; font-size: 14px;" id="pageInfo">Page 1 / 1</span>
@@ -307,23 +307,31 @@
 </div>
 
 <script>
-  const API_BASE = ''; 
+  const API_BASE = ''; // Ye blank hi rahega kyunki same server hai
   let currentPage = 1;
   let totalPages = 1;
   let secretKey = localStorage.getItem('telestore_v2_key') || '';
   let clickCount = 0;
+  let clickTimer; // Naya timer variable add kiya
 
-  // Secret shortcut triggers modal
+  // Secret shortcut triggers modal (FIXED LOGIC)
   document.getElementById('secretTrigger').addEventListener('click', () => {
     clickCount++;
-    if (clickCount === 3) {
-      if (!secretKey) {
-        document.getElementById('authModal').style.display = 'flex';
-        document.getElementById('accessKey').focus();
-      }
+    
+    // Purana timer cancel karo har tap par (taaki aaram se 3 tap kar sako)
+    clearTimeout(clickTimer);
+    
+    if (clickCount >= 3) {
+      // Hamesha login box kholo, chahe purani key save ho ya nahi
+      document.getElementById('authModal').style.display = 'flex';
+      document.getElementById('accessKey').focus();
+      
+      // Box khulne ke baad counter 0 kar do
       clickCount = 0;
+    } else {
+      // 1.5 seconds ka time milega 3 tap poore karne ke liye
+      clickTimer = setTimeout(() => { clickCount = 0; }, 1500); 
     }
-    setTimeout(() => clickCount = 0, 1000); 
   });
 
   function closeModal() {
@@ -335,12 +343,13 @@
   async function verifyAccess() {
     const key = document.getElementById('accessKey').value;
     if (!key) return;
-    
+
     const ok = await loadFiles(1, key);
     if (ok) {
       secretKey = key;
       localStorage.setItem('telestore_v2_key', key);
       closeModal();
+      document.getElementById('authError').style.display = 'none'; // Error chupao
     } else {
       document.getElementById('authError').style.display = 'block';
     }
@@ -365,7 +374,7 @@
       if (!res.ok) return false;
 
       const data = await res.json();
-      
+
       document.getElementById('promoSection').style.display = 'none';
       document.getElementById('filesSection').style.display = 'block';
       document.getElementById('logoutBtn').style.display = 'block';
@@ -401,6 +410,7 @@
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
+  // Page load hote hi files fetch karne ki koshish karega
   if (secretKey) {
     loadFiles(1);
   }
