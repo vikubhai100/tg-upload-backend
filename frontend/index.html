@@ -172,7 +172,6 @@
       margin-bottom: 24px;
     }
 
-    /* FIX: Improved Structure for File Cards */
     .file-card {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -183,7 +182,7 @@
       gap: 16px;
       margin-bottom: 12px;
       transition: 0.2s;
-      overflow: hidden; /* Prevents overflow completely */
+      overflow: hidden; 
     }
 
     .file-card:hover { 
@@ -192,31 +191,21 @@
       box-shadow: var(--shadow); 
     }
 
-    .file-icon { 
-      font-size: 24px; 
-      flex-shrink: 0; /* Icon size fix */
-    }
+    .file-icon { font-size: 24px; flex-shrink: 0; }
 
-    .file-info { 
-      flex: 1; 
-      min-width: 0; /* CRITICAL FIX: Allows text to truncate inside flexbox */
-    }
+    .file-info { flex: 1; min-width: 0; }
 
     .file-name { 
       font-weight: 600; 
       font-size: 15px; 
       color: var(--text); 
       margin-bottom: 4px;
-      white-space: nowrap; /* Forces single line */
-      overflow: hidden;    /* Hides extra text */
-      text-overflow: ellipsis; /* Adds ... at the end */
+      white-space: nowrap; 
+      overflow: hidden;    
+      text-overflow: ellipsis; 
     }
 
-    .file-meta { 
-      font-family: 'JetBrains Mono', monospace; 
-      font-size: 12px; 
-      color: var(--text-muted); 
-    }
+    .file-meta { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-muted); }
 
     .btn-download {
       padding: 10px 16px;
@@ -227,7 +216,7 @@
       font-weight: 700;
       border-radius: 10px;
       transition: 0.2s;
-      flex-shrink: 0; /* CRITICAL FIX: Keeps button size intact */
+      flex-shrink: 0; 
       white-space: nowrap;
     }
     .btn-download:hover { background: var(--primary); color: white; }
@@ -300,36 +289,31 @@
     <h3>Admin Login</h3>
     <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">Enter your secret access key</p>
     <input type="password" id="accessKey" class="auth-input" placeholder="••••••••" onkeypress="handleEnter(event)"/>
-    <button class="btn-cta" style="width: 100%;" onclick="verifyAccess()">Access Files</button>
+    <button class="btn-cta" id="loginBtn" style="width: 100%;" onclick="verifyAccess()">Access Files</button>
     <p class="error-txt" id="authError">Invalid Secret Key!</p>
     <button onclick="closeModal()" style="margin-top: 15px; background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:12px;">Close</button>
   </div>
 </div>
 
 <script>
-  const API_BASE = ''; // Ye blank hi rahega kyunki same server hai
+  // 💡 FIX 1: Dynamic base URL. Ab URL problem kabhi nahi aayegi.
+  const API_BASE = window.location.origin; 
   let currentPage = 1;
   let totalPages = 1;
   let secretKey = localStorage.getItem('telestore_v2_key') || '';
   let clickCount = 0;
-  let clickTimer; // Naya timer variable add kiya
+  let clickTimer;
 
-  // Secret shortcut triggers modal (FIXED LOGIC)
+  // Secret shortcut triggers modal
   document.getElementById('secretTrigger').addEventListener('click', () => {
     clickCount++;
-    
-    // Purana timer cancel karo har tap par (taaki aaram se 3 tap kar sako)
     clearTimeout(clickTimer);
-    
+
     if (clickCount >= 3) {
-      // Hamesha login box kholo, chahe purani key save ho ya nahi
       document.getElementById('authModal').style.display = 'flex';
       document.getElementById('accessKey').focus();
-      
-      // Box khulne ke baad counter 0 kar do
       clickCount = 0;
     } else {
-      // 1.5 seconds ka time milega 3 tap poore karne ke liye
       clickTimer = setTimeout(() => { clickCount = 0; }, 1500); 
     }
   });
@@ -343,13 +327,22 @@
   async function verifyAccess() {
     const key = document.getElementById('accessKey').value;
     if (!key) return;
+    
+    // UI Feedback for login attempt
+    const btn = document.getElementById('loginBtn');
+    btn.textContent = "Verifying...";
+    btn.disabled = true;
 
     const ok = await loadFiles(1, key);
+    
+    btn.textContent = "Access Files";
+    btn.disabled = false;
+
     if (ok) {
       secretKey = key;
       localStorage.setItem('telestore_v2_key', key);
       closeModal();
-      document.getElementById('authError').style.display = 'none'; // Error chupao
+      document.getElementById('authError').style.display = 'none';
     } else {
       document.getElementById('authError').style.display = 'block';
     }
@@ -370,8 +363,16 @@
     if (!keyToTry) return false;
 
     try {
-      const res = await fetch(`${API_BASE}/files?page=${page}&limit=10&key=${encodeURIComponent(keyToTry)}`);
-      if (!res.ok) return false;
+      const url = `${API_BASE}/files?page=${page}&limit=10&key=${encodeURIComponent(keyToTry)}`;
+      console.log(`[Login] Fetching from: ${url}`);
+      
+      const res = await fetch(url);
+      
+      // 💡 FIX 2: Deep Error Tracking
+      if (!res.ok) {
+        console.error(`[Login Error] Backend rejected key. HTTP Status: ${res.status}`);
+        return false;
+      }
 
       const data = await res.json();
 
@@ -401,6 +402,7 @@
 
       return true;
     } catch (e) {
+      console.error("[Login Error] Fetch failed completely:", e);
       return false;
     }
   }
@@ -410,7 +412,6 @@
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
-  // Page load hote hi files fetch karne ki koshish karega
   if (secretKey) {
     loadFiles(1);
   }
