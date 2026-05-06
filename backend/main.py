@@ -150,7 +150,7 @@ def save_file_entry(short_id, data):
         conn = get_db_connection()
         existing = conn.execute("SELECT last_accessed, r2_cache_key FROM files WHERE short_id = ?", (short_id,)).fetchone()
         last_acc = existing["last_accessed"] if existing else int(time.time())
-        
+
         # Safe cache key retrieval: prioritize incoming data's cache key if it exists, else keep existing
         cache_key = data.get("r2_cache_key") or (existing["r2_cache_key"] if existing else None)
         file_hash = data.get("file_hash")
@@ -172,13 +172,13 @@ async def cache_cleanup_loop():
             rows = conn.execute("SELECT short_id, r2_cache_key FROM files WHERE r2_cache_key IS NOT NULL AND last_accessed < ?", (cutoff_time,)).fetchall()
             for row in rows:
                 short_id, cache_key = row["short_id"], row["r2_cache_key"]
-                
+
                 # Verify no other short_id is actively using this cache before deleting
                 count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ?", (cache_key,)).fetchone()[0]
                 if count <= 1:
                     try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
                     except: pass
-                
+
                 conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
                 conn.commit()
             conn.close()
@@ -237,12 +237,12 @@ async def bg_fetch_and_cache(short_id, entry):
 
         conn = get_db_connection()
         conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
-        
+
         # Apply cache key to any potential clones pointing to the same document
         doc_id = entry.get("doc_id")
         if doc_id:
             conn.execute("UPDATE files SET r2_cache_key = ? WHERE doc_id = ? AND r2_cache_key IS NULL", (r2_cache_key, doc_id))
-        
+
         conn.commit(); conn.close()
         log(f"☁️ R2 CACHE SUCCESS | {short_id} cached perfectly!")
 
@@ -369,6 +369,61 @@ async def parallel_upload(client, file_path):
     await asyncio.gather(*[up_part(i) for i in range(parts)])
     return InputFileBig(id=f_id, parts=parts, name=name)
 
+# 💡 NAYA ROUTE: Web Dashboard se direct small files (< 100MB) upload receive karne ke liye
+@app.post("/api/upload")
+async def api_upload(key: str, file: UploadFile = File(...)):
+    verify_key(key)
+    
+    tmp_path = f"/tmp/{uuid.uuid4()}_{file.filename}"
+    with open(tmp_path, "wb") as buffer:
+        while chunk := await file.read(5 * 1024 * 1024):
+            buffer.write(chunk)
+            
+    # 🛡️ DUPLICATE CHECK (Virtual Cloning)
+    file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
+    conn = get_db_connection()
+    existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
+    conn.close()
+    
+    if existing:
+        os.unlink(tmp_path) # Temp file hata do
+        new_short_id = str(uuid.uuid4())[:8]
+        save_file_entry(new_short_id, {
+            "message_id": existing["message_id"],
+            "filename": file.filename,
+            "size": existing["size"],
+            "content_type": file.content_type,
+            "channel_id": existing["channel_id"],
+            "doc_id": existing["doc_id"],
+            "access_hash": existing["access_hash"],
+            "file_reference": existing["file_reference"],
+            "dc_id": existing["dc_id"],
+            "storage_type": existing["storage_type"],
+            "r2_key": existing["r2_key"],
+            "file_hash": file_hash,
+            "r2_cache_key": existing.get("r2_cache_key")
+        })
+        log(f"♻️ WEB DUPLICATE CLONED | Reused ID: {new_short_id}")
+        return [{"file_code": new_short_id, "file_status": "OK"}]
+        
+    client = await get_client()
+    up_file = await parallel_upload(client, tmp_path)
+    msg = await client.send_file(CHANNEL_ID, up_file, force_document=True)
+    
+    short_id = str(uuid.uuid4())[:8]
+    save_file_entry(short_id, {
+        "message_id": msg.id, "filename": file.filename, "size": os.path.getsize(tmp_path),
+        "content_type": file.content_type, "channel_id": CHANNEL_ID,
+        "doc_id": msg.document.id, "access_hash": msg.document.access_hash,
+        "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id,
+        "file_hash": file_hash,
+        "storage_type": "telegram"
+    })
+    
+    os.unlink(tmp_path)
+    log(f"✅ NEW WEB UPLOAD | ID: {short_id}")
+    return [{"file_code": short_id, "file_status": "OK"}]
+
 @app.post("/api/remote_upload")
 async def remote_upload(request: Request):
     try:
@@ -377,18 +432,18 @@ async def remote_upload(request: Request):
         url = data.get("url")
         filename = data.get("filename", f"file_{int(time.time())}.bin")
         tmp_path = f"/tmp/{uuid.uuid4()}"
-        
+
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as r:
                 with open(tmp_path, 'wb') as f:
                     async for chunk in r.content.iter_chunked(5*1024*1024): f.write(chunk)
-                    
+
         # 🛡️ DUPLICATE CHECK
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
         conn = get_db_connection()
         existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
         conn.close()
-        
+
         if existing:
             os.unlink(tmp_path)
             new_short_id = str(uuid.uuid4())[:8]
@@ -409,12 +464,12 @@ async def remote_upload(request: Request):
             })
             log(f"♻️ REMOTE DUPLICATE CLONED | Reused Telegram Data. New ID: {new_short_id} | Name: {filename}")
             return [{"file_code": new_short_id, "file_status": "OK"}]
-            
+
         client = await get_client()
         up_file = await parallel_upload(client, tmp_path)
         msg = await client.send_file(CHANNEL_ID, up_file, force_document=True)
         short_id = str(uuid.uuid4())[:8]
-        
+
         save_file_entry(short_id, {
             "message_id": msg.id, "filename": filename, "size": os.path.getsize(tmp_path),
             "content_type": "application/octet-stream", "channel_id": CHANNEL_ID,
@@ -442,18 +497,18 @@ async def file_clone(key: str, file_code: str):
 async def file_delete(key: str, file_code: str):
     verify_key(key)
     entry = get_file_entry(file_code)
-    
+
     if entry:
         with _db_lock:
             conn = get_db_connection()
-            
+
             # Safe delete check for permanent R2 files
             if entry.get("storage_type") == "r2" and entry.get("r2_key"):
                 count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_key = ?", (entry["r2_key"],)).fetchone()[0]
                 if count <= 1:
                     try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
                     except: pass
-            
+
             # Safe delete check for cached R2 files
             if entry.get("r2_cache_key"):
                 count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ?", (entry["r2_cache_key"],)).fetchone()[0]
@@ -464,7 +519,7 @@ async def file_delete(key: str, file_code: str):
             conn.execute("DELETE FROM files WHERE short_id = ?", (file_code,))
             conn.commit()
             conn.close()
-            
+
     return {"status": 200, "msg": "OK"}
 
 @app.post("/api/file/register_r2")
@@ -472,7 +527,8 @@ async def register_r2(key: str, data: dict = Body(...)):
     verify_key(key)
     save_file_entry(data["short_id"], {
         "filename": data["filename"], "size": data["size"], "storage_type": "r2",
-        "r2_key": data["r2_key"], "content_type": "application/octet-stream"
+        "r2_key": data["r2_key"], "content_type": "application/octet-stream",
+        "file_hash": data.get("file_hash") # 💡 Ye bhi add kar diya
     })
     return {"status": "OK"}
 
@@ -520,18 +576,18 @@ async def index_forwarded(key: str, message_id: int, filename: str):
     client = await get_client()
     message = await client.get_messages(CHANNEL_ID, ids=message_id)
     if not message or not message.document: return {"error": "Not Found"}
-    
+
     doc_id_str = str(message.document.id)
-    
+
     # 🛡️ DUPLICATE CHECK
     conn = get_db_connection()
     existing = conn.execute("SELECT * FROM files WHERE doc_id = ?", (doc_id_str,)).fetchone()
     conn.close()
-    
+
     if existing:
         try: await client.delete_messages(CHANNEL_ID, [message_id])
         except: pass
-        
+
         new_short_id = str(uuid.uuid4())[:8]
         save_file_entry(new_short_id, {
             "message_id": existing["message_id"],
