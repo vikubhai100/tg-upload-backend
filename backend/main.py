@@ -93,18 +93,23 @@ def calculate_hash(file_path):
 # ============================================================
 # 📁 FRONTEND SERVING
 # ============================================================
-CURRENT_FILE_PATH = Path(__file__).resolve()
-FRONTEND_DIR = CURRENT_FILE_PATH.parent.parent / "frontend"
+BASE_DIR = Path(__file__).resolve().parent.parent
+FRONTEND_DIR = BASE_DIR / "frontend"
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     index_file = FRONTEND_DIR / "index.html"
     if index_file.exists():
         return index_file.read_text(encoding="utf-8")
-    return "<h2>Frontend Not Found</h2>"
+    index_alt = Path(__file__).resolve().parent / "index.html"
+    if index_alt.exists():
+        return index_alt.read_text(encoding="utf-8")
+    return "<h2>Frontend Not Found (Check your /frontend folder)</h2>"
 
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+elif (Path(__file__).resolve().parent / "static").exists():
+    app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
 
 # ============================================================
 # 🗄️ DATABASE MANAGEMENT
@@ -117,20 +122,9 @@ def init_db():
     conn.execute('''CREATE TABLE IF NOT EXISTS files (
         short_id TEXT PRIMARY KEY, message_id INTEGER, filename TEXT, size INTEGER,
         content_type TEXT, channel_id INTEGER, doc_id TEXT, access_hash TEXT,
-        file_reference TEXT, dc_id INTEGER, storage_type TEXT DEFAULT 'telegram', r2_key TEXT
+        file_reference TEXT, dc_id INTEGER, storage_type TEXT DEFAULT 'telegram', r2_key TEXT,
+        last_accessed INTEGER DEFAULT 0, r2_cache_key TEXT, file_hash TEXT
     )''')
-
-    try: conn.execute("ALTER TABLE files ADD COLUMN storage_type TEXT DEFAULT 'telegram'")
-    except: pass
-    try: conn.execute("ALTER TABLE files ADD COLUMN r2_key TEXT")
-    except: pass
-    try: conn.execute("ALTER TABLE files ADD COLUMN last_accessed INTEGER DEFAULT 0")
-    except: pass
-    try: conn.execute("ALTER TABLE files ADD COLUMN r2_cache_key TEXT")
-    except: pass
-    try: conn.execute("ALTER TABLE files ADD COLUMN file_hash TEXT")
-    except: pass
-
     conn.execute("PRAGMA journal_mode=WAL")
     conn.commit(); conn.close()
 
@@ -150,7 +144,6 @@ def save_file_entry(short_id, data):
         conn = get_db_connection()
         existing = conn.execute("SELECT last_accessed, r2_cache_key FROM files WHERE short_id = ?", (short_id,)).fetchone()
         last_acc = existing["last_accessed"] if existing else int(time.time())
-
         cache_key = data.get("r2_cache_key") or (existing["r2_cache_key"] if existing else None)
         file_hash = data.get("file_hash")
 
@@ -216,7 +209,6 @@ async def bg_fetch_and_cache(short_id, entry):
                         current_offset += len(chunk)
                         _active_dl[short_id]["dl_bytes"] = current_offset
                         await asyncio.sleep(0.01)
-
             except Exception as e:
                 log(f"⚠️ Spooler TG Drop @ {format_size(current_offset)}. Retrying... Err: {e}")
                 mode = "ab"
@@ -255,7 +247,6 @@ async def download_handle(request: Request, short_id: str):
 
     if entry.get("storage_type") == "r2" and entry.get("r2_key"):
         return redirect_to_r2(entry["r2_key"], entry["filename"], client_ip, "PERMANENT")
-
     if entry.get("r2_cache_key"):
         return redirect_to_r2(entry["r2_cache_key"], entry["filename"], client_ip, "CACHED LINK")
 
@@ -306,7 +297,6 @@ async def download_handle(request: Request, short_id: str):
 
                 info = _active_dl.get(short_id, {})
                 if info.get("done", False) and curr >= target_bytes: break
-
                 avail = target_bytes - curr
                 read_size = min(128 * 1024, end_byte - curr + 1)
                 if not info.get("done", False): read_size = min(read_size, avail)
@@ -334,10 +324,12 @@ async def download_handle(request: Request, short_id: str):
 async def parallel_upload(client, file_path):
     size = os.path.getsize(file_path)
     name = os.path.basename(file_path)
-    if size < 10*1024*1024: return await client.upload_file(file_path)
+    if size < 10*1024*1024: 
+        return await client.upload_file(file_path)
+        
     f_id = int.from_bytes(os.urandom(8), "big", signed=True)
     parts = math.ceil(size / (512*1024))
-    sem = asyncio.Semaphore(4) # Limit set to 4 to avoid telegram hangs
+    sem = asyncio.Semaphore(4) 
     
     async def up_part(idx):
         async with sem:
@@ -350,7 +342,7 @@ async def parallel_upload(client, file_path):
     return InputFileBig(id=f_id, parts=parts, name=name)
 
 # ============================================================
-# 📤 DIRECT WEB UPLOAD (Website Dashboard ke liye) - RAM SAFE ⚡
+# 📤 DIRECT WEB UPLOAD (Optimized RAM SAFE)
 # ============================================================
 @app.post("/api/upload")
 async def api_upload(request: Request):
@@ -366,21 +358,18 @@ async def api_upload(request: Request):
                 break
 
         if not file_obj:
-            return JSONResponse(status_code=400, content=[{"error": "No file detected in request"}])
+            return JSONResponse(status_code=400, content=[{"error": "No file detected"}])
 
-        filename = getattr(file_obj, "filename", f"file_{int(time.time())}.bin")
+        filename = file_obj.filename
         content_type = getattr(file_obj, "content_type", "application/octet-stream")
-        tmp_path = f"/tmp/{uuid.uuid4().hex[:8]}_{filename.replace(' ', '_')}"
+        tmp_path = f"/tmp/web_{uuid.uuid4().hex[:8]}.bin"
 
-        # 🔥 THE ULTIMATE FIX: Chunks me file write karna taaki RAM freeze na ho!
+        # 🚀 CHUNKED UPLOAD: Server kabhi freeze nahi hoga
         async with aiofiles.open(tmp_path, "wb") as f:
-            while True:
-                chunk = await file_obj.read(2 * 1024 * 1024) # 2MB chunks me disk me daalega
-                if not chunk:
-                    break
+            while chunk := await file_obj.read(2 * 1024 * 1024):
                 await f.write(chunk)
 
-        # 🛡️ SMART DEDUPLICATION
+        # 🛡️ DEDUPLICATION CHECK
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
         conn = get_db_connection()
         existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
@@ -388,29 +377,22 @@ async def api_upload(request: Request):
 
         if existing:
             os.unlink(tmp_path)
-            new_short_id = str(uuid.uuid4())[:8]
-            save_file_entry(new_short_id, {
-                "message_id": existing["message_id"],
-                "filename": filename,
-                "size": existing["size"],
-                "content_type": content_type,
-                "channel_id": existing["channel_id"],
-                "doc_id": existing["doc_id"],
-                "access_hash": existing["access_hash"],
-                "file_reference": existing["file_reference"],
-                "dc_id": existing["dc_id"],
-                "storage_type": existing["storage_type"],
-                "r2_key": existing["r2_key"],
-                "file_hash": file_hash,
-                "r2_cache_key": existing.get("r2_cache_key")
+            new_id = str(uuid.uuid4())[:8]
+            save_file_entry(new_id, {
+                "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
+                "content_type": content_type, "channel_id": existing["channel_id"],
+                "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
+                "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
+                "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
+                "file_hash": file_hash, "r2_cache_key": existing.get("r2_cache_key")
             })
-            log(f"♻️ WEB DUPLICATE CLONED | Reused ID: {new_short_id}")
-            return JSONResponse(content=[{"file_code": new_short_id, "file_status": "OK"}])
+            log(f"♻️ WEB DUPLICATE CLONED | Reused ID: {new_id}")
+            return JSONResponse(content=[{"file_code": new_id, "file_status": "OK"}])
 
-        # 🚀 UPLOAD TO TELEGRAM
         client = await get_client()
         file_size = os.path.getsize(tmp_path)
 
+        # FAST TELEGRAM UPLOAD
         if file_size < 10 * 1024 * 1024:
             msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
         else:
@@ -423,10 +405,8 @@ async def api_upload(request: Request):
             "content_type": content_type, "channel_id": CHANNEL_ID,
             "doc_id": msg.document.id, "access_hash": msg.document.access_hash,
             "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id,
-            "file_hash": file_hash,
-            "storage_type": "telegram"
+            "file_hash": file_hash, "storage_type": "telegram"
         })
-
         os.unlink(tmp_path)
         log(f"✅ NEW WEB UPLOAD | ID: {short_id}")
         return JSONResponse(content=[{"file_code": short_id, "file_status": "OK"}])
@@ -450,7 +430,6 @@ async def remote_upload(request: Request):
                     async for chunk in r.content.iter_chunked(5*1024*1024): 
                         await f.write(chunk)
 
-        # 🛡️ DUPLICATE CHECK
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
         conn = get_db_connection()
         existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
@@ -460,21 +439,14 @@ async def remote_upload(request: Request):
             os.unlink(tmp_path)
             new_short_id = str(uuid.uuid4())[:8]
             save_file_entry(new_short_id, {
-                "message_id": existing["message_id"], 
-                "filename": filename, 
-                "size": existing["size"],
-                "content_type": existing["content_type"],
-                "channel_id": existing["channel_id"],
-                "doc_id": existing["doc_id"],
-                "access_hash": existing["access_hash"],
-                "file_reference": existing["file_reference"],
-                "dc_id": existing["dc_id"],
-                "storage_type": existing["storage_type"],
-                "r2_key": existing["r2_key"],
-                "file_hash": file_hash,
-                "r2_cache_key": existing.get("r2_cache_key")
+                "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
+                "content_type": existing["content_type"], "channel_id": existing["channel_id"],
+                "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
+                "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
+                "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
+                "file_hash": file_hash, "r2_cache_key": existing.get("r2_cache_key")
             })
-            log(f"♻️ REMOTE DUPLICATE CLONED | Reused Telegram Data. New ID: {new_short_id} | Name: {filename}")
+            log(f"♻️ REMOTE DUPLICATE CLONED | Reused ID: {new_short_id}")
             return [{"file_code": new_short_id, "file_status": "OK"}]
 
         client = await get_client()
@@ -508,7 +480,6 @@ async def file_clone(key: str, file_code: str):
 @app.get("/api/file/delete")
 async def file_delete(key: str, file_code: str):
     verify_key(key); entry = get_file_entry(file_code)
-
     if entry:
         with _db_lock:
             conn = get_db_connection()
@@ -522,10 +493,8 @@ async def file_delete(key: str, file_code: str):
                 if count <= 1:
                     try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_cache_key"])
                     except: pass
-
             conn.execute("DELETE FROM files WHERE short_id = ?", (file_code,))
             conn.commit(); conn.close()
-
     return {"status": 200, "msg": "OK"}
 
 @app.post("/api/file/register_r2")
@@ -579,9 +548,8 @@ async def index_forwarded(key: str, message_id: int, filename: str):
     if existing:
         try: await client.delete_messages(CHANNEL_ID, [message_id])
         except: pass
-
-        new_short_id = str(uuid.uuid4())[:8]
-        save_file_entry(new_short_id, {
+        new_id = str(uuid.uuid4())[:8]
+        save_file_entry(new_id, {
             "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
             "content_type": existing["content_type"], "channel_id": existing["channel_id"],
             "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
@@ -589,7 +557,7 @@ async def index_forwarded(key: str, message_id: int, filename: str):
             "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
             "file_hash": existing.get("file_hash"), "r2_cache_key": existing.get("r2_cache_key")
         })
-        return [{"file_code": new_short_id, "file_status": "OK"}]
+        return [{"file_code": new_id, "file_status": "OK"}]
 
     short_id = str(uuid.uuid4())[:8]
     save_file_entry(short_id, {
