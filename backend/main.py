@@ -14,7 +14,7 @@ import aiofiles
 from pathlib import Path
 from urllib.parse import quote
 from botocore.config import Config
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, Response, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -154,6 +154,74 @@ def save_file_entry(short_id, data):
              str(data.get("access_hash", "0")), str(data.get("file_reference", "0")),
              data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key, file_hash))
         conn.commit(); conn.close()
+
+# ============================================================
+# 🧹 R2 AUTO-CLEANUP & DEDUPLICATION (ADDED LOGIC)
+# ============================================================
+def execute_r2_cleanup():
+    try:
+        log("🧹 [AUTO-CLEANUP] Starting R2 Deduplication scan...")
+        conn = get_db_connection()
+        
+        # Find hashes that appear more than once in R2
+        duplicates = conn.execute('''
+            SELECT file_hash, COUNT(*) as c 
+            FROM files 
+            WHERE storage_type = 'r2' AND file_hash IS NOT NULL AND r2_key IS NOT NULL
+            GROUP BY file_hash 
+            HAVING c > 1
+        ''').fetchall()
+
+        total_saved_bytes = 0
+        files_cleaned = 0
+
+        for dup in duplicates:
+            f_hash = dup["file_hash"]
+            
+            # Get all files with this hash (oldest first)
+            rows = conn.execute("SELECT short_id, r2_key, size FROM files WHERE file_hash = ? AND storage_type = 'r2' ORDER BY rowid ASC", (f_hash,)).fetchall()
+            
+            if len(rows) > 1:
+                # Keep the first one as master
+                master_r2_key = rows[0]["r2_key"]
+                
+                # Delete the rest and link to master
+                for i in range(1, len(rows)):
+                    dup_short_id = rows[i]["short_id"]
+                    dup_r2_key = rows[i]["r2_key"]
+                    
+                    if dup_r2_key != master_r2_key:
+                        conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, dup_short_id))
+                        try:
+                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=dup_r2_key)
+                            log(f"🗑️ [DEDUPE] Deleted extra R2 file: {dup_r2_key}")
+                            total_saved_bytes += rows[i]["size"]
+                            files_cleaned += 1
+                        except Exception as e:
+                            log(f"⚠️ [DEDUPE] R2 delete failed for {dup_r2_key}: {e}")
+        
+        conn.commit()
+        conn.close()
+        
+        if files_cleaned > 0:
+            log(f"✅ [AUTO-CLEANUP] Done! Removed {files_cleaned} duplicates. Freed {format_size(total_saved_bytes)} space!")
+        else:
+            log("✅ [AUTO-CLEANUP] Scan complete. No duplicate R2 files found.")
+            
+    except Exception as e:
+        log(f"❌ [AUTO-CLEANUP ERROR]: {str(e)}")
+
+async def r2_deduplication_loop():
+    await asyncio.sleep(300) # Runs 5 mins after startup
+    while True:
+        await asyncio.to_thread(execute_r2_cleanup)
+        await asyncio.sleep(86400) # Runs every 24 hours
+
+@app.get("/api/run_cleanup")
+async def trigger_manual_cleanup(key: str, background_tasks: BackgroundTasks):
+    verify_key(key)
+    background_tasks.add_task(execute_r2_cleanup)
+    return {"status": "success", "message": "R2 Deduplication started in the background. Check logs."}
 
 async def cache_cleanup_loop():
     await asyncio.sleep(60)
@@ -570,20 +638,7 @@ async def index_forwarded(key: str, message_id: int, filename: str):
     return [{"file_code": short_id, "file_status": "OK"}]
 
 # ============================================================
-# 🛠️ UTILITIES & STARTUP
-# ============================================================
-_client = None
-async def get_client():
-    global _client
-    if _client and _client.is_connected(): return _client
-    _client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
-    await _client.start(bot_token=BOT_TOKEN); return _client
-
-def verify_key(key: str):
-    if key != INTERNAL_API_KEY: raise HTTPException(status_code=403)
-
-# ============================================================
-# 📂 FETCH FILES DIRECTORY (Jo route miss ho gaya tha)
+# 📂 FETCH FILES DIRECTORY 
 # ============================================================
 @app.get("/files")
 async def list_files(key: str, page: int = 1, limit: int = 10):
@@ -598,8 +653,22 @@ async def list_files(key: str, page: int = 1, limit: int = 10):
         "total": total, "page": page, "total_pages": math.ceil(total / limit) if total > 0 else 1
     }
 
+# ============================================================
+# 🛠️ UTILITIES & STARTUP
+# ============================================================
+_client = None
+async def get_client():
+    global _client
+    if _client and _client.is_connected(): return _client
+    _client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+    await _client.start(bot_token=BOT_TOKEN); return _client
+
+def verify_key(key: str):
+    if key != INTERNAL_API_KEY: raise HTTPException(status_code=403)
+
 @app.on_event("startup")
 async def on_startup():
     init_db()
     asyncio.create_task(cache_cleanup_loop())
+    asyncio.create_task(r2_deduplication_loop()) # 💡 R2 Cleanup Background Task
     log("✅ URLKING HYBRID SYSTEM (SPOOLER V3) ONLINE & READY")
