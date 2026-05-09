@@ -11,6 +11,7 @@ import sys
 import aiohttp
 import hashlib
 import aiofiles
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote
 from botocore.config import Config
@@ -43,8 +44,8 @@ LOG_FILE = "/tmp/telestore.log"
 sys.stdout = sys.stderr
 
 def log(msg):
-    import datetime
-    line = f"{datetime.datetime.now().strftime('%H:%M:%S')} | {msg}"
+    import datetime as dt
+    line = f"{dt.datetime.now().strftime('%H:%M:%S')} | {msg}"
     print(line, flush=True)
     try:
         with open(LOG_FILE, "a") as f: f.write(line + "\n")
@@ -132,13 +133,6 @@ def get_db_connection():
     c = sqlite3.connect(DB_FILE_SQLITE, check_same_thread=False)
     c.row_factory = sqlite3.Row; return c
 
-def get_file_entry(short_id):
-    with _db_lock:
-        conn = get_db_connection()
-        row = conn.execute("SELECT * FROM files WHERE short_id = ?", (short_id,)).fetchone()
-        conn.close()
-    return dict(row) if row else None
-
 def save_file_entry(short_id, data):
     with _db_lock:
         conn = get_db_connection()
@@ -155,92 +149,143 @@ def save_file_entry(short_id, data):
              data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key, file_hash))
         conn.commit(); conn.close()
 
+def get_file_entry(short_id):
+    with _db_lock:
+        conn = get_db_connection()
+        row = conn.execute("SELECT * FROM files WHERE short_id = ?", (short_id,)).fetchone()
+        conn.close()
+    return dict(row) if row else None
+
 # ============================================================
-# 🧹 R2 AUTO-CLEANUP & DEDUPLICATION (ADDED LOGIC)
+# 🧹 AUTO-CLEANUP 1: R2 DEDUPLICATION
 # ============================================================
 def execute_r2_cleanup():
     try:
-        log("🧹 [AUTO-CLEANUP] Starting R2 Deduplication scan...")
+        log("🧹 [AUTO-CLEANUP] Starting Deep R2 Deduplication scan...")
         conn = get_db_connection()
-        
-        # Find hashes that appear more than once in R2
-        duplicates = conn.execute('''
-            SELECT file_hash, COUNT(*) as c 
-            FROM files 
-            WHERE storage_type = 'r2' AND file_hash IS NOT NULL AND r2_key IS NOT NULL
-            GROUP BY file_hash 
-            HAVING c > 1
-        ''').fetchall()
-
         total_saved_bytes = 0
         files_cleaned = 0
 
-        for dup in duplicates:
+        # PASS 1: Deduplicate by exact FILE HASH
+        duplicates_hash = conn.execute('''
+            SELECT file_hash, COUNT(*) as c FROM files 
+            WHERE storage_type = 'r2' AND file_hash IS NOT NULL AND file_hash != '' AND r2_key IS NOT NULL
+            GROUP BY file_hash HAVING c > 1
+        ''').fetchall()
+
+        for dup in duplicates_hash:
             f_hash = dup["file_hash"]
-            
-            # Get all files with this hash (oldest first)
             rows = conn.execute("SELECT short_id, r2_key, size FROM files WHERE file_hash = ? AND storage_type = 'r2' ORDER BY rowid ASC", (f_hash,)).fetchall()
-            
             if len(rows) > 1:
-                # Keep the first one as master
                 master_r2_key = rows[0]["r2_key"]
-                
-                # Delete the rest and link to master
                 for i in range(1, len(rows)):
                     dup_short_id = rows[i]["short_id"]
                     dup_r2_key = rows[i]["r2_key"]
-                    
                     if dup_r2_key != master_r2_key:
                         conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, dup_short_id))
                         try:
                             r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=dup_r2_key)
-                            log(f"🗑️ [DEDUPE] Deleted extra R2 file: {dup_r2_key}")
                             total_saved_bytes += rows[i]["size"]
                             files_cleaned += 1
-                        except Exception as e:
-                            log(f"⚠️ [DEDUPE] R2 delete failed for {dup_r2_key}: {e}")
-        
+                            log(f"🗑️ [DEDUPE] Deleted extra R2 file: {dup_r2_key}")
+                        except: pass
+
+        # PASS 2: Deduplicate by exact NAME + exact SIZE
+        duplicates_name_size = conn.execute('''
+            SELECT filename, size, COUNT(*) as c FROM files 
+            WHERE storage_type = 'r2' AND r2_key IS NOT NULL AND (file_hash IS NULL OR file_hash = '')
+            GROUP BY filename, size HAVING c > 1
+        ''').fetchall()
+
+        for dup in duplicates_name_size:
+            f_name = dup["filename"]
+            f_size = dup["size"]
+            rows = conn.execute("SELECT short_id, r2_key, size FROM files WHERE filename = ? AND size = ? AND storage_type = 'r2' ORDER BY rowid ASC", (f_name, f_size)).fetchall()
+            if len(rows) > 1:
+                master_r2_key = rows[0]["r2_key"]
+                for i in range(1, len(rows)):
+                    dup_short_id = rows[i]["short_id"]
+                    dup_r2_key = rows[i]["r2_key"]
+                    if dup_r2_key != master_r2_key:
+                        conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, dup_short_id))
+                        try:
+                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=dup_r2_key)
+                            total_saved_bytes += rows[i]["size"]
+                            files_cleaned += 1
+                            log(f"🗑️ [DEDUPE] Deleted extra R2 file: {dup_r2_key}")
+                        except: pass
+
         conn.commit()
         conn.close()
         
         if files_cleaned > 0:
             log(f"✅ [AUTO-CLEANUP] Done! Removed {files_cleaned} duplicates. Freed {format_size(total_saved_bytes)} space!")
-        else:
-            log("✅ [AUTO-CLEANUP] Scan complete. No duplicate R2 files found.")
             
     except Exception as e:
         log(f"❌ [AUTO-CLEANUP ERROR]: {str(e)}")
 
+# ============================================================
+# 🧹 AUTO-CLEANUP 2: PHYSICAL CACHE SWEEPER (NEW BUG FIX)
+# ============================================================
+def execute_cache_sweeper():
+    try:
+        log("🧹 [CACHE SWEEPER] Scanning R2 for expired 24h+ cache files...")
+        # 24 ghante purani date nikalna
+        cutoff_date = datetime.now(timezone.utc) - timedelta(hours=24)
+        
+        # S3 Pagination use kar rahe hain taaki R2 crash na ho
+        paginator = r2_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix='cache_')
+        
+        cleaned_cache = 0
+        conn = get_db_connection()
+
+        for page in pages:
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    # Agar file ka physical creation date 24h se purana hai
+                    if obj['LastModified'] < cutoff_date:
+                        cache_key = obj['Key']
+                        try:
+                            # 1. R2 Se uda do
+                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
+                            # 2. Database ko safed jhoot bolne se roko (nullify karo)
+                            conn.execute("UPDATE files SET r2_cache_key = NULL WHERE r2_cache_key = ?", (cache_key,))
+                            cleaned_cache += 1
+                            log(f"🗑️ [CACHE SWEEPER] Destroyed old cache: {cache_key}")
+                        except: pass
+        
+        conn.commit()
+        conn.close()
+
+        if cleaned_cache > 0:
+            log(f"✅ [CACHE SWEEPER] Successfully wiped {cleaned_cache} expired cache files from R2!")
+        else:
+            log("✅ [CACHE SWEEPER] R2 Cache is already spotless.")
+            
+    except Exception as e:
+        log(f"❌ [CACHE SWEEPER ERROR]: {str(e)}")
+
+# --- Background Loops ---
 async def r2_deduplication_loop():
-    await asyncio.sleep(300) # Runs 5 mins after startup
+    await asyncio.sleep(60) 
     while True:
         await asyncio.to_thread(execute_r2_cleanup)
-        await asyncio.sleep(86400) # Runs every 24 hours
+        await asyncio.sleep(86400) # Every 24 hours
+
+async def cache_cleanup_loop():
+    await asyncio.sleep(120) 
+    while True:
+        await asyncio.to_thread(execute_cache_sweeper)
+        await asyncio.sleep(12 * 3600) # Har 12 ghante me chalega 24h purani files dhundne
 
 @app.get("/api/run_cleanup")
 async def trigger_manual_cleanup(key: str, background_tasks: BackgroundTasks):
     verify_key(key)
+    # Ab is button ko dabane se Deduplication AND Cache dono clean honge ek sath!
     background_tasks.add_task(execute_r2_cleanup)
-    return {"status": "success", "message": "R2 Deduplication started in the background. Check logs."}
-
-async def cache_cleanup_loop():
-    await asyncio.sleep(60)
-    while True:
-        try:
-            cutoff_time = int(time.time()) - (24 * 3600)
-            conn = get_db_connection()
-            rows = conn.execute("SELECT short_id, r2_cache_key FROM files WHERE r2_cache_key IS NOT NULL AND last_accessed < ?", (cutoff_time,)).fetchall()
-            for row in rows:
-                short_id, cache_key = row["short_id"], row["r2_cache_key"]
-                count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ?", (cache_key,)).fetchone()[0]
-                if count <= 1:
-                    try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
-                    except: pass
-                conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
-                conn.commit()
-            conn.close()
-        except: pass
-        await asyncio.sleep(3600)
+    background_tasks.add_task(execute_cache_sweeper)
+    return {"status": "success", "message": "Deep R2 Cleanup & Cache Sweeper started in the background!"}
 
 def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     try:
@@ -253,7 +298,7 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     except Exception as e: raise HTTPException(status_code=500)
 
 # ============================================================
-# 🧠 THE MASTER SPOOLER: TEMP FILE + CACHE (SAFE)
+# 🧠 THE MASTER SPOOLER: TEMP FILE + CACHE
 # ============================================================
 _active_dl = {}
 
@@ -409,9 +454,6 @@ async def parallel_upload(client, file_path):
     await asyncio.gather(*[up_part(i) for i in range(parts)])
     return InputFileBig(id=f_id, parts=parts, name=name)
 
-# ============================================================
-# 📤 DIRECT WEB UPLOAD (Optimized RAM SAFE)
-# ============================================================
 @app.post("/api/upload")
 async def api_upload(request: Request):
     try:
@@ -432,12 +474,10 @@ async def api_upload(request: Request):
         content_type = getattr(file_obj, "content_type", "application/octet-stream")
         tmp_path = f"/tmp/web_{uuid.uuid4().hex[:8]}.bin"
 
-        # 🚀 CHUNKED UPLOAD: Server kabhi freeze nahi hoga
         async with aiofiles.open(tmp_path, "wb") as f:
             while chunk := await file_obj.read(2 * 1024 * 1024):
                 await f.write(chunk)
 
-        # 🛡️ DEDUPLICATION CHECK
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
         conn = get_db_connection()
         existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
@@ -460,7 +500,6 @@ async def api_upload(request: Request):
         client = await get_client()
         file_size = os.path.getsize(tmp_path)
 
-        # FAST TELEGRAM UPLOAD
         if file_size < 10 * 1024 * 1024:
             msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
         else:
@@ -535,6 +574,54 @@ async def remote_upload(request: Request):
     except Exception as e: return {"error": str(e)}
 
 # ============================================================
+# ⚡ INSTANT R2 REGISTRATION DEDUPE
+# ============================================================
+@app.post("/api/file/register_r2")
+async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = Body(...)):
+    verify_key(key)
+    
+    file_hash = data.get("file_hash")
+    new_r2_key = data["r2_key"]
+    filename = data.get("filename")
+    size = data.get("size", 0)
+    
+    conn = get_db_connection()
+    existing = None
+    
+    if file_hash and file_hash.strip():
+        existing = conn.execute("SELECT r2_key FROM files WHERE file_hash = ? AND storage_type = 'r2' AND r2_key IS NOT NULL", (file_hash,)).fetchone()
+    
+    if not existing and filename and size > 0:
+        existing = conn.execute("SELECT r2_key FROM files WHERE filename = ? AND size = ? AND storage_type = 'r2' AND r2_key IS NOT NULL", (filename, size)).fetchone()
+        
+    conn.close()
+    
+    if existing:
+        master_r2_key = existing["r2_key"]
+        if master_r2_key != new_r2_key:
+            save_file_entry(data["short_id"], {
+                "filename": filename, "size": size, "storage_type": "r2",
+                "r2_key": master_r2_key, "content_type": "application/octet-stream",
+                "file_hash": file_hash
+            })
+            
+            def delete_redundant():
+                try:
+                    r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=new_r2_key)
+                    log(f"🗑️ [INSTANT DEDUPE] Deleted redundant R2 upload: {new_r2_key}")
+                except: pass
+                
+            background_tasks.add_task(delete_redundant)
+            return {"status": "OK", "msg": "Duplicate handled instantly"}
+            
+    save_file_entry(data["short_id"], {
+        "filename": filename, "size": size, "storage_type": "r2",
+        "r2_key": new_r2_key, "content_type": "application/octet-stream",
+        "file_hash": file_hash
+    })
+    return {"status": "OK"}
+
+# ============================================================
 # 📑 FILE MANAGEMENT
 # ============================================================
 @app.get("/api/file/clone")
@@ -565,19 +652,6 @@ async def file_delete(key: str, file_code: str):
             conn.commit(); conn.close()
     return {"status": 200, "msg": "OK"}
 
-@app.post("/api/file/register_r2")
-async def register_r2(key: str, data: dict = Body(...)):
-    verify_key(key)
-    save_file_entry(data["short_id"], {
-        "filename": data["filename"], "size": data["size"], "storage_type": "r2",
-        "r2_key": data["r2_key"], "content_type": "application/octet-stream",
-        "file_hash": data.get("file_hash")
-    })
-    return {"status": "OK"}
-
-# ============================================================
-# ✏️ FILE RENAME
-# ============================================================
 @app.get("/api/file/rename")
 async def file_rename(key: str, file_code: str, name: str):
     verify_key(key)
@@ -592,9 +666,6 @@ async def file_rename(key: str, file_code: str, name: str):
     if changed == 0: return {"status": 404, "msg": "File not found"}
     return {"status": 200, "msg": "OK", "new_name": safe_name}
 
-# ============================================================
-# ℹ️ FILE INFO
-# ============================================================
 @app.get("/api/file/info")
 async def file_info(key: str, file_code: str):
     verify_key(key); entry = get_file_entry(file_code)
@@ -637,9 +708,6 @@ async def index_forwarded(key: str, message_id: int, filename: str):
     })
     return [{"file_code": short_id, "file_status": "OK"}]
 
-# ============================================================
-# 📂 FETCH FILES DIRECTORY 
-# ============================================================
 @app.get("/files")
 async def list_files(key: str, page: int = 1, limit: int = 10):
     verify_key(key)
@@ -670,5 +738,5 @@ def verify_key(key: str):
 async def on_startup():
     init_db()
     asyncio.create_task(cache_cleanup_loop())
-    asyncio.create_task(r2_deduplication_loop()) # 💡 R2 Cleanup Background Task
+    asyncio.create_task(r2_deduplication_loop()) 
     log("✅ URLKING HYBRID SYSTEM (SPOOLER V3) ONLINE & READY")
