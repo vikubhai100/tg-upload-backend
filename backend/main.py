@@ -10,6 +10,7 @@ import boto3
 import sys
 import aiohttp
 import hashlib
+import hmac      
 import aiofiles
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -80,7 +81,7 @@ BASE_URL         = os.getenv("BASE_URL", "https://db.mypdftools.site")
 SESSION_STR      = os.getenv("SESSION_STRING", "")
 DB_FILE_SQLITE   = "/app/data/files.db"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "super_secret_key_123")
-
+DOWNLOAD_SECRET  = "URLKING_ANTI_BOT_SECRET_2024"  # 🔥 YE NAYI LINE ADD KARO
 # ============================================================
 # 🛡️ DEDUPLICATION HELPER
 # ============================================================
