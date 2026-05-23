@@ -352,10 +352,10 @@ async def bg_fetch_and_cache(short_id, entry):
 @app.get("/download/{short_id}")
 async def download_handle(request: Request, short_id: str, exp: int = 0, sign: str = ""):
     
-    # User ki IP pehle hi nikal lo
-    client_ip = get_client_ip(request)
+    # 🔥 Live Request se Browser info nikal rahe hain
+    user_agent = request.headers.get("user-agent", "unknown")
 
-    # 🔴 ANTI-BOT SECURITY WALL START 🔴
+    # 🔴 ANTI-BOT SECURITY WALL (USER-AGENT BINDING) START 🔴
     if not exp or not sign:
         return HTMLResponse(
             content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'>"
@@ -372,23 +372,23 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
             status_code=403
         )
 
-    # Validate signature WITH IP ADDRESS
-    data_to_sign = f"{short_id}:{exp}:{client_ip}".encode('utf-8')
+    # 🔥 Validate signature WITH USER-AGENT
+    data_to_sign = f"{short_id}:{exp}:{user_agent}".encode('utf-8')
     expected_sign = hmac.new(DOWNLOAD_SECRET.encode('utf-8'), data_to_sign, hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected_sign, sign):
         return HTMLResponse(
             content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'>"
-                    "<h2>🛑 IP Mismatch or Invalid Link!</h2>"
-                    "<p>Link sharing is strictly prohibited. Please open the website and verify yourself.</p></div>", 
+                    "<h2>🛑 Security Error! Link Mismatch</h2>"
+                    "<p>Link sharing is strictly prohibited. Please generate the link from the website.</p></div>", 
             status_code=403
         )
-    # 🔴 ANTI-BOT SECURITY WALL END 🔴
+    # 🔴 ANTI-BOT SECURITY WALL (USER-AGENT BINDING) END 🔴
 
+    client_ip = get_client_ip(request)
     entry = get_file_entry(short_id)
     if not entry: raise HTTPException(status_code=404, detail="File Not Found")
 
-    # === Iske aage ka purana DB update aur file streaming code waisa hi rahega jaisa tha ===
     conn = get_db_connection()
     conn.execute("UPDATE files SET last_accessed = ? WHERE short_id = ?", (int(time.time()), short_id))
     conn.commit(); conn.close()
@@ -465,7 +465,6 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     }
     if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
     return StreamingResponse(temp_file_streamer(), status_code=206 if range_header else 200, headers=headers)
-
 
 
 # ============================================================
