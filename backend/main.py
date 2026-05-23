@@ -350,7 +350,37 @@ async def bg_fetch_and_cache(short_id, entry):
         except: pass
 
 @app.get("/download/{short_id}")
-async def download_handle(request: Request, short_id: str):
+async def download_handle(request: Request, short_id: str, exp: int = 0, sign: str = ""):
+    # 🔴 ANTI-BOT SECURITY WALL START 🔴
+    if not exp or not sign:
+        return HTMLResponse(
+            content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'>"
+                    "<h2>❌ Access Denied</h2>"
+                    "<p>Direct linking or bots are blocked. Please generate the link from the official website.</p></div>", 
+            status_code=403
+        )
+
+    if int(time.time()) > exp:
+        return HTMLResponse(
+            content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#f0ad4e;'>"
+                    "<h2>⏳ Link Expired</h2>"
+                    "<p>Your download link has expired. Please go back and generate a new link.</p></div>", 
+            status_code=403
+        )
+
+    # Validate the cryptographic signature
+    data_to_sign = f"{short_id}:{exp}".encode('utf-8')
+    expected_sign = hmac.new(DOWNLOAD_SECRET.encode('utf-8'), data_to_sign, hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(expected_sign, sign):
+        return HTMLResponse(
+            content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'>"
+                    "<h2>🛑 Security Alert!</h2>"
+                    "<p>Invalid Signature! Bypass Attempt Detected.</p></div>", 
+            status_code=403
+        )
+    # 🔴 ANTI-BOT SECURITY WALL END 🔴
+
     client_ip = get_client_ip(request)
     entry = get_file_entry(short_id)
     if not entry: raise HTTPException(status_code=404, detail="File Not Found")
@@ -431,6 +461,7 @@ async def download_handle(request: Request, short_id: str):
     }
     if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
     return StreamingResponse(temp_file_streamer(), status_code=206 if range_header else 200, headers=headers)
+
 
 # ============================================================
 # 🚀 UPLOAD & REMOTE LOGIC
