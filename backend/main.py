@@ -136,7 +136,6 @@ def init_db():
         file_reference TEXT, dc_id INTEGER, storage_type TEXT DEFAULT 'telegram', r2_key TEXT,
         last_accessed INTEGER DEFAULT 0, r2_cache_key TEXT, file_hash TEXT
     )''')
-    # 🔥 Naya Table: Device Lock Track karne ke liye
     conn.execute('''CREATE TABLE IF NOT EXISTS used_tokens (
         sign TEXT PRIMARY KEY,
         client_ip TEXT,
@@ -237,7 +236,6 @@ def execute_cache_sweeper():
                             conn.execute("UPDATE files SET r2_cache_key = NULL WHERE r2_cache_key = ?", (cache_key,))
                         except: pass
 
-        # 🔥 Auto-Delete expired tokens to save DB space
         current_time = int(time.time())
         conn.execute("DELETE FROM used_tokens WHERE expires_at < ?", (current_time,))
         conn.commit(); conn.close()
@@ -263,7 +261,7 @@ async def trigger_manual_cleanup(key: str, background_tasks: BackgroundTasks):
     return {"status": "success", "message": "Cleanup started!"}
 
 # ============================================================
-# 🔥 ANTI-BOT R2 REDIRECT (JS Auto-Downloader + Hacky Close Fallback)
+# 🔥 DIRECT R2 REDIRECT (ORIGINAL BEHAVIOR RESTORED)
 # ============================================================
 def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     try:
@@ -273,57 +271,8 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
         }, ExpiresIn=7200)
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
         
-        html_content = f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Secure File Delivery</title>
-            <style>
-                body {{ background-color: #020617; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; font-family: 'Segoe UI', sans-serif; text-align: center; }}
-                .loader {{ border: 4px solid rgba(255,255,255,0.1); border-top: 4px solid #3b82f6; border-radius: 50%; width: 45px; height: 45px; animation: spin 1s linear infinite; margin-bottom: 20px; }}
-                @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
-                #success-icon {{ display: none; font-size: 3rem; margin-bottom: 15px; }}
-                p {{ color: #94a3b8; font-size: 0.9rem; }}
-                .btn {{ display: none; margin-top: 20px; padding: 12px 25px; background: linear-gradient(to right, #3b82f6, #2563eb); color: white; text-decoration: none; border-radius: 8px; font-weight: bold; box-shadow: 0 4px 6px rgba(0,0,0,0.3); transition: 0.3s; }}
-                .btn:active {{ transform: scale(0.95); }}
-            </style>
-        </head>
-        <body>
-            <div class="loader" id="spinner"></div>
-            <div id="success-icon">✅</div>
-            <h2 id="status">Securely downloading your file...</h2>
-            <p id="sub-status">Please wait a moment.</p>
-            <a href="https://urlking.in" class="btn" id="home-btn">Go to URLKING Home</a>
-            
-            <script>
-                setTimeout(() => {{ 
-                    const a = document.createElement('a');
-                    a.href = "{url}";
-                    document.body.appendChild(a);
-                    a.click();
-                    
-                    document.getElementById('spinner').style.display = 'none';
-                    document.getElementById('success-icon').style.display = 'block';
-                    document.getElementById('status').innerText = "Download Started!";
-                    document.getElementById('sub-status').innerText = "You can now safely close this tab.";
-                    
-                    setTimeout(() => {{
-                        try {{
-                            window.open('', '_self', '');
-                            window.close();
-                        }} catch(e) {{}}
-                        setTimeout(() => {{
-                            document.getElementById('home-btn').style.display = 'inline-block';
-                        }}, 1500);
-                    }}, 2000);
-                }}, 800);
-            </script>
-        </body>
-        </html>
-        """
-        return HTMLResponse(content=html_content)
+        # 🔥 DIRECT REDIRECT (No New Page/Blank HTML) - Isse tab faaltu nahi atakega
+        return RedirectResponse(url=url)
     except Exception as e: 
         raise HTTPException(status_code=500)
 
@@ -390,14 +339,11 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     if not hmac.compare_digest(expected_sign, sign):
         return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'><h2>🛑 Security Error! Link Mismatch</h2><p>Link sharing is strictly prohibited.</p></div>", status_code=403)
 
-    # =========================================================
-    # 🔥 ONE-TIME LINK (DEVICE IP LOCK) - SHARED LINK BLOCKER
-    # =========================================================
+    # 🔥 IP-LOCK SYSTEM (Isse link sharing hamesha block rahegi)
     conn = get_db_connection()
     token_row = conn.execute("SELECT client_ip FROM used_tokens WHERE sign = ?", (sign,)).fetchone()
     
     if token_row:
-        # Check if the IP requesting is the SAME IP that locked the token
         if token_row["client_ip"] != client_ip:
             conn.close()
             return HTMLResponse(
@@ -408,14 +354,12 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                 status_code=403
             )
     else:
-        # First time use: Lock this token to the current user's IP
         conn.execute("INSERT INTO used_tokens (sign, client_ip, expires_at) VALUES (?, ?, ?)", (sign, client_ip, exp))
         conn.commit()
 
     conn.execute("UPDATE files SET last_accessed = ? WHERE short_id = ?", (int(time.time()), short_id))
     conn.commit(); conn.close()
 
-    # Continue normal execution
     entry = get_file_entry(short_id)
     if not entry: raise HTTPException(status_code=404, detail="File Not Found")
 
