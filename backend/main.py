@@ -278,7 +278,7 @@ async def trigger_manual_cleanup(key: str, background_tasks: BackgroundTasks):
     return {"status": "success", "message": "Deep R2 Cleanup & Cache Sweeper started in the background!"}
 
 # ============================================================
-# 🔥 ANTI-BOT R2 REDIRECT (JS Auto-Downloader to hide HTTP headers)
+# 🔥 ANTI-BOT R2 REDIRECT (JS Auto-Downloader + Tab Auto-Kill)
 # ============================================================
 def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     try:
@@ -288,8 +288,6 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
         }, ExpiresIn=7200)
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
         
-        # HTTP 307 Redirect ki jagah JS based auto-downloader denge
-        # Taaki Scraper 'Location' header padh hi na paye
         html_content = f"""
         <!DOCTYPE html>
         <html lang="en">
@@ -298,16 +296,34 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>Secure File Delivery</title>
             <style>
-                body {{ background-color: #020617; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; font-family: 'Segoe UI', sans-serif; }}
+                body {{ background-color: #020617; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; font-family: 'Segoe UI', sans-serif; text-align: center; }}
                 .loader {{ border: 4px solid rgba(255,255,255,0.1); border-top: 4px solid #3b82f6; border-radius: 50%; width: 45px; height: 45px; animation: spin 1s linear infinite; margin-bottom: 20px; }}
                 @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+                #success-icon {{ display: none; font-size: 3rem; margin-bottom: 15px; }}
+                p {{ color: #94a3b8; font-size: 0.9rem; }}
             </style>
         </head>
         <body>
-            <div class="loader"></div>
-            <h2>Securely downloading your file...</h2>
+            <div class="loader" id="spinner"></div>
+            <div id="success-icon">✅</div>
+            <h2 id="status">Securely downloading your file...</h2>
+            <p id="sub-status">Please wait a moment.</p>
             <script>
-                setTimeout(() => {{ window.location.replace("{url}"); }}, 800);
+                setTimeout(() => {{ 
+                    // 1. Trigger file download without leaving page
+                    window.location.href = "{url}";
+                    
+                    // 2. Change UI to Success
+                    document.getElementById('spinner').style.display = 'none';
+                    document.getElementById('success-icon').style.display = 'block';
+                    document.getElementById('status').innerText = "Download Started!";
+                    document.getElementById('sub-status').innerText = "Closing this tab automatically...";
+                    
+                    // 3. Auto-Kill this Tab after 1.5 seconds
+                    setTimeout(() => {{
+                        window.close();
+                    }}, 1500);
+                }}, 800);
             </script>
         </body>
         </html>
