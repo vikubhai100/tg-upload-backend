@@ -174,9 +174,6 @@ def get_file_entry(short_id):
 def execute_r2_cleanup():
     try:
         conn = get_db_connection()
-        total_saved_bytes = 0
-        files_cleaned = 0
-
         duplicates_hash = conn.execute('''
             SELECT file_hash, COUNT(*) as c FROM files 
             WHERE storage_type = 'r2' AND file_hash IS NOT NULL AND file_hash != '' AND r2_key IS NOT NULL
@@ -185,39 +182,15 @@ def execute_r2_cleanup():
 
         for dup in duplicates_hash:
             f_hash = dup["file_hash"]
-            rows = conn.execute("SELECT short_id, r2_key, size FROM files WHERE file_hash = ? AND storage_type = 'r2' ORDER BY rowid ASC", (f_hash,)).fetchall()
+            rows = conn.execute("SELECT short_id, r2_key FROM files WHERE file_hash = ? AND storage_type = 'r2' ORDER BY rowid ASC", (f_hash,)).fetchall()
             if len(rows) > 1:
                 master_r2_key = rows[0]["r2_key"]
                 for i in range(1, len(rows)):
-                    dup_short_id = rows[i]["short_id"]
-                    dup_r2_key = rows[i]["r2_key"]
-                    if dup_r2_key != master_r2_key:
-                        conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, dup_short_id))
-                        try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=dup_r2_key)
-                        except: pass
-
-        duplicates_name_size = conn.execute('''
-            SELECT filename, size, COUNT(*) as c FROM files 
-            WHERE storage_type = 'r2' AND r2_key IS NOT NULL AND (file_hash IS NULL OR file_hash = '')
-            GROUP BY filename, size HAVING c > 1
-        ''').fetchall()
-
-        for dup in duplicates_name_size:
-            f_name = dup["filename"]
-            f_size = dup["size"]
-            rows = conn.execute("SELECT short_id, r2_key, size FROM files WHERE filename = ? AND size = ? AND storage_type = 'r2' ORDER BY rowid ASC", (f_name, f_size)).fetchall()
-            if len(rows) > 1:
-                master_r2_key = rows[0]["r2_key"]
-                for i in range(1, len(rows)):
-                    dup_short_id = rows[i]["short_id"]
-                    dup_r2_key = rows[i]["r2_key"]
-                    if dup_r2_key != master_r2_key:
-                        conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, dup_short_id))
-                        try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=dup_r2_key)
-                        except: pass
-
+                    conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, rows[i]["short_id"]))
+                    try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=rows[i]["r2_key"])
+                    except: pass
         conn.commit(); conn.close()
-    except Exception as e: log(f"❌ [AUTO-CLEANUP ERROR]: {str(e)}")
+    except Exception as e: pass
 
 def execute_cache_sweeper():
     try:
@@ -230,16 +203,15 @@ def execute_cache_sweeper():
             if 'Contents' in page:
                 for obj in page['Contents']:
                     if obj['LastModified'] < cutoff_date:
-                        cache_key = obj['Key']
                         try:
-                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
-                            conn.execute("UPDATE files SET r2_cache_key = NULL WHERE r2_cache_key = ?", (cache_key,))
+                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=obj['Key'])
+                            conn.execute("UPDATE files SET r2_cache_key = NULL WHERE r2_cache_key = ?", (obj['Key'],))
                         except: pass
 
         current_time = int(time.time())
         conn.execute("DELETE FROM used_tokens WHERE expires_at < ?", (current_time,))
         conn.commit(); conn.close()
-    except Exception as e: log(f"❌ [CACHE SWEEPER ERROR]: {str(e)}")
+    except Exception as e: pass
 
 async def r2_deduplication_loop():
     await asyncio.sleep(60) 
@@ -253,25 +225,20 @@ async def cache_cleanup_loop():
         await asyncio.to_thread(execute_cache_sweeper)
         await asyncio.sleep(12 * 3600) 
 
-@app.get("/api/run_cleanup")
-async def trigger_manual_cleanup(key: str, background_tasks: BackgroundTasks):
-    verify_key(key)
-    background_tasks.add_task(execute_r2_cleanup)
-    background_tasks.add_task(execute_cache_sweeper)
-    return {"status": "success", "message": "Cleanup started!"}
-
 # ============================================================
-# 🔥 DIRECT R2 REDIRECT (ORIGINAL BEHAVIOR RESTORED)
+# 🔥 ORIGINAL DIRECT R2 REDIRECT (NO HTML, SECURE 12-SEC EXPIRY)
 # ============================================================
 def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     try:
+        # MAGIC FIX: ExpiresIn=12 Seconds (Perfect Sweet Spot)
+        # Slow network will easily connect in 12s. Bot's shared link will be DEAD!
         url = r2_client.generate_presigned_url('get_object', Params={
             'Bucket': R2_BUCKET_NAME, 'Key': r2_key,
             'ResponseContentDisposition': f"attachment; filename=\"{filename}\""
-        }, ExpiresIn=7200)
+        }, ExpiresIn=12)
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
         
-        # 🔥 DIRECT REDIRECT (No New Page/Blank HTML) - Isse tab faaltu nahi atakega
+        # Original Direct Redirect - Browser handles the download smoothly without empty tabs!
         return RedirectResponse(url=url)
     except Exception as e: 
         raise HTTPException(status_code=500)
@@ -339,7 +306,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     if not hmac.compare_digest(expected_sign, sign):
         return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'><h2>🛑 Security Error! Link Mismatch</h2><p>Link sharing is strictly prohibited.</p></div>", status_code=403)
 
-    # 🔥 IP-LOCK SYSTEM (Isse link sharing hamesha block rahegi)
+    # 🔥 IP-LOCK SYSTEM
     conn = get_db_connection()
     token_row = conn.execute("SELECT client_ip FROM used_tokens WHERE sign = ?", (sign,)).fetchone()
     
@@ -363,6 +330,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     entry = get_file_entry(short_id)
     if not entry: raise HTTPException(status_code=404, detail="File Not Found")
 
+    # 🔥 Direct Redirects applied here
     if entry.get("storage_type") == "r2" and entry.get("r2_key"):
         return redirect_to_r2(entry["r2_key"], entry["filename"], client_ip, "PERMANENT")
     if entry.get("r2_cache_key"):
@@ -407,7 +375,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                 while curr >= target_bytes:
                     info = _active_dl.get(short_id)
                     if not info or info["done"]: break
-                    if info["err"]: raise RuntimeError("Backend connection dropped")
+                    if info["err"]: raise RuntimeError("Backend dropped")
                     await asyncio.sleep(0.2)
                     target_bytes = _active_dl.get(short_id, {}).get("dl_bytes", 0)
 
