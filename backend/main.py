@@ -77,6 +77,10 @@ app.add_middleware(
 # ============================================================
 @app.middleware("http")
 async def bot_guard_middleware(request: Request, call_next):
+    # ✅ FIX: Internal API calls (jaise bot se aane wali requests) ko allow karein
+    if request.url.path.startswith("/api/"):
+        return await call_next(request)
+
     ua = request.headers.get("user-agent", "").lower()
     sec_ch_ua = request.headers.get("sec-ch-ua", "").lower()
 
@@ -237,7 +241,7 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
             'ResponseContentDisposition': f"attachment; filename=\"{filename}\""
         }, ExpiresIn=12)
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
-        
+
         # Original Direct Redirect - Browser handles the download smoothly without empty tabs!
         return RedirectResponse(url=url)
     except Exception as e: 
@@ -309,7 +313,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     # 🔥 IP-LOCK SYSTEM
     conn = get_db_connection()
     token_row = conn.execute("SELECT client_ip FROM used_tokens WHERE sign = ?", (sign,)).fetchone()
-    
+
     if token_row:
         if token_row["client_ip"] != client_ip:
             conn.close()
