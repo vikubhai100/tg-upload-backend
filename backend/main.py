@@ -72,27 +72,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================
-# 🛡️ ANTI-BOT HEADLESS MIDDLEWARE
-# ============================================================
-@app.middleware("http")
-async def bot_guard_middleware(request: Request, call_next):
-    # ✅ FIX: Internal API calls (jaise bot se aane wali requests) ko allow karein
-    if request.url.path.startswith("/api/"):
-        return await call_next(request)
-
-    ua = request.headers.get("user-agent", "").lower()
-    sec_ch_ua = request.headers.get("sec-ch-ua", "").lower()
-
-    if any(b in ua for b in ["python", "curl", "wget", "httpie", "postman", "crawler", "spider", "telegram", "axios", "node-fetch", "libwww"]):
-        return JSONResponse(status_code=403, content={"error": "Bot Access Denied"})
-
-    if "headless" in sec_ch_ua or any(h in ua for h in ["headlesschrome", "puppeteer", "playwright", "selenium"]):
-        return JSONResponse(status_code=403, content={"error": "Headless Engine Detected"})
-
-    response = await call_next(request)
-    return response
-
 # Configuration
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "")
 API_ID           = int(os.getenv("API_ID", "0"))
@@ -102,8 +81,10 @@ BASE_URL         = os.getenv("BASE_URL", "https://db.mypdftools.site")
 SESSION_STR      = os.getenv("SESSION_STRING", "")
 DB_FILE_SQLITE   = "/app/data/files.db"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "super_secret_key_123")
-DOWNLOAD_SECRET  = "URLKING_ANTI_BOT_SECRET_2024"  
-
+DOWNLOAD_SECRET  = "URLKING_ANTI_BOT_SECRET_2024"  # 🔥 YE NAYI LINE ADD KARO
+# ============================================================
+# 🛡️ DEDUPLICATION HELPER
+# ============================================================
 def calculate_hash(file_path):
     hasher = hashlib.md5()
     with open(file_path, 'rb') as f:
@@ -111,6 +92,9 @@ def calculate_hash(file_path):
             hasher.update(chunk)
     return hasher.hexdigest()
 
+# ============================================================
+# 📁 FRONTEND SERVING
+# ============================================================
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 
@@ -129,6 +113,9 @@ if FRONTEND_DIR.exists():
 elif (Path(__file__).resolve().parent / "static").exists():
     app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
 
+# ============================================================
+# 🗄️ DATABASE MANAGEMENT
+# ============================================================
 _db_lock = threading.Lock()
 
 def init_db():
@@ -139,11 +126,6 @@ def init_db():
         content_type TEXT, channel_id INTEGER, doc_id TEXT, access_hash TEXT,
         file_reference TEXT, dc_id INTEGER, storage_type TEXT DEFAULT 'telegram', r2_key TEXT,
         last_accessed INTEGER DEFAULT 0, r2_cache_key TEXT, file_hash TEXT
-    )''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS used_tokens (
-        sign TEXT PRIMARY KEY,
-        client_ip TEXT,
-        expires_at INTEGER
     )''')
     conn.execute("PRAGMA journal_mode=WAL")
     conn.commit(); conn.close()
@@ -175,9 +157,17 @@ def get_file_entry(short_id):
         conn.close()
     return dict(row) if row else None
 
+# ============================================================
+# 🧹 AUTO-CLEANUP 1: R2 DEDUPLICATION
+# ============================================================
 def execute_r2_cleanup():
     try:
+        log("🧹 [AUTO-CLEANUP] Starting Deep R2 Deduplication scan...")
         conn = get_db_connection()
+        total_saved_bytes = 0
+        files_cleaned = 0
+
+        # PASS 1: Deduplicate by exact FILE HASH
         duplicates_hash = conn.execute('''
             SELECT file_hash, COUNT(*) as c FROM files 
             WHERE storage_type = 'r2' AND file_hash IS NOT NULL AND file_hash != '' AND r2_key IS NOT NULL
@@ -186,67 +176,131 @@ def execute_r2_cleanup():
 
         for dup in duplicates_hash:
             f_hash = dup["file_hash"]
-            rows = conn.execute("SELECT short_id, r2_key FROM files WHERE file_hash = ? AND storage_type = 'r2' ORDER BY rowid ASC", (f_hash,)).fetchall()
+            rows = conn.execute("SELECT short_id, r2_key, size FROM files WHERE file_hash = ? AND storage_type = 'r2' ORDER BY rowid ASC", (f_hash,)).fetchall()
             if len(rows) > 1:
                 master_r2_key = rows[0]["r2_key"]
                 for i in range(1, len(rows)):
-                    conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, rows[i]["short_id"]))
-                    try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=rows[i]["r2_key"])
-                    except: pass
-        conn.commit(); conn.close()
-    except Exception as e: pass
+                    dup_short_id = rows[i]["short_id"]
+                    dup_r2_key = rows[i]["r2_key"]
+                    if dup_r2_key != master_r2_key:
+                        conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, dup_short_id))
+                        try:
+                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=dup_r2_key)
+                            total_saved_bytes += rows[i]["size"]
+                            files_cleaned += 1
+                            log(f"🗑️ [DEDUPE] Deleted extra R2 file: {dup_r2_key}")
+                        except: pass
 
+        # PASS 2: Deduplicate by exact NAME + exact SIZE
+        duplicates_name_size = conn.execute('''
+            SELECT filename, size, COUNT(*) as c FROM files 
+            WHERE storage_type = 'r2' AND r2_key IS NOT NULL AND (file_hash IS NULL OR file_hash = '')
+            GROUP BY filename, size HAVING c > 1
+        ''').fetchall()
+
+        for dup in duplicates_name_size:
+            f_name = dup["filename"]
+            f_size = dup["size"]
+            rows = conn.execute("SELECT short_id, r2_key, size FROM files WHERE filename = ? AND size = ? AND storage_type = 'r2' ORDER BY rowid ASC", (f_name, f_size)).fetchall()
+            if len(rows) > 1:
+                master_r2_key = rows[0]["r2_key"]
+                for i in range(1, len(rows)):
+                    dup_short_id = rows[i]["short_id"]
+                    dup_r2_key = rows[i]["r2_key"]
+                    if dup_r2_key != master_r2_key:
+                        conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, dup_short_id))
+                        try:
+                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=dup_r2_key)
+                            total_saved_bytes += rows[i]["size"]
+                            files_cleaned += 1
+                            log(f"🗑️ [DEDUPE] Deleted extra R2 file: {dup_r2_key}")
+                        except: pass
+
+        conn.commit()
+        conn.close()
+
+        if files_cleaned > 0:
+            log(f"✅ [AUTO-CLEANUP] Done! Removed {files_cleaned} duplicates. Freed {format_size(total_saved_bytes)} space!")
+
+    except Exception as e:
+        log(f"❌ [AUTO-CLEANUP ERROR]: {str(e)}")
+
+# ============================================================
+# 🧹 AUTO-CLEANUP 2: PHYSICAL CACHE SWEEPER (NEW BUG FIX)
+# ============================================================
 def execute_cache_sweeper():
     try:
+        log("🧹 [CACHE SWEEPER] Scanning R2 for expired 24h+ cache files...")
+        # 24 ghante purani date nikalna
         cutoff_date = datetime.now(timezone.utc) - timedelta(hours=24)
+
+        # S3 Pagination use kar rahe hain taaki R2 crash na ho
         paginator = r2_client.get_paginator('list_objects_v2')
         pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix='cache_')
+
+        cleaned_cache = 0
         conn = get_db_connection()
 
         for page in pages:
             if 'Contents' in page:
                 for obj in page['Contents']:
+                    # Agar file ka physical creation date 24h se purana hai
                     if obj['LastModified'] < cutoff_date:
+                        cache_key = obj['Key']
                         try:
-                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=obj['Key'])
-                            conn.execute("UPDATE files SET r2_cache_key = NULL WHERE r2_cache_key = ?", (obj['Key'],))
+                            # 1. R2 Se uda do
+                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=cache_key)
+                            # 2. Database ko safed jhoot bolne se roko (nullify karo)
+                            conn.execute("UPDATE files SET r2_cache_key = NULL WHERE r2_cache_key = ?", (cache_key,))
+                            cleaned_cache += 1
+                            log(f"🗑️ [CACHE SWEEPER] Destroyed old cache: {cache_key}")
                         except: pass
 
-        current_time = int(time.time())
-        conn.execute("DELETE FROM used_tokens WHERE expires_at < ?", (current_time,))
-        conn.commit(); conn.close()
-    except Exception as e: pass
+        conn.commit()
+        conn.close()
 
+        if cleaned_cache > 0:
+            log(f"✅ [CACHE SWEEPER] Successfully wiped {cleaned_cache} expired cache files from R2!")
+        else:
+            log("✅ [CACHE SWEEPER] R2 Cache is already spotless.")
+
+    except Exception as e:
+        log(f"❌ [CACHE SWEEPER ERROR]: {str(e)}")
+
+# --- Background Loops ---
 async def r2_deduplication_loop():
     await asyncio.sleep(60) 
     while True:
         await asyncio.to_thread(execute_r2_cleanup)
-        await asyncio.sleep(86400) 
+        await asyncio.sleep(86400) # Every 24 hours
 
 async def cache_cleanup_loop():
     await asyncio.sleep(120) 
     while True:
         await asyncio.to_thread(execute_cache_sweeper)
-        await asyncio.sleep(12 * 3600) 
+        await asyncio.sleep(12 * 3600) # Har 12 ghante me chalega 24h purani files dhundne
 
-# ============================================================
-# 🔥 ORIGINAL DIRECT R2 REDIRECT (NO HTML, SECURE 12-SEC EXPIRY)
-# ============================================================
+@app.get("/api/run_cleanup")
+async def trigger_manual_cleanup(key: str, background_tasks: BackgroundTasks):
+    verify_key(key)
+    # Ab is button ko dabane se Deduplication AND Cache dono clean honge ek sath!
+    background_tasks.add_task(execute_r2_cleanup)
+    background_tasks.add_task(execute_cache_sweeper)
+    return {"status": "success", "message": "Deep R2 Cleanup & Cache Sweeper started in the background!"}
+
 def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     try:
-        # MAGIC FIX: ExpiresIn=12 Seconds (Perfect Sweet Spot)
-        # Slow network will easily connect in 12s. Bot's shared link will be DEAD!
         url = r2_client.generate_presigned_url('get_object', Params={
             'Bucket': R2_BUCKET_NAME, 'Key': r2_key,
             'ResponseContentDisposition': f"attachment; filename=\"{filename}\""
-        }, ExpiresIn=12)
+        }, ExpiresIn=7200)
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
-
-        # Original Direct Redirect - Browser handles the download smoothly without empty tabs!
         return RedirectResponse(url=url)
-    except Exception as e: 
-        raise HTTPException(status_code=500)
+    except Exception as e: raise HTTPException(status_code=500)
 
+# ============================================================
+# 🧠 THE MASTER SPOOLER: TEMP FILE + CACHE
+# ============================================================
 _active_dl = {}
 
 async def bg_fetch_and_cache(short_id, entry):
@@ -256,6 +310,7 @@ async def bg_fetch_and_cache(short_id, entry):
     mode = "wb"
 
     try:
+        log(f"⚙️ SPOOLER START | Fetching {short_id} ({format_size(file_size)}) to Temp...")
         client = await get_client()
 
         while current_offset < file_size:
@@ -269,6 +324,7 @@ async def bg_fetch_and_cache(short_id, entry):
                         _active_dl[short_id]["dl_bytes"] = current_offset
                         await asyncio.sleep(0.01)
             except Exception as e:
+                log(f"⚠️ Spooler TG Drop @ {format_size(current_offset)}. Retrying... Err: {e}")
                 mode = "ab"
                 await asyncio.sleep(2)
 
@@ -295,46 +351,48 @@ async def bg_fetch_and_cache(short_id, entry):
 
 @app.get("/download/{short_id}")
 async def download_handle(request: Request, short_id: str, exp: int = 0, sign: str = ""):
-    user_agent = request.headers.get("user-agent", "unknown")
-    client_ip = get_client_ip(request)
 
+    # 🔥 Live Request se Browser info nikal rahe hain
+    user_agent = request.headers.get("user-agent", "unknown")
+
+    # 🔴 ANTI-BOT SECURITY WALL (USER-AGENT BINDING) START 🔴
     if not exp or not sign:
-        return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'><h2>❌ Access Denied</h2><p>Direct linking or bots are blocked.</p></div>", status_code=403)
+        return HTMLResponse(
+            content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'>"
+                    "<h2>❌ Access Denied</h2>"
+                    "<p>Direct linking or bots are blocked. Please generate the link from the official website.</p></div>", 
+            status_code=403
+        )
 
     if int(time.time()) > exp:
-        return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#f0ad4e;'><h2>⏳ Link Expired</h2><p>Your download link has expired. Please go back.</p></div>", status_code=403)
+        return HTMLResponse(
+            content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#f0ad4e;'>"
+                    "<h2>⏳ Link Expired</h2>"
+                    "<p>Your download link has expired. Please go back and generate a new link.</p></div>", 
+            status_code=403
+        )
 
+    # 🔥 Validate signature WITH USER-AGENT
     data_to_sign = f"{short_id}:{exp}:{user_agent}".encode('utf-8')
     expected_sign = hmac.new(DOWNLOAD_SECRET.encode('utf-8'), data_to_sign, hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected_sign, sign):
-        return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'><h2>🛑 Security Error! Link Mismatch</h2><p>Link sharing is strictly prohibited.</p></div>", status_code=403)
+        return HTMLResponse(
+            content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'>"
+                    "<h2>🛑 Security Error! Link Mismatch</h2>"
+                    "<p>Link sharing is strictly prohibited. Please generate the link from the website.</p></div>", 
+            status_code=403
+        )
+    # 🔴 ANTI-BOT SECURITY WALL (USER-AGENT BINDING) END 🔴
 
-    # 🔥 IP-LOCK SYSTEM
-    conn = get_db_connection()
-    token_row = conn.execute("SELECT client_ip FROM used_tokens WHERE sign = ?", (sign,)).fetchone()
-
-    if token_row:
-        if token_row["client_ip"] != client_ip:
-            conn.close()
-            return HTMLResponse(
-                content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; background:#fef2f2; border:1px solid #fca5a5; padding:20px; border-radius:10px; color:#991b1b;'>"
-                        "<h2>🛑 Link Already Used!</h2>"
-                        "<p>This link was already claimed by another device/IP.</p>"
-                        "<p><strong>Link sharing is strictly not allowed.</strong> Please generate a new link from the official site.</p></div>", 
-                status_code=403
-            )
-    else:
-        conn.execute("INSERT INTO used_tokens (sign, client_ip, expires_at) VALUES (?, ?, ?)", (sign, client_ip, exp))
-        conn.commit()
-
-    conn.execute("UPDATE files SET last_accessed = ? WHERE short_id = ?", (int(time.time()), short_id))
-    conn.commit(); conn.close()
-
+    client_ip = get_client_ip(request)
     entry = get_file_entry(short_id)
     if not entry: raise HTTPException(status_code=404, detail="File Not Found")
 
-    # 🔥 Direct Redirects applied here
+    conn = get_db_connection()
+    conn.execute("UPDATE files SET last_accessed = ? WHERE short_id = ?", (int(time.time()), short_id))
+    conn.commit(); conn.close()
+
     if entry.get("storage_type") == "r2" and entry.get("r2_key"):
         return redirect_to_r2(entry["r2_key"], entry["filename"], client_ip, "PERMANENT")
     if entry.get("r2_cache_key"):
@@ -346,10 +404,12 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
         asyncio.create_task(bg_fetch_and_cache(short_id, entry))
 
     for _ in range(50):
-        if os.path.exists(tmp_path) and _active_dl.get(short_id, {}).get("dl_bytes", 0) > 0: break
+        if os.path.exists(tmp_path) and _active_dl.get(short_id, {}).get("dl_bytes", 0) > 0:
+            break
         await asyncio.sleep(0.2)
 
-    if not os.path.exists(tmp_path): raise HTTPException(500, "Failed to connect to Backend")
+    if not os.path.exists(tmp_path):
+        raise HTTPException(500, "Failed to connect to Telegram Core")
 
     file_size = int(entry["size"])
     filename_raw = entry["filename"]
@@ -379,7 +439,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                 while curr >= target_bytes:
                     info = _active_dl.get(short_id)
                     if not info or info["done"]: break
-                    if info["err"]: raise RuntimeError("Backend dropped")
+                    if info["err"]: raise RuntimeError("Backend connection dropped")
                     await asyncio.sleep(0.2)
                     target_bytes = _active_dl.get(short_id, {}).get("dl_bytes", 0)
 
@@ -406,6 +466,10 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
     return StreamingResponse(temp_file_streamer(), status_code=206 if range_header else 200, headers=headers)
 
+
+# ============================================================
+# 🚀 UPLOAD & REMOTE LOGIC
+# ============================================================
 async def parallel_upload(client, file_path):
     size = os.path.getsize(file_path)
     name = os.path.basename(file_path)
@@ -466,6 +530,7 @@ async def api_upload(request: Request):
                 "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
                 "file_hash": file_hash, "r2_cache_key": existing.get("r2_cache_key")
             })
+            log(f"♻️ WEB DUPLICATE CLONED | Reused ID: {new_id}")
             return JSONResponse(content=[{"file_code": new_id, "file_status": "OK"}])
 
         client = await get_client()
@@ -486,9 +551,11 @@ async def api_upload(request: Request):
             "file_hash": file_hash, "storage_type": "telegram"
         })
         os.unlink(tmp_path)
+        log(f"✅ NEW WEB UPLOAD | ID: {short_id}")
         return JSONResponse(content=[{"file_code": short_id, "file_status": "OK"}])
 
     except Exception as e:
+        log(f"❌ API UPLOAD CRASH: {str(e)}")
         return JSONResponse(status_code=500, content=[{"error": str(e)}])
 
 @app.post("/api/remote_upload")
@@ -522,6 +589,7 @@ async def remote_upload(request: Request):
                 "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
                 "file_hash": file_hash, "r2_cache_key": existing.get("r2_cache_key")
             })
+            log(f"♻️ REMOTE DUPLICATE CLONED | Reused ID: {new_short_id}")
             return [{"file_code": new_short_id, "file_status": "OK"}]
 
         client = await get_client()
@@ -537,9 +605,13 @@ async def remote_upload(request: Request):
             "file_hash": file_hash
         })
         os.unlink(tmp_path)
+        log(f"✅ NEW REMOTE UPLOAD | ID: {short_id}")
         return [{"file_code": short_id, "file_status": "OK"}]
     except Exception as e: return {"error": str(e)}
 
+# ============================================================
+# ⚡ INSTANT R2 REGISTRATION DEDUPE
+# ============================================================
 @app.post("/api/file/register_r2")
 async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = Body(...)):
     verify_key(key)
@@ -570,7 +642,9 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
             })
 
             def delete_redundant():
-                try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=new_r2_key)
+                try:
+                    r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=new_r2_key)
+                    log(f"🗑️ [INSTANT DEDUPE] Deleted redundant R2 upload: {new_r2_key}")
                 except: pass
 
             background_tasks.add_task(delete_redundant)
@@ -583,6 +657,9 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
     })
     return {"status": "OK"}
 
+# ============================================================
+# 📑 FILE MANAGEMENT
+# ============================================================
 @app.get("/api/file/clone")
 async def file_clone(key: str, file_code: str):
     verify_key(key); entry = get_file_entry(file_code)
@@ -680,6 +757,9 @@ async def list_files(key: str, page: int = 1, limit: int = 10):
         "total": total, "page": page, "total_pages": math.ceil(total / limit) if total > 0 else 1
     }
 
+# ============================================================
+# 🛠️ UTILITIES & STARTUP
+# ============================================================
 _client = None
 async def get_client():
     global _client
@@ -695,4 +775,4 @@ async def on_startup():
     init_db()
     asyncio.create_task(cache_cleanup_loop())
     asyncio.create_task(r2_deduplication_loop()) 
-    log("✅ URLKING HYBRID SYSTEM ONLINE & READY")
+    log("✅ URLKING HYBRID SYSTEM (SPOOLER V3) ONLINE & READY")
