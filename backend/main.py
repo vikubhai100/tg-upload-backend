@@ -304,11 +304,16 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     if int(time.time()) > exp:
         return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#f0ad4e;'><h2>⏳ Link Expired</h2><p>Your download link has expired. Please go back.</p></div>", status_code=403)
 
-    data_to_sign = f"{short_id}:{exp}:{user_agent}".encode('utf-8')
+    # 🔥 BROWSER (USER-AGENT) & IP BINDING START 🔥
+    # Yeh Node.js `download.js` ke formula ke saath exact match karta hai
+    data_to_sign = f"{short_id}:{exp}:{user_agent}:{client_ip}".encode('utf-8')
     expected_sign = hmac.new(DOWNLOAD_SECRET.encode('utf-8'), data_to_sign, hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected_sign, sign):
-        return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'><h2>🛑 Security Error! Link Mismatch</h2><p>Link sharing is strictly prohibited.</p></div>", status_code=403)
+        # Jab bot ya koi script bypass karke hit karega, toh uska IP alag hoga aur signature fail ho jayega!
+        log(f"🛑 Security Error: IP or Link Mismatch for {short_id} (IP: {client_ip})")
+        return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'><h2>🛑 Security Error! IP or Link Mismatch</h2><p>Link sharing is strictly prohibited.</p></div>", status_code=403)
+    # 🔥 BROWSER (USER-AGENT) & IP BINDING END 🔥
 
     # 🔥 IP-LOCK SYSTEM
     conn = get_db_connection()
