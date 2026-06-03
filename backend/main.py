@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import tempfile
@@ -64,6 +63,14 @@ def get_client_ip(request: Request):
     fwd = request.headers.get("X-Forwarded-For")
     return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "Unknown")
 
+# 🔥 FIX: Helper to verify if object actually exists in R2 before redirecting
+def check_r2_file_exists(key):
+    try:
+        r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=key)
+        return True
+    except:
+        return False
+
 app = FastAPI(title="URLKING Hybrid Storage")
 
 app.add_middleware(
@@ -78,7 +85,6 @@ app.add_middleware(
 # ============================================================
 @app.middleware("http")
 async def bot_guard_middleware(request: Request, call_next):
-    # ✅ FIX: Internal API calls (jaise bot se aane wali requests) ko allow karein
     if request.url.path.startswith("/api/"):
         return await call_next(request)
 
@@ -235,15 +241,12 @@ async def cache_cleanup_loop():
 # ============================================================
 def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     try:
-        # MAGIC FIX: ExpiresIn=12 Seconds (Perfect Sweet Spot)
-        # Slow network will easily connect in 12s. Bot's shared link will be DEAD!
         url = r2_client.generate_presigned_url('get_object', Params={
             'Bucket': R2_BUCKET_NAME, 'Key': r2_key,
             'ResponseContentDisposition': f"attachment; filename=\"{filename}\""
         }, ExpiresIn=12)
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
 
-        # Original Direct Redirect - Browser handles the download smoothly without empty tabs!
         return RedirectResponse(url=url)
     except Exception as e: 
         raise HTTPException(status_code=500)
@@ -335,12 +338,48 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     entry = get_file_entry(short_id)
     if not entry: raise HTTPException(status_code=404, detail="File Not Found")
 
-    # 🔥 Direct Redirects applied here
+    # 🔥 Direct Redirects applied here WITH EXISTENCE CHECK & SIZE/TELEGRAM LOGIC
     if entry.get("storage_type") == "r2" and entry.get("r2_key"):
-        return redirect_to_r2(entry["r2_key"], entry["filename"], client_ip, "PERMANENT")
-    if entry.get("r2_cache_key"):
-        return redirect_to_r2(entry["r2_cache_key"], entry["filename"], client_ip, "CACHED LINK")
+        r2_key = entry["r2_key"]
+        exists = await asyncio.to_thread(check_r2_file_exists, r2_key)
+        
+        if exists:
+            return redirect_to_r2(r2_key, entry["filename"], client_ip, "PERMANENT")
+        else:
+            if entry.get("message_id") and int(entry.get("message_id")) > 0:
+                conn = get_db_connection()
+                conn.execute("UPDATE files SET r2_key = NULL, storage_type = 'telegram' WHERE short_id = ?", (short_id,))
+                conn.commit(); conn.close()
+                log(f"⚠️ R2 FIX | Key Missing: {r2_key}. Falling back to Telegram (<100MB file).")
+            else:
+                return HTMLResponse(
+                    content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; background:#fef2f2; border:1px solid #fca5a5; padding:20px; border-radius:10px; color:#991b1b;'>"
+                            "<h2>🗑️ File Not Found / Deleted</h2>"
+                            "<p>This file (large R2 upload) has been permanently removed from the server.</p></div>", 
+                    status_code=404
+                )
 
+    if entry.get("r2_cache_key"):
+        r2_cache_key = entry["r2_cache_key"]
+        exists = await asyncio.to_thread(check_r2_file_exists, r2_cache_key)
+        
+        if exists:
+            return redirect_to_r2(r2_cache_key, entry["filename"], client_ip, "CACHED LINK")
+        else:
+            if entry.get("message_id") and int(entry.get("message_id")) > 0:
+                conn = get_db_connection()
+                conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
+                conn.commit(); conn.close()
+                log(f"⚠️ R2 FIX | Cache Key Missing: {r2_cache_key}. Falling back to Telegram.")
+            else:
+                return HTMLResponse(
+                    content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; background:#fef2f2; border:1px solid #fca5a5; padding:20px; border-radius:10px; color:#991b1b;'>"
+                            "<h2>🗑️ File Not Found / Deleted</h2>"
+                            "<p>This file has been permanently removed from the server.</p></div>", 
+                    status_code=404
+                )
+
+    # 👇 Fallback to Telegram Stream
     tmp_path = f"/tmp/dl_{short_id}.bin"
     if short_id not in _active_dl:
         _active_dl[short_id] = {"dl_bytes": 0, "done": False, "err": False}
