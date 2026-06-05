@@ -63,7 +63,6 @@ def get_client_ip(request: Request):
     fwd = request.headers.get("X-Forwarded-For")
     return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "Unknown")
 
-# 🔥 FIX: Helper to verify if object actually exists in R2 before redirecting
 def check_r2_file_exists(key):
     try:
         r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=key)
@@ -97,8 +96,7 @@ async def bot_guard_middleware(request: Request, call_next):
     if "headless" in sec_ch_ua or any(h in ua for h in ["headlesschrome", "puppeteer", "playwright", "selenium"]):
         return JSONResponse(status_code=403, content={"error": "Headless Engine Detected"})
 
-    response = await call_next(request)
-    return response
+    return await call_next(request)
 
 # Configuration
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "")
@@ -136,11 +134,13 @@ if FRONTEND_DIR.exists():
 elif (Path(__file__).resolve().parent / "static").exists():
     app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
 
-_db_lock = threading.Lock()
 
+# ============================================================
+# 💾 DB CONNECTION & HANDLERS (OPTIMIZED WITH TIMEOUT & RETRY)
+# ============================================================
 def init_db():
     os.makedirs(os.path.dirname(DB_FILE_SQLITE), exist_ok=True)
-    conn = sqlite3.connect(DB_FILE_SQLITE)
+    conn = sqlite3.connect(DB_FILE_SQLITE, timeout=30.0)
     conn.execute('''CREATE TABLE IF NOT EXISTS files (
         short_id TEXT PRIMARY KEY, message_id INTEGER, filename TEXT, size INTEGER,
         content_type TEXT, channel_id INTEGER, doc_id TEXT, access_hash TEXT,
@@ -153,34 +153,46 @@ def init_db():
         expires_at INTEGER
     )''')
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 def get_db_connection():
-    c = sqlite3.connect(DB_FILE_SQLITE, check_same_thread=False)
-    c.row_factory = sqlite3.Row; return c
+    # Adding 30 seconds timeout to prevent "database is locked" 500 errors
+    c = sqlite3.connect(DB_FILE_SQLITE, check_same_thread=False, timeout=30.0)
+    c.row_factory = sqlite3.Row
+    return c
 
 def save_file_entry(short_id, data):
-    with _db_lock:
-        conn = get_db_connection()
-        existing = conn.execute("SELECT last_accessed, r2_cache_key FROM files WHERE short_id = ?", (short_id,)).fetchone()
-        last_acc = existing["last_accessed"] if existing else int(time.time())
-        cache_key = data.get("r2_cache_key") or (existing["r2_cache_key"] if existing else None)
-        file_hash = data.get("file_hash")
+    for _ in range(5):  # Safety retry mechanism
+        try:
+            conn = get_db_connection()
+            existing = conn.execute("SELECT last_accessed, r2_cache_key FROM files WHERE short_id = ?", (short_id,)).fetchone()
+            last_acc = existing["last_accessed"] if existing else int(time.time())
+            cache_key = data.get("r2_cache_key") or (existing["r2_cache_key"] if existing else None)
+            file_hash = data.get("file_hash")
 
-        conn.execute('''REPLACE INTO files (short_id, message_id, filename, size, content_type, channel_id, doc_id, access_hash, file_reference, dc_id, storage_type, r2_key, last_accessed, r2_cache_key, file_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (short_id, data.get("message_id", 0), data.get("filename"), data.get("size"),
-             data.get("content_type"), data.get("channel_id", 0), str(data.get("doc_id", "0")),
-             str(data.get("access_hash", "0")), str(data.get("file_reference", "0")),
-             data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key, file_hash))
-        conn.commit(); conn.close()
+            conn.execute('''REPLACE INTO files (short_id, message_id, filename, size, content_type, channel_id, doc_id, access_hash, file_reference, dc_id, storage_type, r2_key, last_accessed, r2_cache_key, file_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (short_id, data.get("message_id", 0), data.get("filename"), data.get("size", 0),
+                 data.get("content_type"), data.get("channel_id", 0), str(data.get("doc_id", "0")),
+                 str(data.get("access_hash", "0")), str(data.get("file_reference", "0")),
+                 data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key, file_hash))
+            conn.commit()
+            conn.close()
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                time.sleep(0.5)
+                continue
+            raise
 
 def get_file_entry(short_id):
-    with _db_lock:
-        conn = get_db_connection()
+    conn = get_db_connection()
+    try:
         row = conn.execute("SELECT * FROM files WHERE short_id = ?", (short_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
         conn.close()
-    return dict(row) if row else None
 
 def execute_r2_cleanup():
     try:
@@ -201,7 +213,7 @@ def execute_r2_cleanup():
                     try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=rows[i]["r2_key"])
                     except: pass
         conn.commit(); conn.close()
-    except Exception as e: pass
+    except Exception: pass
 
 def execute_cache_sweeper():
     try:
@@ -222,7 +234,7 @@ def execute_cache_sweeper():
         current_time = int(time.time())
         conn.execute("DELETE FROM used_tokens WHERE expires_at < ?", (current_time,))
         conn.commit(); conn.close()
-    except Exception as e: pass
+    except Exception: pass
 
 async def r2_deduplication_loop():
     await asyncio.sleep(60) 
@@ -236,9 +248,6 @@ async def cache_cleanup_loop():
         await asyncio.to_thread(execute_cache_sweeper)
         await asyncio.sleep(12 * 3600) 
 
-# ============================================================
-# 🔥 ORIGINAL DIRECT R2 REDIRECT (NO HTML, SECURE 12-SEC EXPIRY)
-# ============================================================
 def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     try:
         url = r2_client.generate_presigned_url('get_object', Params={
@@ -246,9 +255,8 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
             'ResponseContentDisposition': f"attachment; filename=\"{filename}\""
         }, ExpiresIn=12)
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
-
         return RedirectResponse(url=url)
-    except Exception as e: 
+    except Exception: 
         raise HTTPException(status_code=500)
 
 _active_dl = {}
@@ -261,7 +269,6 @@ async def bg_fetch_and_cache(short_id, entry):
 
     try:
         client = await get_client()
-
         while current_offset < file_size:
             try:
                 message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
@@ -272,7 +279,7 @@ async def bg_fetch_and_cache(short_id, entry):
                         current_offset += len(chunk)
                         _active_dl[short_id]["dl_bytes"] = current_offset
                         await asyncio.sleep(0.01)
-            except Exception as e:
+            except Exception:
                 mode = "ab"
                 await asyncio.sleep(2)
 
@@ -282,14 +289,18 @@ async def bg_fetch_and_cache(short_id, entry):
             r2_client.upload_file(tmp_path, R2_BUCKET_NAME, r2_cache_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
         await asyncio.to_thread(s3_up)
 
-        conn = get_db_connection()
-        conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
-        doc_id = entry.get("doc_id")
-        if doc_id:
-            conn.execute("UPDATE files SET r2_cache_key = ? WHERE doc_id = ? AND r2_cache_key IS NULL", (r2_cache_key, doc_id))
-        conn.commit(); conn.close()
+        def update_cache_db():
+            conn = get_db_connection()
+            conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
+            doc_id = entry.get("doc_id")
+            if doc_id:
+                conn.execute("UPDATE files SET r2_cache_key = ? WHERE doc_id = ? AND r2_cache_key IS NULL", (r2_cache_key, doc_id))
+            conn.commit()
+            conn.close()
+            
+        await asyncio.to_thread(update_cache_db)
 
-    except Exception as e:
+    except Exception:
         if short_id in _active_dl: _active_dl[short_id]["err"] = True
     finally:
         await asyncio.sleep(1800)
@@ -314,72 +325,58 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     if not hmac.compare_digest(expected_sign, sign):
         return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#d9534f;'><h2>🛑 Security Error! Link Mismatch</h2><p>Link sharing is strictly prohibited.</p></div>", status_code=403)
 
-    # 🔥 IP-LOCK SYSTEM
-    conn = get_db_connection()
-    token_row = conn.execute("SELECT client_ip FROM used_tokens WHERE sign = ?", (sign,)).fetchone()
+    def verify_and_lock_ip():
+        conn = get_db_connection()
+        try:
+            token_row = conn.execute("SELECT client_ip FROM used_tokens WHERE sign = ?", (sign,)).fetchone()
+            if token_row:
+                if token_row["client_ip"] != client_ip: return False
+            else:
+                conn.execute("INSERT INTO used_tokens (sign, client_ip, expires_at) VALUES (?, ?, ?)", (sign, client_ip, exp))
+                conn.commit()
+            conn.execute("UPDATE files SET last_accessed = ? WHERE short_id = ?", (int(time.time()), short_id))
+            conn.commit()
+            return True
+        finally: conn.close()
 
-    if token_row:
-        if token_row["client_ip"] != client_ip:
-            conn.close()
-            return HTMLResponse(
-                content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; background:#fef2f2; border:1px solid #fca5a5; padding:20px; border-radius:10px; color:#991b1b;'>"
-                        "<h2>🛑 Link Already Used!</h2>"
-                        "<p>This link was already claimed by another device/IP.</p>"
-                        "<p><strong>Link sharing is strictly not allowed.</strong> Please generate a new link from the official site.</p></div>", 
-                status_code=403
-            )
-    else:
-        conn.execute("INSERT INTO used_tokens (sign, client_ip, expires_at) VALUES (?, ?, ?)", (sign, client_ip, exp))
-        conn.commit()
+    if not await asyncio.to_thread(verify_and_lock_ip):
+        return HTMLResponse(
+            content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; background:#fef2f2; border:1px solid #fca5a5; padding:20px; border-radius:10px; color:#991b1b;'>"
+                    "<h2>🛑 Link Already Used!</h2>"
+                    "<p>This link was already claimed by another device/IP.</p>"
+                    "<p><strong>Link sharing is strictly not allowed.</strong> Please generate a new link from the official site.</p></div>", 
+            status_code=403
+        )
 
-    conn.execute("UPDATE files SET last_accessed = ? WHERE short_id = ?", (int(time.time()), short_id))
-    conn.commit(); conn.close()
-
-    entry = get_file_entry(short_id)
+    entry = await asyncio.to_thread(get_file_entry, short_id)
     if not entry: raise HTTPException(status_code=404, detail="File Not Found")
 
-    # 🔥 Direct Redirects applied here WITH EXISTENCE CHECK & SIZE/TELEGRAM LOGIC
     if entry.get("storage_type") == "r2" and entry.get("r2_key"):
         r2_key = entry["r2_key"]
-        exists = await asyncio.to_thread(check_r2_file_exists, r2_key)
-        
-        if exists:
+        if await asyncio.to_thread(check_r2_file_exists, r2_key):
             return redirect_to_r2(r2_key, entry["filename"], client_ip, "PERMANENT")
         else:
             if entry.get("message_id") and int(entry.get("message_id")) > 0:
-                conn = get_db_connection()
-                conn.execute("UPDATE files SET r2_key = NULL, storage_type = 'telegram' WHERE short_id = ?", (short_id,))
-                conn.commit(); conn.close()
-                log(f"⚠️ R2 FIX | Key Missing: {r2_key}. Falling back to Telegram (<100MB file).")
+                def fallback_db_fix():
+                    conn = get_db_connection()
+                    conn.execute("UPDATE files SET r2_key = NULL, storage_type = 'telegram' WHERE short_id = ?", (short_id,))
+                    conn.commit(); conn.close()
+                await asyncio.to_thread(fallback_db_fix)
             else:
-                return HTMLResponse(
-                    content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; background:#fef2f2; border:1px solid #fca5a5; padding:20px; border-radius:10px; color:#991b1b;'>"
-                            "<h2>🗑️ File Not Found / Deleted</h2>"
-                            "<p>This file (large R2 upload) has been permanently removed from the server.</p></div>", 
-                    status_code=404
-                )
+                return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#991b1b;'><h2>🗑️ File Deleted</h2></div>", status_code=404)
 
     if entry.get("r2_cache_key"):
         r2_cache_key = entry["r2_cache_key"]
-        exists = await asyncio.to_thread(check_r2_file_exists, r2_cache_key)
-        
-        if exists:
+        if await asyncio.to_thread(check_r2_file_exists, r2_cache_key):
             return redirect_to_r2(r2_cache_key, entry["filename"], client_ip, "CACHED LINK")
         else:
             if entry.get("message_id") and int(entry.get("message_id")) > 0:
-                conn = get_db_connection()
-                conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
-                conn.commit(); conn.close()
-                log(f"⚠️ R2 FIX | Cache Key Missing: {r2_cache_key}. Falling back to Telegram.")
-            else:
-                return HTMLResponse(
-                    content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; background:#fef2f2; border:1px solid #fca5a5; padding:20px; border-radius:10px; color:#991b1b;'>"
-                            "<h2>🗑️ File Not Found / Deleted</h2>"
-                            "<p>This file has been permanently removed from the server.</p></div>", 
-                    status_code=404
-                )
+                def remove_cache_key():
+                    conn = get_db_connection()
+                    conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
+                    conn.commit(); conn.close()
+                await asyncio.to_thread(remove_cache_key)
 
-    # 👇 Fallback to Telegram Stream
     tmp_path = f"/tmp/dl_{short_id}.bin"
     if short_id not in _active_dl:
         _active_dl[short_id] = {"dl_bytes": 0, "done": False, "err": False}
@@ -476,29 +473,30 @@ async def api_upload(request: Request):
         file_obj = None
         for k, v in form.items():
             if hasattr(v, "filename") and getattr(v, "filename", None):
-                file_obj = v
-                break
+                file_obj = v; break
 
-        if not file_obj:
-            return JSONResponse(status_code=400, content=[{"error": "No file detected"}])
+        if not file_obj: return JSONResponse(status_code=400, content=[{"error": "No file detected"}])
 
         filename = file_obj.filename
         content_type = getattr(file_obj, "content_type", "application/octet-stream")
         tmp_path = f"/tmp/web_{uuid.uuid4().hex[:8]}.bin"
 
         async with aiofiles.open(tmp_path, "wb") as f:
-            while chunk := await file_obj.read(2 * 1024 * 1024):
-                await f.write(chunk)
+            while chunk := await file_obj.read(2 * 1024 * 1024): await f.write(chunk)
 
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
-        conn = get_db_connection()
-        existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
-        conn.close()
+        
+        def fetch_existing():
+            conn = get_db_connection()
+            try: return conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
+            finally: conn.close()
+            
+        existing = await asyncio.to_thread(fetch_existing)
 
         if existing:
             os.unlink(tmp_path)
             new_id = str(uuid.uuid4())[:8]
-            save_file_entry(new_id, {
+            await asyncio.to_thread(save_file_entry, new_id, {
                 "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
                 "content_type": content_type, "channel_id": existing["channel_id"],
                 "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
@@ -511,14 +509,11 @@ async def api_upload(request: Request):
         client = await get_client()
         file_size = os.path.getsize(tmp_path)
 
-        if file_size < 10 * 1024 * 1024:
-            msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
-        else:
-            up_file = await parallel_upload(client, tmp_path)
-            msg = await client.send_file(CHANNEL_ID, up_file, force_document=True)
+        if file_size < 10 * 1024 * 1024: msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
+        else: msg = await client.send_file(CHANNEL_ID, await parallel_upload(client, tmp_path), force_document=True)
 
         short_id = str(uuid.uuid4())[:8]
-        save_file_entry(short_id, {
+        await asyncio.to_thread(save_file_entry, short_id, {
             "message_id": msg.id, "filename": filename, "size": file_size,
             "content_type": content_type, "channel_id": CHANNEL_ID,
             "doc_id": msg.document.id, "access_hash": msg.document.access_hash,
@@ -527,7 +522,6 @@ async def api_upload(request: Request):
         })
         os.unlink(tmp_path)
         return JSONResponse(content=[{"file_code": short_id, "file_status": "OK"}])
-
     except Exception as e:
         return JSONResponse(status_code=500, content=[{"error": str(e)}])
 
@@ -547,14 +541,18 @@ async def remote_upload(request: Request):
                         await f.write(chunk)
 
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
-        conn = get_db_connection()
-        existing = conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
-        conn.close()
+        
+        def fetch_existing():
+            conn = get_db_connection()
+            try: return conn.execute("SELECT * FROM files WHERE file_hash = ?", (file_hash,)).fetchone()
+            finally: conn.close()
+            
+        existing = await asyncio.to_thread(fetch_existing)
 
         if existing:
             os.unlink(tmp_path)
             new_short_id = str(uuid.uuid4())[:8]
-            save_file_entry(new_short_id, {
+            await asyncio.to_thread(save_file_entry, new_short_id, {
                 "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
                 "content_type": existing["content_type"], "channel_id": existing["channel_id"],
                 "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
@@ -565,11 +563,10 @@ async def remote_upload(request: Request):
             return [{"file_code": new_short_id, "file_status": "OK"}]
 
         client = await get_client()
-        up_file = await parallel_upload(client, tmp_path)
-        msg = await client.send_file(CHANNEL_ID, up_file, force_document=True)
+        msg = await client.send_file(CHANNEL_ID, await parallel_upload(client, tmp_path), force_document=True)
         short_id = str(uuid.uuid4())[:8]
 
-        save_file_entry(short_id, {
+        await asyncio.to_thread(save_file_entry, short_id, {
             "message_id": msg.id, "filename": filename, "size": os.path.getsize(tmp_path),
             "content_type": "application/octet-stream", "channel_id": CHANNEL_ID,
             "doc_id": msg.document.id, "access_hash": msg.document.access_hash,
@@ -580,30 +577,40 @@ async def remote_upload(request: Request):
         return [{"file_code": short_id, "file_status": "OK"}]
     except Exception as e: return {"error": str(e)}
 
+# ============================================================
+# 🎯 API ENDPOINTS FIXED (HTTP 500 CRASH RESOLVED)
+# ============================================================
 @app.post("/api/file/register_r2")
 async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = Body(...)):
     verify_key(key)
 
     file_hash = data.get("file_hash")
-    new_r2_key = data["r2_key"]
+    new_r2_key = data.get("r2_key")
     filename = data.get("filename")
-    size = data.get("size", 0)
+    size = int(data.get("size", 0))
 
-    conn = get_db_connection()
-    existing = None
+    if not new_r2_key:
+        raise HTTPException(status_code=400, detail="Missing r2_key")
 
-    if file_hash and file_hash.strip():
-        existing = conn.execute("SELECT r2_key FROM files WHERE file_hash = ? AND storage_type = 'r2' AND r2_key IS NOT NULL", (file_hash,)).fetchone()
+    def check_existing_db():
+        conn = get_db_connection()
+        try:
+            if file_hash and str(file_hash).strip():
+                ext = conn.execute("SELECT r2_key FROM files WHERE file_hash = ? AND storage_type = 'r2' AND r2_key IS NOT NULL", (file_hash,)).fetchone()
+                if ext: return dict(ext)
+            if filename and size > 0:
+                ext = conn.execute("SELECT r2_key FROM files WHERE filename = ? AND size = ? AND storage_type = 'r2' AND r2_key IS NOT NULL", (filename, size)).fetchone()
+                if ext: return dict(ext)
+            return None
+        finally:
+            conn.close()
 
-    if not existing and filename and size > 0:
-        existing = conn.execute("SELECT r2_key FROM files WHERE filename = ? AND size = ? AND storage_type = 'r2' AND r2_key IS NOT NULL", (filename, size)).fetchone()
-
-    conn.close()
+    existing = await asyncio.to_thread(check_existing_db)
 
     if existing:
         master_r2_key = existing["r2_key"]
         if master_r2_key != new_r2_key:
-            save_file_entry(data["short_id"], {
+            await asyncio.to_thread(save_file_entry, data["short_id"], {
                 "filename": filename, "size": size, "storage_type": "r2",
                 "r2_key": master_r2_key, "content_type": "application/octet-stream",
                 "file_hash": file_hash
@@ -612,11 +619,10 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
             def delete_redundant():
                 try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=new_r2_key)
                 except: pass
-
             background_tasks.add_task(delete_redundant)
             return {"status": "OK", "msg": "Duplicate handled instantly"}
 
-    save_file_entry(data["short_id"], {
+    await asyncio.to_thread(save_file_entry, data["short_id"], {
         "filename": filename, "size": size, "storage_type": "r2",
         "r2_key": new_r2_key, "content_type": "application/octet-stream",
         "file_hash": file_hash
@@ -625,30 +631,37 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
 
 @app.get("/api/file/clone")
 async def file_clone(key: str, file_code: str):
-    verify_key(key); entry = get_file_entry(file_code)
-    if not entry: return {"status": 404}
+    verify_key(key)
+    entry = await asyncio.to_thread(get_file_entry, file_code)
+    if not entry: return JSONResponse(status_code=404, content={"status": 404, "error": "File not found"})
+    
     new_id = str(uuid.uuid4())[:8]
-    save_file_entry(new_id, entry)
+    await asyncio.to_thread(save_file_entry, new_id, entry)
     return {"status": 200, "result": {"filecode": new_id}}
 
 @app.get("/api/file/delete")
 async def file_delete(key: str, file_code: str):
-    verify_key(key); entry = get_file_entry(file_code)
+    verify_key(key)
+    entry = await asyncio.to_thread(get_file_entry, file_code)
     if entry:
-        with _db_lock:
+        def run_delete():
             conn = get_db_connection()
-            if entry.get("storage_type") == "r2" and entry.get("r2_key"):
-                count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_key = ?", (entry["r2_key"],)).fetchone()[0]
-                if count <= 1:
-                    try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
-                    except: pass
-            if entry.get("r2_cache_key"):
-                count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ?", (entry["r2_cache_key"],)).fetchone()[0]
-                if count <= 1:
-                    try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_cache_key"])
-                    except: pass
-            conn.execute("DELETE FROM files WHERE short_id = ?", (file_code,))
-            conn.commit(); conn.close()
+            try:
+                if entry.get("storage_type") == "r2" and entry.get("r2_key"):
+                    count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_key = ?", (entry["r2_key"],)).fetchone()[0]
+                    if count <= 1:
+                        try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
+                        except: pass
+                if entry.get("r2_cache_key"):
+                    count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ?", (entry["r2_cache_key"],)).fetchone()[0]
+                    if count <= 1:
+                        try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_cache_key"])
+                        except: pass
+                conn.execute("DELETE FROM files WHERE short_id = ?", (file_code,))
+                conn.commit()
+            finally:
+                conn.close()
+        await asyncio.to_thread(run_delete)
     return {"status": 200, "msg": "OK"}
 
 @app.get("/api/file/rename")
@@ -657,17 +670,23 @@ async def file_rename(key: str, file_code: str, name: str):
     safe_name = name.strip().replace("/", "_").replace("\\", "_").replace("\x00", "")
     if not safe_name: raise HTTPException(status_code=400, detail="Invalid filename")
 
-    with _db_lock:
+    def run_rename():
         conn = get_db_connection()
-        result = conn.execute("UPDATE files SET filename = ? WHERE short_id = ?", (safe_name, file_code))
-        conn.commit(); changed = result.rowcount; conn.close()
-
-    if changed == 0: return {"status": 404, "msg": "File not found"}
+        try:
+            result = conn.execute("UPDATE files SET filename = ? WHERE short_id = ?", (safe_name, file_code))
+            conn.commit()
+            return result.rowcount
+        finally:
+            conn.close()
+            
+    changed = await asyncio.to_thread(run_rename)
+    if changed == 0: return JSONResponse(status_code=404, content={"status": 404, "msg": "File not found"})
     return {"status": 200, "msg": "OK", "new_name": safe_name}
 
 @app.get("/api/file/info")
 async def file_info(key: str, file_code: str):
-    verify_key(key); entry = get_file_entry(file_code)
+    verify_key(key)
+    entry = await asyncio.to_thread(get_file_entry, file_code)
     if entry: return {"result": [{"name": entry["filename"], "size": entry["size"], "storage": entry.get("storage_type", "telegram")}]}
     return {"result": []}
 
@@ -679,15 +698,18 @@ async def index_forwarded(key: str, message_id: int, filename: str):
     if not message or not message.document: return {"error": "Not Found"}
 
     doc_id_str = str(message.document.id)
-    conn = get_db_connection()
-    existing = conn.execute("SELECT * FROM files WHERE doc_id = ?", (doc_id_str,)).fetchone()
-    conn.close()
+    def fetch_existing():
+        conn = get_db_connection()
+        try: return conn.execute("SELECT * FROM files WHERE doc_id = ?", (doc_id_str,)).fetchone()
+        finally: conn.close()
+
+    existing = await asyncio.to_thread(fetch_existing)
 
     if existing:
         try: await client.delete_messages(CHANNEL_ID, [message_id])
         except: pass
         new_id = str(uuid.uuid4())[:8]
-        save_file_entry(new_id, {
+        await asyncio.to_thread(save_file_entry, new_id, {
             "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
             "content_type": existing["content_type"], "channel_id": existing["channel_id"],
             "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
@@ -698,7 +720,7 @@ async def index_forwarded(key: str, message_id: int, filename: str):
         return [{"file_code": new_id, "file_status": "OK"}]
 
     short_id = str(uuid.uuid4())[:8]
-    save_file_entry(short_id, {
+    await asyncio.to_thread(save_file_entry, short_id, {
         "message_id": message.id, "filename": filename, "size": message.document.size,
         "content_type": message.file.mime_type, "channel_id": CHANNEL_ID,
         "doc_id": message.document.id, "access_hash": message.document.access_hash,
@@ -710,11 +732,17 @@ async def index_forwarded(key: str, message_id: int, filename: str):
 @app.get("/files")
 async def list_files(key: str, page: int = 1, limit: int = 10):
     verify_key(key)
-    conn = get_db_connection()
-    offset = (page - 1) * limit
-    total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    rows = conn.execute("SELECT * FROM files ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
-    conn.close()
+    def get_files():
+        conn = get_db_connection()
+        try:
+            offset = (page - 1) * limit
+            total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            rows = conn.execute("SELECT * FROM files ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+            return total, rows
+        finally:
+            conn.close()
+            
+    total, rows = await asyncio.to_thread(get_files)
     return {
         "files": [{"short_id": r["short_id"], "filename": r["filename"], "size": format_size(r["size"]), "download_link": f"{BASE_URL}/download/{r['short_id']}"} for r in rows],
         "total": total, "page": page, "total_pages": math.ceil(total / limit) if total > 0 else 1
