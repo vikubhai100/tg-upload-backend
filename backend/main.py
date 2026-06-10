@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import InputFileBig
-from telethon.tl.function.upload import SaveBigFilePartRequest
+from telethon.tl.functions.upload import SaveBigFilePartRequest
 
 # ============================================================
 # ☁️ CLOUDFLARE R2 CONFIG
