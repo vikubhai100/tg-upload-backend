@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import InputFileBig
-from telethon.tl.functions.upload import SaveBigFilePartRequest
+from telethon.tl.function.upload import SaveBigFilePartRequest
 
 # ============================================================
 # ☁️ CLOUDFLARE R2 CONFIG
@@ -145,13 +145,18 @@ def init_db():
         short_id TEXT PRIMARY KEY, message_id INTEGER, filename TEXT, size INTEGER,
         content_type TEXT, channel_id INTEGER, doc_id TEXT, access_hash TEXT,
         file_reference TEXT, dc_id INTEGER, storage_type TEXT DEFAULT 'telegram', r2_key TEXT,
-        last_accessed INTEGER DEFAULT 0, r2_cache_key TEXT, file_hash TEXT
+        last_accessed INTEGER DEFAULT 0, r2_cache_key TEXT, file_hash TEXT,
+        tg_backup_msg_id INTEGER DEFAULT 0
     )''')
     conn.execute('''CREATE TABLE IF NOT EXISTS used_tokens (
         sign TEXT PRIMARY KEY,
         client_ip TEXT,
         expires_at INTEGER
     )''')
+    try:
+        conn.execute("ALTER TABLE files ADD COLUMN tg_backup_msg_id INTEGER DEFAULT 0")
+    except:
+        pass
     conn.execute("PRAGMA journal_mode=WAL")
     conn.commit()
     conn.close()
@@ -300,6 +305,27 @@ async def bg_fetch_and_cache(short_id, entry):
             
         await asyncio.to_thread(update_cache_db)
 
+        # ♻️ AUTO-RESTORE: If R2 permanent file was deleted, re-upload it
+        entry_check = await asyncio.to_thread(get_file_entry, short_id)
+        if entry_check and not entry_check.get("r2_key"):
+            try:
+                restore_r2_key = f"restored_{short_id}_{uuid.uuid4().hex[:6]}"
+                def restore_to_r2():
+                    r2_client.upload_file(tmp_path, R2_BUCKET_NAME, restore_r2_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
+                await asyncio.to_thread(restore_to_r2)
+                
+                def update_restore_db():
+                    conn = get_db_connection()
+                    try:
+                        conn.execute("UPDATE files SET r2_key = ?, storage_type = 'r2' WHERE short_id = ?", (restore_r2_key, short_id))
+                        conn.commit()
+                    finally:
+                        conn.close()
+                await asyncio.to_thread(update_restore_db)
+                log(f"♻️ Auto-restored to R2: {short_id} → {restore_r2_key}")
+            except Exception as restore_err:
+                log(f"⚠️ R2 restore failed for {short_id}: {str(restore_err)}")
+
     except Exception:
         if short_id in _active_dl: _active_dl[short_id]["err"] = True
     finally:
@@ -356,12 +382,21 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
         if await asyncio.to_thread(check_r2_file_exists, r2_key):
             return redirect_to_r2(r2_key, entry["filename"], client_ip, "PERMANENT")
         else:
-            if entry.get("message_id") and int(entry.get("message_id")) > 0:
+            # R2 file deleted (inactive cleanup) — check Telegram backup
+            backup_msg_id = entry.get("tg_backup_msg_id") or entry.get("message_id")
+            if backup_msg_id and int(backup_msg_id) > 0:
+                # Update DB: mark as telegram since R2 is gone
                 def fallback_db_fix():
                     conn = get_db_connection()
                     conn.execute("UPDATE files SET r2_key = NULL, storage_type = 'telegram' WHERE short_id = ?", (short_id,))
                     conn.commit(); conn.close()
                 await asyncio.to_thread(fallback_db_fix)
+                # Update entry for streaming below
+                entry["storage_type"] = "telegram"
+                entry["r2_key"] = None
+                entry["message_id"] = int(backup_msg_id)
+                log(f"♻️ R2 missing, falling back to Telegram backup for: {short_id}")
+                # Continue below to stream from Telegram + restore to R2 in background
             else:
                 return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#991b1b;'><h2>🗑️ File Deleted</h2></div>", status_code=404)
 
@@ -706,7 +741,7 @@ async def index_forwarded(key: str, message_id: int, filename: str):
     existing = await asyncio.to_thread(fetch_existing)
 
     if existing:
-        try: await client.delete_messages(CHANNEL_ID, [message_id])
+        try: await client.delete_messages(CHANNEL_ID, message_id)
         except: pass
         new_id = str(uuid.uuid4())[:8]
         await asyncio.to_thread(save_file_entry, new_id, {
@@ -728,6 +763,82 @@ async def index_forwarded(key: str, message_id: int, filename: str):
         "storage_type": "telegram"
     })
     return [{"file_code": short_id, "file_status": "OK"}]
+
+@app.post("/api/file/backup_to_telegram")
+async def backup_to_telegram(key: str, data: dict = Body(...)):
+    verify_key(key)
+    file_code = data.get("file_code")
+    if not file_code:
+        raise HTTPException(status_code=400, detail="Missing file_code")
+    
+    entry = await asyncio.to_thread(get_file_entry, file_code)
+    if not entry:
+        raise HTTPException(status_code=404, detail="File not found in DB")
+    
+    # If already has a backup, skip
+    if entry.get("tg_backup_msg_id") and int(entry.get("tg_backup_msg_id", 0)) > 0:
+        return {"status": "OK", "msg": "Backup already exists", "backup_msg_id": entry["tg_backup_msg_id"]}
+    
+    r2_key = entry.get("r2_key")
+    if not r2_key:
+        return {"status": "OK", "msg": "No R2 key, nothing to backup"}
+    
+    # Check if file exists on Telegram already (original message_id exists)
+    if entry.get("message_id") and int(entry.get("message_id", 0)) > 0:
+        # Already has Telegram message, just mark it as backup
+        def mark_backup():
+            conn = get_db_connection()
+            try:
+                conn.execute("UPDATE files SET tg_backup_msg_id = message_id WHERE short_id = ?", (file_code,))
+                conn.commit()
+            finally:
+                conn.close()
+        await asyncio.to_thread(mark_backup)
+        return {"status": "OK", "msg": "Original Telegram message exists, marked as backup", "backup_msg_id": entry["message_id"]}
+    
+    # Download from R2 to temp file
+    tmp_path = f"/tmp/backup_{file_code}_{uuid.uuid4().hex[:6]}.bin"
+    try:
+        def download_from_r2():
+            r2_client.download_file(R2_BUCKET_NAME, r2_key, tmp_path)
+        await asyncio.to_thread(download_from_r2)
+        
+        # Upload to Telegram channel
+        client = await get_client()
+        file_size = os.path.getsize(tmp_path)
+        
+        if file_size > 10 * 1024 * 1024:
+            msg = await client.send_file(CHANNEL_ID, await parallel_upload(client, tmp_path), force_document=True)
+        else:
+            msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
+        
+        # Update DB with backup message ID
+        def update_backup():
+            conn = get_db_connection()
+            try:
+                conn.execute(
+                    "UPDATE files SET tg_backup_msg_id = ?, message_id = ?, channel_id = ?, doc_id = ?, access_hash = ?, file_reference = ?, dc_id = ? WHERE short_id = ?",
+                    (msg.id, msg.id, CHANNEL_ID, str(msg.document.id),
+                     str(msg.document.access_hash), msg.document.file_reference.hex(),
+                     msg.document.dc_id, file_code))
+                conn.commit()
+            finally:
+                conn.close()
+        await asyncio.to_thread(update_backup)
+        
+        log(f"✅ Backup to Telegram complete: {file_code} → msg_id={msg.id}")
+        return {"status": "OK", "msg": "Backed up to Telegram", "backup_msg_id": msg.id}
+    
+    except Exception as e:
+        log(f"❌ Backup failed for {file_code}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except:
+            pass
+
 
 @app.get("/files")
 async def list_files(key: str, page: int = 1, limit: int = 10):
