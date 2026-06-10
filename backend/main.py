@@ -171,17 +171,18 @@ def save_file_entry(short_id, data):
     for _ in range(5):  # Safety retry mechanism
         try:
             conn = get_db_connection()
-            existing = conn.execute("SELECT last_accessed, r2_cache_key FROM files WHERE short_id = ?", (short_id,)).fetchone()
+            existing = conn.execute("SELECT last_accessed, r2_cache_key, tg_backup_msg_id FROM files WHERE short_id = ?", (short_id,)).fetchone()
             last_acc = existing["last_accessed"] if existing else int(time.time())
             cache_key = data.get("r2_cache_key") or (existing["r2_cache_key"] if existing else None)
             file_hash = data.get("file_hash")
+            backup_msg_id = data.get("tg_backup_msg_id") or (existing["tg_backup_msg_id"] if existing else 0)
 
-            conn.execute('''REPLACE INTO files (short_id, message_id, filename, size, content_type, channel_id, doc_id, access_hash, file_reference, dc_id, storage_type, r2_key, last_accessed, r2_cache_key, file_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            conn.execute('''REPLACE INTO files (short_id, message_id, filename, size, content_type, channel_id, doc_id, access_hash, file_reference, dc_id, storage_type, r2_key, last_accessed, r2_cache_key, file_hash, tg_backup_msg_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (short_id, data.get("message_id", 0), data.get("filename"), data.get("size", 0),
                  data.get("content_type"), data.get("channel_id", 0), str(data.get("doc_id", "0")),
                  str(data.get("access_hash", "0")), str(data.get("file_reference", "0")),
-                 data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key, file_hash))
+                 data.get("dc_id", 0), data.get("storage_type", "telegram"), data.get("r2_key"), last_acc, cache_key, file_hash, backup_msg_id))
             conn.commit()
             conn.close()
             break
