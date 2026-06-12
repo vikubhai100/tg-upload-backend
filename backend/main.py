@@ -935,7 +935,8 @@ async def backup_to_telegram(key: str, data: dict = Body(...)):
         file_size = os.path.getsize(tmp_path)
         
         if file_size > 10 * 1024 * 1024:
-            msg = await client.send_file(CHANNEL_ID, await parallel_upload(client, tmp_path), force_document=True)
+            uploaded_file = await parallel_upload(client, tmp_path)
+            msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
         else:
             msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
         
