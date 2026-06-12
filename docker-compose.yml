@@ -12,7 +12,7 @@ services:
       - API_ID=${API_ID}
       - API_HASH=${API_HASH}
       - SESSION_STRING=${SESSION_STRING:-}
-      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-super_secret_key_123}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:?INTERNAL_API_KEY must be set}
       - PORT=${PORT:-9500}
     volumes:
       - telestore-data:/app/data

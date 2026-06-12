@@ -28,10 +28,10 @@ from telethon.tl.functions.upload import SaveBigFilePartRequest
 # ============================================================
 # ☁️ CLOUDFLARE R2 CONFIG
 # ============================================================
-R2_ENDPOINT = "https://c756225d2d945ebc6c51149e7a1e3cfe.r2.cloudflarestorage.com"
-R2_ACCESS_KEY = "6725033f7581ed01c53a5b4411dc0614"
-R2_SECRET_KEY = "21295882807a0d4940dc9330e146795043b6c69ce83520f04b0be5a49262d28f"
-R2_BUCKET_NAME = "urlking"
+R2_ENDPOINT = os.getenv("R2_ENDPOINT", "")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "urlking")
 
 r2_client = boto3.client(
     service_name='s3',
@@ -50,7 +50,7 @@ def log(msg):
     print(line, flush=True)
     try:
         with open(LOG_FILE, "a") as f: f.write(line + "\n")
-    except: pass
+    except Exception: pass
 
 def format_size(size_bytes):
     if size_bytes == 0: return "0 B"
@@ -67,15 +67,16 @@ def check_r2_file_exists(key):
     try:
         r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=key)
         return True
-    except:
+    except Exception:
         return False
 
 app = FastAPI(title="URLKING Hybrid Storage")
 
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://urlking.site,https://db.mypdftools.site,https://mypdftools.pages.dev").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -106,11 +107,13 @@ CHANNEL_ID       = int(os.getenv("CHANNEL_ID", "0"))
 BASE_URL         = os.getenv("BASE_URL", "https://db.mypdftools.site")
 SESSION_STR      = os.getenv("SESSION_STRING", "")
 DB_FILE_SQLITE   = "/app/data/files.db"
-INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "super_secret_key_123")
-DOWNLOAD_SECRET  = "URLKING_ANTI_BOT_SECRET_2024"  
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
+if not INTERNAL_API_KEY:
+    log("WARNING: INTERNAL_API_KEY not set! API is unprotected!")
+DOWNLOAD_SECRET  = os.getenv("DOWNLOAD_SECRET", "")  
 
 def calculate_hash(file_path):
-    hasher = hashlib.md5()
+    hasher = hashlib.sha256()
     with open(file_path, 'rb') as f:
         while chunk := f.read(8192 * 1024): 
             hasher.update(chunk)
@@ -211,7 +214,7 @@ def execute_r2_cleanup():
                 for i in range(1, len(rows)):
                     conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, rows[i]["short_id"]))
                     try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=rows[i]["r2_key"])
-                    except: pass
+                    except Exception: pass
         conn.commit(); conn.close()
     except Exception: pass
 
@@ -229,7 +232,7 @@ def execute_cache_sweeper():
                         try:
                             r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=obj['Key'])
                             conn.execute("UPDATE files SET r2_cache_key = NULL WHERE r2_cache_key = ?", (obj['Key'],))
-                        except: pass
+                        except Exception: pass
 
         current_time = int(time.time())
         conn.execute("DELETE FROM used_tokens WHERE expires_at < ?", (current_time,))
@@ -252,11 +255,12 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     try:
         url = r2_client.generate_presigned_url('get_object', Params={
             'Bucket': R2_BUCKET_NAME, 'Key': r2_key,
-            'ResponseContentDisposition': f"attachment; filename=\"{filename}\""
-        }, ExpiresIn=12)
+            'ResponseContentDisposition': f"attachment; filename*=UTF-8''{quote(filename)}"
+        }, ExpiresIn=600)
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
         return RedirectResponse(url=url)
-    except Exception: 
+    except Exception as e: 
+        log(f"R2 redirect error: {e}")
         raise HTTPException(status_code=500)
 
 _active_dl = {}
@@ -300,13 +304,14 @@ async def bg_fetch_and_cache(short_id, entry):
             
         await asyncio.to_thread(update_cache_db)
 
-    except Exception:
+    except Exception as e:
+        log(f"bg_fetch error for {short_id}: {e}")
         if short_id in _active_dl: _active_dl[short_id]["err"] = True
     finally:
         await asyncio.sleep(1800)
         if short_id in _active_dl: _active_dl.pop(short_id, None)
         try: os.remove(tmp_path)
-        except: pass
+        except Exception: pass
 
 @app.get("/download/{short_id}")
 async def download_handle(request: Request, short_id: str, exp: int = 0, sign: str = ""):
@@ -319,7 +324,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     if int(time.time()) > exp:
         return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#f0ad4e;'><h2>⏳ Link Expired</h2><p>Your download link has expired. Please go back.</p></div>", status_code=403)
 
-    data_to_sign = f"{short_id}:{exp}:{user_agent}".encode('utf-8')
+    data_to_sign = f"{short_id}:{exp}".encode('utf-8')
     expected_sign = hmac.new(DOWNLOAD_SECRET.encode('utf-8'), data_to_sign, hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected_sign, sign):
@@ -399,7 +404,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
             r_str = range_header.replace("bytes=", "").split("-")
             start_byte = int(r_str[0]) if r_str[0] else 0
             if len(r_str) > 1 and r_str[1]: end_byte = int(r_str[1])
-        except: pass
+        except Exception: pass
 
     content_length = end_byte - start_byte + 1
 
@@ -466,8 +471,9 @@ async def parallel_upload(client, file_path):
 @app.post("/api/upload")
 async def api_upload(request: Request):
     try:
+        tmp_path = None
         form = await request.form()
-        key = request.query_params.get("key") or form.get("key")
+        key = request.query_params.get("key") or form.get("key") or request.headers.get("Authorization", "").replace("Bearer ", "")
         verify_key(key)
 
         file_obj = None
@@ -495,7 +501,7 @@ async def api_upload(request: Request):
 
         if existing:
             os.unlink(tmp_path)
-            new_id = str(uuid.uuid4())[:8]
+            new_id = uuid.uuid4().hex[:12]
             await asyncio.to_thread(save_file_entry, new_id, {
                 "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
                 "content_type": content_type, "channel_id": existing["channel_id"],
@@ -512,7 +518,7 @@ async def api_upload(request: Request):
         if file_size < 10 * 1024 * 1024: msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
         else: msg = await client.send_file(CHANNEL_ID, await parallel_upload(client, tmp_path), force_document=True)
 
-        short_id = str(uuid.uuid4())[:8]
+        short_id = uuid.uuid4().hex[:12]
         await asyncio.to_thread(save_file_entry, short_id, {
             "message_id": msg.id, "filename": filename, "size": file_size,
             "content_type": content_type, "channel_id": CHANNEL_ID,
@@ -523,21 +529,66 @@ async def api_upload(request: Request):
         os.unlink(tmp_path)
         return JSONResponse(content=[{"file_code": short_id, "file_status": "OK"}])
     except Exception as e:
+        if tmp_path and os.path.exists(tmp_path):
+            try: os.unlink(tmp_path)
+            except Exception: pass
         return JSONResponse(status_code=500, content=[{"error": str(e)}])
 
 @app.post("/api/remote_upload")
 async def remote_upload(request: Request):
     try:
         data = await request.json()
-        verify_key(data.get("key"))
+        key = data.get("key") or request.headers.get("Authorization", "").replace("Bearer ", "")
+        verify_key(key)
         url = data.get("url")
         filename = data.get("filename", f"file_{int(time.time())}.bin")
+        
+        # SSRF Protection: Validate URL
+        if not url:
+            return {"error": "URL is required"}
+        
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        
+        # Only allow https
+        if parsed.scheme not in ("https", "http"):
+            return {"error": "Only HTTP(S) URLs are allowed"}
+        
+        # Block private/internal IPs
+        import socket
+        import ipaddress
+        try:
+            hostname = parsed.hostname
+            if hostname:
+                resolved_ip = socket.gethostbyname(hostname)
+                ip_obj = ipaddress.ip_address(resolved_ip)
+                if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local:
+                    return {"error": "Internal URLs are not allowed"}
+                # Block cloud metadata endpoints
+                if resolved_ip.startswith("169.254."):
+                    return {"error": "Metadata endpoints are blocked"}
+        except (socket.gaierror, ValueError):
+            return {"error": "Invalid URL hostname"}
+        
+        # Max file size check (2GB)
+        MAX_REMOTE_SIZE = 2 * 1024 * 1024 * 1024
+        
         tmp_path = f"/tmp/{uuid.uuid4()}"
+        total_size = 0
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as r:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as r:
+                if r.status != 200:
+                    return {"error": f"Remote server returned status {r.status}"}
                 async with aiofiles.open(tmp_path, 'wb') as f:
                     async for chunk in r.content.iter_chunked(5*1024*1024): 
+                        total_size += len(chunk)
+                        if total_size > MAX_REMOTE_SIZE:
+                            # Cleanup and reject
+                            await f.close()
+                            try: os.unlink(tmp_path)
+                            except Exception: pass
+                            return {"error": "Remote file exceeds 2GB limit"}
                         await f.write(chunk)
 
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
@@ -550,8 +601,9 @@ async def remote_upload(request: Request):
         existing = await asyncio.to_thread(fetch_existing)
 
         if existing:
-            os.unlink(tmp_path)
-            new_short_id = str(uuid.uuid4())[:8]
+            try: os.unlink(tmp_path)
+            except Exception: pass
+            new_short_id = uuid.uuid4().hex[:12]
             await asyncio.to_thread(save_file_entry, new_short_id, {
                 "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
                 "content_type": existing["content_type"], "channel_id": existing["channel_id"],
@@ -564,7 +616,7 @@ async def remote_upload(request: Request):
 
         client = await get_client()
         msg = await client.send_file(CHANNEL_ID, await parallel_upload(client, tmp_path), force_document=True)
-        short_id = str(uuid.uuid4())[:8]
+        short_id = uuid.uuid4().hex[:12]
 
         await asyncio.to_thread(save_file_entry, short_id, {
             "message_id": msg.id, "filename": filename, "size": os.path.getsize(tmp_path),
@@ -573,7 +625,8 @@ async def remote_upload(request: Request):
             "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id,
             "file_hash": file_hash
         })
-        os.unlink(tmp_path)
+        try: os.unlink(tmp_path)
+        except Exception: pass
         return [{"file_code": short_id, "file_status": "OK"}]
     except Exception as e: return {"error": str(e)}
 
@@ -581,7 +634,8 @@ async def remote_upload(request: Request):
 # 🎯 API ENDPOINTS FIXED (HTTP 500 CRASH RESOLVED)
 # ============================================================
 @app.post("/api/file/register_r2")
-async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = Body(...)):
+async def register_r2(request: Request, background_tasks: BackgroundTasks, data: dict = Body(...)):
+    key = request.query_params.get("key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     verify_key(key)
 
     file_hash = data.get("file_hash")
@@ -618,7 +672,7 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
 
             def delete_redundant():
                 try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=new_r2_key)
-                except: pass
+                except Exception as e: log(f"R2 delete redundant error: {e}")
             background_tasks.add_task(delete_redundant)
             return {"status": "OK", "msg": "Duplicate handled instantly"}
 
@@ -630,18 +684,26 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
     return {"status": "OK"}
 
 @app.get("/api/file/clone")
-async def file_clone(key: str, file_code: str):
+async def file_clone(request: Request, file_code: str):
+    key = request.query_params.get("key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     verify_key(key)
     entry = await asyncio.to_thread(get_file_entry, file_code)
     if not entry: return JSONResponse(status_code=404, content={"status": 404, "error": "File not found"})
     
-    new_id = str(uuid.uuid4())[:8]
+    new_id = uuid.uuid4().hex[:12]
     await asyncio.to_thread(save_file_entry, new_id, entry)
     return {"status": 200, "result": {"filecode": new_id}}
 
-@app.get("/api/file/delete")
-async def file_delete(key: str, file_code: str):
+@app.post("/api/file/delete")
+async def file_delete(request: Request, file_code: str = ""):
+    key = request.query_params.get("key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     verify_key(key)
+    if not file_code:
+        try:
+            body = await request.json()
+            file_code = body.get("file_code", "")
+        except Exception:
+            pass
     entry = await asyncio.to_thread(get_file_entry, file_code)
     if entry:
         def run_delete():
@@ -651,12 +713,12 @@ async def file_delete(key: str, file_code: str):
                     count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_key = ?", (entry["r2_key"],)).fetchone()[0]
                     if count <= 1:
                         try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
-                        except: pass
+                        except Exception as e: log(f"R2 delete error: {e}")
                 if entry.get("r2_cache_key"):
                     count = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ?", (entry["r2_cache_key"],)).fetchone()[0]
                     if count <= 1:
                         try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_cache_key"])
-                        except: pass
+                        except Exception as e: log(f"R2 cache delete error: {e}")
                 conn.execute("DELETE FROM files WHERE short_id = ?", (file_code,))
                 conn.commit()
             finally:
@@ -664,11 +726,16 @@ async def file_delete(key: str, file_code: str):
         await asyncio.to_thread(run_delete)
     return {"status": 200, "msg": "OK"}
 
-@app.get("/api/file/rename")
-async def file_rename(key: str, file_code: str, name: str):
+@app.post("/api/file/rename")
+async def file_rename(request: Request):
+    key = request.query_params.get("key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     verify_key(key)
+    data = await request.json()
+    file_code = data.get("file_code", "")
+    name = data.get("name", "")
     safe_name = name.strip().replace("/", "_").replace("\\", "_").replace("\x00", "")
     if not safe_name: raise HTTPException(status_code=400, detail="Invalid filename")
+    if len(safe_name) > 255: safe_name = safe_name[:255]
 
     def run_rename():
         conn = get_db_connection()
@@ -684,14 +751,16 @@ async def file_rename(key: str, file_code: str, name: str):
     return {"status": 200, "msg": "OK", "new_name": safe_name}
 
 @app.get("/api/file/info")
-async def file_info(key: str, file_code: str):
+async def file_info(request: Request, file_code: str):
+    key = request.query_params.get("key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     verify_key(key)
     entry = await asyncio.to_thread(get_file_entry, file_code)
     if entry: return {"result": [{"name": entry["filename"], "size": entry["size"], "storage": entry.get("storage_type", "telegram")}]}
     return {"result": []}
 
 @app.get("/api/index_forwarded")
-async def index_forwarded(key: str, message_id: int, filename: str):
+async def index_forwarded(request: Request, message_id: int, filename: str):
+    key = request.query_params.get("key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     verify_key(key)
     client = await get_client()
     message = await client.get_messages(CHANNEL_ID, ids=message_id)
@@ -707,8 +776,8 @@ async def index_forwarded(key: str, message_id: int, filename: str):
 
     if existing:
         try: await client.delete_messages(CHANNEL_ID, [message_id])
-        except: pass
-        new_id = str(uuid.uuid4())[:8]
+        except Exception: pass
+        new_id = uuid.uuid4().hex[:12]
         await asyncio.to_thread(save_file_entry, new_id, {
             "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
             "content_type": existing["content_type"], "channel_id": existing["channel_id"],
@@ -719,7 +788,7 @@ async def index_forwarded(key: str, message_id: int, filename: str):
         })
         return [{"file_code": new_id, "file_status": "OK"}]
 
-    short_id = str(uuid.uuid4())[:8]
+    short_id = uuid.uuid4().hex[:12]
     await asyncio.to_thread(save_file_entry, short_id, {
         "message_id": message.id, "filename": filename, "size": message.document.size,
         "content_type": message.file.mime_type, "channel_id": CHANNEL_ID,
@@ -730,8 +799,11 @@ async def index_forwarded(key: str, message_id: int, filename: str):
     return [{"file_code": short_id, "file_status": "OK"}]
 
 @app.get("/files")
-async def list_files(key: str, page: int = 1, limit: int = 10):
+async def list_files(request: Request, page: int = 1, limit: int = 10):
+    key = request.query_params.get("key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     verify_key(key)
+    # Limit bounds
+    limit = min(max(limit, 1), 100)
     def get_files():
         conn = get_db_connection()
         try:
@@ -756,7 +828,13 @@ async def get_client():
     await _client.start(bot_token=BOT_TOKEN); return _client
 
 def verify_key(key: str):
+    if not INTERNAL_API_KEY:
+        return  # No key set, skip verification
     if key != INTERNAL_API_KEY: raise HTTPException(status_code=403)
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 @app.on_event("startup")
 async def on_startup():

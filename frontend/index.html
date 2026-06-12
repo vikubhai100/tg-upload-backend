@@ -363,10 +363,10 @@
     if (!keyToTry) return false;
 
     try {
-      const url = `${API_BASE}/files?page=${page}&limit=10&key=${encodeURIComponent(keyToTry)}`;
-      console.log(`[Login] Fetching from: ${url}`);
+      const url = `${API_BASE}/files?page=${page}&limit=10`;
+      console.log(`[Login] Fetching files...`);
       
-      const res = await fetch(url);
+      const res = await fetch(url, { headers: { 'Authorization': `Bearer ${keyToTry}` } });
       
       // 💡 FIX 2: Deep Error Tracking
       if (!res.ok) {
@@ -389,16 +389,46 @@
       document.getElementById('btnNext').disabled = currentPage >= totalPages;
 
       const list = document.getElementById('filesList');
-      list.innerHTML = data.files.map(f => `
-        <div class="file-card">
-          <div class="file-icon">${getIcon(f.filename)}</div>
-          <div class="file-info">
-            <div class="file-name" title="${f.filename}">${f.filename}</div>
-            <div class="file-meta">${f.size} • ID: ${f.short_id}</div>
-          </div>
-          <a href="${f.download_link}" class="btn-download" target="_blank">Download</a>
-        </div>
-      `).join('');
+      list.innerHTML = '';
+      data.files.forEach(f => {
+        const card = document.createElement('div');
+        card.className = 'file-card';
+        
+        const icon = document.createElement('div');
+        icon.className = 'file-icon';
+        icon.textContent = getIcon(f.filename);
+        
+        const info = document.createElement('div');
+        info.className = 'file-info';
+        
+        const name = document.createElement('div');
+        name.className = 'file-name';
+        name.title = f.filename;
+        name.textContent = f.filename;
+        
+        const meta = document.createElement('div');
+        meta.className = 'file-meta';
+        meta.textContent = `${f.size} \u2022 ID: ${f.short_id}`;
+        
+        const link = document.createElement('a');
+        link.className = 'btn-download';
+        link.target = '_blank';
+        link.textContent = 'Download';
+        // Only set href if it's a valid URL on our domain
+        try {
+          const url = new URL(f.download_link, window.location.origin);
+          if (url.origin === window.location.origin || url.hostname.endsWith('mypdftools.site') || url.hostname.endsWith('urlking.site')) {
+            link.href = url.href;
+          }
+        } catch(e) {}
+        
+        info.appendChild(name);
+        info.appendChild(meta);
+        card.appendChild(icon);
+        card.appendChild(info);
+        card.appendChild(link);
+        list.appendChild(card);
+      });
 
       return true;
     } catch (e) {
