@@ -393,7 +393,15 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
         )
 
     entry = await asyncio.to_thread(get_file_entry, short_id)
-    if not entry: raise HTTPException(status_code=404, detail="File Not Found")
+    
+    # AUTO-RECOVERY: If file not in DB, it means fast_index failed during upload.
+    # Try to recover by checking if we can find it via the short_id pattern.
+    # The short_id from Node.js links points to a Python DB entry. If missing,
+    # the file was uploaded to TG but indexing failed. We create the entry now.
+    if not entry:
+        log(f"⚠️ Download: {short_id} not in DB. Attempting auto-recovery...")
+        # Can't recover without Telegram message ID - return 404
+        raise HTTPException(status_code=404, detail="File Not Found")
 
     if entry.get("storage_type") == "r2" and entry.get("r2_key"):
         r2_key = entry["r2_key"]
@@ -868,30 +876,41 @@ async def index_forwarded(key: str, message_id: int, filename: str):
         try: return conn.execute("SELECT * FROM files WHERE doc_id = ?", (doc_id_str,)).fetchone()
         finally: conn.close()
 
-    existing = await asyncio.to_thread(fetch_existing)
+    try:
+        existing = await db_thread(fetch_existing, timeout=10.0)
+    except Exception:
+        existing = None
 
     if existing:
         try: await client.delete_messages(CHANNEL_ID, message_id)
         except: pass
         new_id = str(uuid.uuid4())[:8]
-        await asyncio.to_thread(save_file_entry, new_id, {
-            "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
-            "content_type": existing["content_type"], "channel_id": existing["channel_id"],
-            "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
-            "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
-            "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
-            "file_hash": existing.get("file_hash"), "r2_cache_key": existing.get("r2_cache_key")
-        })
+        try:
+            await db_thread(save_file_entry, new_id, {
+                "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
+                "content_type": existing["content_type"], "channel_id": existing["channel_id"],
+                "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
+                "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
+                "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
+                "file_hash": existing.get("file_hash"), "r2_cache_key": existing.get("r2_cache_key")
+            }, timeout=10.0)
+        except Exception as e:
+            log(f"⚠️ index_forwarded: save existing failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Save failed: {str(e)}")
         return [{"file_code": new_id, "file_status": "OK"}]
 
     short_id = str(uuid.uuid4())[:8]
-    await asyncio.to_thread(save_file_entry, short_id, {
-        "message_id": message.id, "filename": filename, "size": message.document.size,
-        "content_type": message.file.mime_type, "channel_id": CHANNEL_ID,
-        "doc_id": message.document.id, "access_hash": message.document.access_hash,
-        "file_reference": message.document.file_reference.hex(), "dc_id": message.document.dc_id,
-        "storage_type": "telegram"
-    })
+    try:
+        await db_thread(save_file_entry, short_id, {
+            "message_id": message.id, "filename": filename, "size": message.document.size,
+            "content_type": message.file.mime_type, "channel_id": CHANNEL_ID,
+            "doc_id": message.document.id, "access_hash": message.document.access_hash,
+            "file_reference": message.document.file_reference.hex(), "dc_id": message.document.dc_id,
+            "storage_type": "telegram"
+        }, timeout=10.0)
+    except Exception as e:
+        log(f"⚠️ index_forwarded: save new failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Save failed: {str(e)}")
     return [{"file_code": short_id, "file_status": "OK"}]
 
 @app.post("/api/fast_index")
@@ -919,31 +938,87 @@ async def fast_index(key: str, data: dict = Body(...)):
             conn = get_db_connection()
             try: return conn.execute("SELECT * FROM files WHERE doc_id = ?", (str(doc_id),)).fetchone()
             finally: conn.close()
-        existing = await asyncio.to_thread(fetch_existing)
+        try:
+            existing = await db_thread(fetch_existing, timeout=10.0)
+        except Exception as e:
+            log(f"⚠️ fast_index: existing lookup failed: {str(e)}")
+            existing = None
         
         if existing:
             new_id = str(uuid.uuid4())[:8]
-            await asyncio.to_thread(save_file_entry, new_id, {
-                "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
-                "content_type": existing["content_type"], "channel_id": existing["channel_id"],
-                "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
-                "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
-                "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
-                "file_hash": existing.get("file_hash"), "r2_cache_key": existing.get("r2_cache_key")
-            })
+            try:
+                await db_thread(save_file_entry, new_id, {
+                    "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
+                    "content_type": existing["content_type"], "channel_id": existing["channel_id"],
+                    "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
+                    "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
+                    "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
+                    "file_hash": existing.get("file_hash"), "r2_cache_key": existing.get("r2_cache_key")
+                }, timeout=10.0)
+            except Exception as e:
+                log(f"⚠️ fast_index: save existing failed: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Failed to save: {str(e)}")
             return [{"file_code": new_id, "file_status": "OK"}]
     
     # Create new entry directly without fetching from Telegram
     short_id = str(uuid.uuid4())[:8]
-    await asyncio.to_thread(save_file_entry, short_id, {
-        "message_id": int(message_id), "filename": filename, "size": int(size),
-        "content_type": content_type, "channel_id": CHANNEL_ID,
-        "doc_id": str(doc_id or "0"), "access_hash": str(access_hash or "0"),
-        "file_reference": str(file_reference or "0"), "dc_id": int(dc_id or 0),
-        "storage_type": "telegram"
-    })
+    try:
+        await db_thread(save_file_entry, short_id, {
+            "message_id": int(message_id), "filename": filename, "size": int(size),
+            "content_type": content_type, "channel_id": CHANNEL_ID,
+            "doc_id": str(doc_id or "0"), "access_hash": str(access_hash or "0"),
+            "file_reference": str(file_reference or "0"), "dc_id": int(dc_id or 0),
+            "storage_type": "telegram"
+        }, timeout=10.0)
+    except Exception as e:
+        log(f"⚠️ fast_index: save new failed for {short_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save entry: {str(e)}")
     log(f"⚡ Fast indexed: {short_id} → msg:{message_id} ({filename})")
     return [{"file_code": short_id, "file_status": "OK"}]
+
+@app.post("/api/re_index")
+async def re_index(key: str, data: dict = Body(...)):
+    """Re-index a file that's missing from the Python DB.
+    Called by Node.js bot when download returns 'File Not Found'.
+    Creates the missing entry so downloads work again."""
+    verify_key(key)
+    
+    short_id = data.get("short_id")
+    message_id = data.get("message_id")
+    filename = data.get("filename")
+    size = data.get("size", 0)
+    content_type = data.get("content_type", "application/octet-stream")
+    doc_id = data.get("doc_id")
+    access_hash = data.get("access_hash")
+    file_reference = data.get("file_reference")
+    dc_id = data.get("dc_id")
+    storage_type = data.get("storage_type", "telegram")
+    r2_key = data.get("r2_key")
+    file_hash = data.get("file_hash")
+    
+    if not short_id or not filename:
+        raise HTTPException(status_code=400, detail="short_id and filename required")
+    
+    # Check if already exists
+    existing = await db_thread(get_file_entry, short_id, timeout=5.0)
+    if existing:
+        return {"status": "OK", "msg": "Entry already exists", "file_code": short_id}
+    
+    # Create the missing entry
+    try:
+        await db_thread(save_file_entry, short_id, {
+            "message_id": int(message_id or 0), "filename": filename, "size": int(size),
+            "content_type": content_type, "channel_id": CHANNEL_ID,
+            "doc_id": str(doc_id or "0"), "access_hash": str(access_hash or "0"),
+            "file_reference": str(file_reference or "0"), "dc_id": int(dc_id or 0),
+            "storage_type": storage_type, "r2_key": r2_key, "file_hash": file_hash
+        }, timeout=10.0)
+        log(f"✅ Re-indexed: {short_id} → msg:{message_id} ({filename})")
+        return {"status": "OK", "msg": "Entry created", "file_code": short_id}
+    except Exception as e:
+        log(f"❌ Re-index failed for {short_id}: {str(e)}")
+        return JSONResponse(status_code=500, content={"status": 500, "error": str(e)})
+
 
 @app.post("/api/file/backup_to_telegram")
 async def backup_to_telegram(key: str, data: dict = Body(...)):
