@@ -259,7 +259,7 @@ def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
         url = r2_client.generate_presigned_url('get_object', Params={
             'Bucket': R2_BUCKET_NAME, 'Key': r2_key,
             'ResponseContentDisposition': f"attachment; filename=\"{filename}\""
-        }, ExpiresIn=12)
+        }, ExpiresIn=3600)  # 1 hour instead of 12 seconds — slow connections need time
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
         return RedirectResponse(url=url)
     except Exception: 
@@ -480,23 +480,45 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
     return StreamingResponse(temp_file_streamer(), status_code=206 if range_header else 200, headers=headers)
 
 async def parallel_upload(client, file_path):
+    """Upload file to Telegram using parallel chunked upload for large files.
+    Returns the uploaded file object (InputFileBig or uploaded file).
+    For files < 10MB, uses simple upload_file which is faster.
+    For files >= 10MB, uses SaveBigFilePartRequest with 4 parallel workers.
+    """
     size = os.path.getsize(file_path)
     name = os.path.basename(file_path)
+    
     if size < 10*1024*1024: 
-        return await client.upload_file(file_path)
+        # Small files: use simple upload - no need for chunked upload
+        uploaded = await client.upload_file(file_path)
+        return uploaded
 
+    # Large files: parallel chunked upload for speed
+    CHUNK_SIZE = 512 * 1024  # 512KB per chunk (Telegram requirement for big files)
     f_id = int.from_bytes(os.urandom(8), "big", signed=True)
-    parts = math.ceil(size / (512*1024))
-    sem = asyncio.Semaphore(4) 
+    parts = math.ceil(size / CHUNK_SIZE)
+    sem = asyncio.Semaphore(4)  # 4 parallel upload workers
+    upload_errors = []
 
     async def up_part(idx):
         async with sem:
+            offset = idx * CHUNK_SIZE
+            read_size = min(CHUNK_SIZE, size - offset)
             async with aiofiles.open(file_path, 'rb') as f:
-                await f.seek(idx * 512*1024)
-                chunk = await f.read(512*1024)
-            await client(SaveBigFilePartRequest(f_id, idx, parts, chunk))
+                await f.seek(offset)
+                chunk = await f.read(read_size)
+            try:
+                await client(SaveBigFilePartRequest(f_id, idx, parts, chunk))
+            except Exception as e:
+                upload_errors.append(f"Part {idx}: {str(e)}")
+                log(f"⚠️ Upload part {idx}/{parts} failed: {str(e)}")
+                raise
 
-    await asyncio.gather(*[up_part(i) for i in range(parts)])
+    await asyncio.gather(*[up_part(i) for i in range(parts)], return_exceptions=False)
+    
+    if upload_errors:
+        log(f"⚠️ Upload completed with {len(upload_errors)} errors for {name}")
+    
     return InputFileBig(id=f_id, parts=parts, name=name)
 
 @app.post("/api/upload")
@@ -545,8 +567,13 @@ async def api_upload(request: Request):
         client = await get_client()
         file_size = os.path.getsize(tmp_path)
 
-        if file_size < 10 * 1024 * 1024: msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
-        else: msg = await client.send_file(CHANNEL_ID, await parallel_upload(client, tmp_path), force_document=True)
+        if file_size < 10 * 1024 * 1024:
+            # Small files: direct send_file with file path
+            msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
+        else:
+            # Large files: parallel upload first, then send with InputFileBig
+            uploaded_file = await parallel_upload(client, tmp_path)
+            msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
 
         short_id = str(uuid.uuid4())[:8]
         await asyncio.to_thread(save_file_entry, short_id, {
@@ -556,9 +583,14 @@ async def api_upload(request: Request):
             "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id,
             "file_hash": file_hash, "storage_type": "telegram"
         })
-        os.unlink(tmp_path)
+        # Clean up temp file safely
+        try: os.unlink(tmp_path)
+        except: pass
         return JSONResponse(content=[{"file_code": short_id, "file_status": "OK"}])
     except Exception as e:
+        # Clean up temp file on error too
+        try: os.unlink(tmp_path)
+        except: pass
         return JSONResponse(status_code=500, content=[{"error": str(e)}])
 
 @app.post("/api/remote_upload")
@@ -568,13 +600,35 @@ async def remote_upload(request: Request):
         verify_key(data.get("key"))
         url = data.get("url")
         filename = data.get("filename", f"file_{int(time.time())}.bin")
-        tmp_path = f"/tmp/{uuid.uuid4()}"
+        tmp_path = f"/tmp/remote_{uuid.uuid4().hex[:8]}"
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as r:
-                async with aiofiles.open(tmp_path, 'wb') as f:
-                    async for chunk in r.content.iter_chunked(5*1024*1024): 
-                        await f.write(chunk)
+        # Download remote file with timeout and retry logic
+        download_timeout = aiohttp.ClientTimeout(total=1800, connect=30, sock_read=120)  # 30min total, 30s connect, 2min per read
+        last_err = None
+        for attempt in range(3):
+            try:
+                async with aiohttp.ClientSession(timeout=download_timeout) as session:
+                    async with session.get(url, allow_redirects=True, ssl=False) as r:
+                        if r.status != 200:
+                            raise Exception(f"Remote server returned HTTP {r.status}")
+                        async with aiofiles.open(tmp_path, 'wb') as f:
+                            async for chunk in r.content.iter_chunked(5*1024*1024): 
+                                await f.write(chunk)
+                last_err = None
+                break
+            except Exception as dl_err:
+                last_err = dl_err
+                log(f"⚠️ Remote download attempt {attempt+1}/3 failed: {str(dl_err)}")
+                if attempt < 2:
+                    await asyncio.sleep(3 * (attempt + 1))
+                    # Partial file cleanup before retry
+                    try: os.unlink(tmp_path)
+                    except: pass
+        
+        if last_err:
+            try: os.unlink(tmp_path)
+            except: pass
+            return {"error": f"Remote download failed after 3 attempts: {str(last_err)}"}
 
         file_hash = await asyncio.to_thread(calculate_hash, tmp_path)
         
@@ -599,19 +653,40 @@ async def remote_upload(request: Request):
             return [{"file_code": new_short_id, "file_status": "OK"}]
 
         client = await get_client()
-        msg = await client.send_file(CHANNEL_ID, await parallel_upload(client, tmp_path), force_document=True)
+        actual_size = os.path.getsize(tmp_path)
+        
+        # Detect content type from filename extension
+        import mimetypes
+        detected_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        
+        if actual_size < 10 * 1024 * 1024:
+            # Small files: direct send_file - fast, no chunked upload needed
+            msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
+        else:
+            # Large files: parallel chunked upload, then send
+            uploaded_file = await parallel_upload(client, tmp_path)
+            msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
+
         short_id = str(uuid.uuid4())[:8]
 
         await asyncio.to_thread(save_file_entry, short_id, {
-            "message_id": msg.id, "filename": filename, "size": os.path.getsize(tmp_path),
-            "content_type": "application/octet-stream", "channel_id": CHANNEL_ID,
+            "message_id": msg.id, "filename": filename, "size": actual_size,
+            "content_type": detected_type, "channel_id": CHANNEL_ID,
             "doc_id": msg.document.id, "access_hash": msg.document.access_hash,
             "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id,
             "file_hash": file_hash
         })
-        os.unlink(tmp_path)
+        
+        # Clean up temp file safely
+        try: os.unlink(tmp_path)
+        except: pass
+        
         return [{"file_code": short_id, "file_status": "OK"}]
-    except Exception as e: return {"error": str(e)}
+    except Exception as e:
+        # Clean up temp file on error too
+        try: os.unlink(tmp_path)
+        except: pass
+        return {"error": str(e)}
 
 # ============================================================
 # 🎯 API ENDPOINTS FIXED (HTTP 500 CRASH RESOLVED)
@@ -765,6 +840,57 @@ async def index_forwarded(key: str, message_id: int, filename: str):
     })
     return [{"file_code": short_id, "file_status": "OK"}]
 
+@app.post("/api/fast_index")
+async def fast_index(key: str, data: dict = Body(...)):
+    """Fast indexing endpoint that accepts file metadata directly from client.
+    No Telegram API call needed - saves 5-30 seconds compared to index_forwarded.
+    This fixes the '100% upload ke baad late ID' issue."""
+    verify_key(key)
+    
+    message_id = data.get("message_id")
+    filename = data.get("filename")
+    size = data.get("size", 0)
+    content_type = data.get("content_type", "application/octet-stream")
+    doc_id = data.get("doc_id")
+    access_hash = data.get("access_hash")
+    file_reference = data.get("file_reference")
+    dc_id = data.get("dc_id")
+    
+    if not message_id or not filename:
+        raise HTTPException(status_code=400, detail="message_id and filename required")
+    
+    # Check for existing file by doc_id
+    if doc_id:
+        def fetch_existing():
+            conn = get_db_connection()
+            try: return conn.execute("SELECT * FROM files WHERE doc_id = ?", (str(doc_id),)).fetchone()
+            finally: conn.close()
+        existing = await asyncio.to_thread(fetch_existing)
+        
+        if existing:
+            new_id = str(uuid.uuid4())[:8]
+            await asyncio.to_thread(save_file_entry, new_id, {
+                "message_id": existing["message_id"], "filename": filename, "size": existing["size"],
+                "content_type": existing["content_type"], "channel_id": existing["channel_id"],
+                "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
+                "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
+                "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
+                "file_hash": existing.get("file_hash"), "r2_cache_key": existing.get("r2_cache_key")
+            })
+            return [{"file_code": new_id, "file_status": "OK"}]
+    
+    # Create new entry directly without fetching from Telegram
+    short_id = str(uuid.uuid4())[:8]
+    await asyncio.to_thread(save_file_entry, short_id, {
+        "message_id": int(message_id), "filename": filename, "size": int(size),
+        "content_type": content_type, "channel_id": CHANNEL_ID,
+        "doc_id": str(doc_id or "0"), "access_hash": str(access_hash or "0"),
+        "file_reference": str(file_reference or "0"), "dc_id": int(dc_id or 0),
+        "storage_type": "telegram"
+    })
+    log(f"⚡ Fast indexed: {short_id} → msg:{message_id} ({filename})")
+    return [{"file_code": short_id, "file_status": "OK"}]
+
 @app.post("/api/file/backup_to_telegram")
 async def backup_to_telegram(key: str, data: dict = Body(...)):
     verify_key(key)
@@ -861,11 +987,15 @@ async def list_files(key: str, page: int = 1, limit: int = 10):
     }
 
 _client = None
+_client_lock = asyncio.Lock()
+
 async def get_client():
     global _client
-    if _client and _client.is_connected(): return _client
-    _client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
-    await _client.start(bot_token=BOT_TOKEN); return _client
+    async with _client_lock:
+        if _client and _client.is_connected(): return _client
+        _client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+        await _client.start(bot_token=BOT_TOKEN)
+        return _client
 
 def verify_key(key: str):
     if key != INTERNAL_API_KEY: raise HTTPException(status_code=403)
