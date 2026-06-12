@@ -12,6 +12,7 @@ import aiohttp
 import hashlib
 import hmac      
 import aiofiles
+import concurrent.futures
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -71,6 +72,22 @@ def check_r2_file_exists(key):
         return False
 
 app = FastAPI(title="URLKING Hybrid Storage")
+
+# Separate thread pools — lightweight DB ops won't get stuck behind heavy uploads
+_light_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="light_db")
+_heavy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="heavy_io")
+
+async def db_thread(fn, *args, timeout=10.0):
+    """Run lightweight DB function in dedicated pool with timeout protection.
+    Prevents clone/rename from getting stuck when heavy uploads fill the default pool."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(_light_executor, fn, *args),
+            timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        log(f"DB operation timed out: {fn.__name__}")
+        raise HTTPException(status_code=504, detail="Database operation timed out")
 
 app.add_middleware(
     CORSMiddleware,
@@ -743,17 +760,44 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
 @app.get("/api/file/clone")
 async def file_clone(key: str, file_code: str):
     verify_key(key)
-    entry = await asyncio.to_thread(get_file_entry, file_code)
-    if not entry: return JSONResponse(status_code=404, content={"status": 404, "error": "File not found"})
+    if not file_code or not file_code.strip():
+        return JSONResponse(status_code=400, content={"status": 400, "error": "Missing file_code"})
+    
+    try:
+        # Use lightweight executor with timeout — won't get stuck behind heavy uploads
+        entry = await db_thread(get_file_entry, file_code, timeout=10.0)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log(f"Clone DB lookup failed for {file_code}: {str(e)}")
+        return JSONResponse(status_code=500, content={"status": 500, "error": f"Database error: {str(e)}"})
+    
+    if not entry:
+        return JSONResponse(status_code=404, content={"status": 404, "error": "File not found"})
     
     new_id = str(uuid.uuid4())[:8]
-    await asyncio.to_thread(save_file_entry, new_id, entry)
+    
+    try:
+        # Clean entry: remove old short_id so it doesn't interfere with new one
+        clean_entry = {k: v for k, v in entry.items() if k != "short_id"}
+        await db_thread(save_file_entry, new_id, clean_entry, timeout=10.0)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log(f"Clone save failed for new_id={new_id}: {str(e)}")
+        return JSONResponse(status_code=500, content={"status": 500, "error": f"Failed to save clone: {str(e)}"})
+    
+    log(f"Clone OK: {file_code} -> {new_id}")
     return {"status": 200, "result": {"filecode": new_id}}
 
 @app.get("/api/file/delete")
 async def file_delete(key: str, file_code: str):
     verify_key(key)
-    entry = await asyncio.to_thread(get_file_entry, file_code)
+    try:
+        entry = await db_thread(get_file_entry, file_code, timeout=10.0)
+    except Exception as e:
+        log(f"Delete lookup failed for {file_code}: {str(e)}")
+        return {"status": 500, "error": str(e)}
     if entry:
         def run_delete():
             conn = get_db_connection()
@@ -790,14 +834,24 @@ async def file_rename(key: str, file_code: str, name: str):
         finally:
             conn.close()
             
-    changed = await asyncio.to_thread(run_rename)
+    try:
+        changed = await db_thread(run_rename, timeout=10.0)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log(f"Rename failed for {file_code}: {str(e)}")
+        return JSONResponse(status_code=500, content={"status": 500, "error": f"Rename failed: {str(e)}"})
+        
     if changed == 0: return JSONResponse(status_code=404, content={"status": 404, "msg": "File not found"})
     return {"status": 200, "msg": "OK", "new_name": safe_name}
 
 @app.get("/api/file/info")
 async def file_info(key: str, file_code: str):
     verify_key(key)
-    entry = await asyncio.to_thread(get_file_entry, file_code)
+    try:
+        entry = await db_thread(get_file_entry, file_code, timeout=10.0)
+    except Exception:
+        return {"result": []}
     if entry: return {"result": [{"name": entry["filename"], "size": entry["size"], "storage": entry.get("storage_type", "telegram")}]}
     return {"result": []}
 
