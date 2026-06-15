@@ -60,6 +60,11 @@ def format_size(size_bytes):
         size_bytes /= 1024.0
     return f"{size_bytes:.1f} TB"
 
+def safeFile(name):
+    """Sanitize filename for safe matching — mirrors Node.js safeFile()"""
+    import re
+    return re.sub(r'[<>:"/\\|?*\x00-\x1F]', '_', (name or 'file')).strip() or 'file'
+
 def get_client_ip(request: Request):
     fwd = request.headers.get("X-Forwarded-For")
     return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "Unknown")
@@ -465,22 +470,25 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                 if cs == 'exists':
                     healed_key = candidate
         
-        # Strategy 2: Search R2 by filename
+        # Strategy 2: Search ALL R2 objects for filename match
         if not healed_key and filename:
             def search_r2():
                 try:
-                    resp = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, MaxKeys=100)
-                    if 'Contents' in resp:
-                        for obj in resp['Contents']:
-                            k = obj['Key']
-                            if k.startswith('cache_') or k == r2_key:
-                                continue
-                            if filename in k:
-                                try:
-                                    r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=k)
-                                    return k
-                                except:
-                                    pass
+                    # Paginate through ALL R2 objects to find match
+                    paginator = r2_client.get_paginator('list_objects_v2')
+                    for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
+                        if 'Contents' in page:
+                            for obj in page['Contents']:
+                                k = obj['Key']
+                                if k.startswith('cache_') or k == r2_key:
+                                    continue
+                                # Match by filename appearing in key
+                                if filename in k or k.endswith(safeFile(filename)):
+                                    try:
+                                        r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=k)
+                                        return k
+                                    except:
+                                        pass
                     return None
                 except:
                     return None
@@ -488,12 +496,39 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
             if found:
                 healed_key = found
         
+        # Strategy 3: Search R2 by file hash prefix (R2 keys contain hash-like patterns)
+        if not healed_key and file_hash:
+            def search_r2_by_hash():
+                try:
+                    paginator = r2_client.get_paginator('list_objects_v2')
+                    for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
+                        if 'Contents' in page:
+                            for obj in page['Contents']:
+                                k = obj['Key']
+                                if k.startswith('cache_') or k == r2_key:
+                                    continue
+                                # Check if key starts with hash-like prefix
+                                if file_hash[:8] in k:
+                                    try:
+                                        r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=k)
+                                        return k
+                                    except:
+                                        pass
+                    return None
+                except:
+                    return None
+            found = await asyncio.to_thread(search_r2_by_hash)
+            if found:
+                healed_key = found
+        
         if healed_key:
-            # Heal the DB entry — update r2_key to working one
+            # Heal the DB entry AND all other entries with the same dead key
             def heal_db():
                 c = get_db_connection()
                 try:
                     c.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (healed_key, short_id))
+                    # Also fix other entries pointing to the same dead key
+                    c.execute("UPDATE files SET r2_key = ? WHERE r2_key = ? AND storage_type = 'r2'", (healed_key, r2_key))
                     c.commit()
                 finally:
                     c.close()
@@ -514,6 +549,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
             entry["message_id"] = int(backup_msg_id)
             log(f"R2 missing, falling back to Telegram backup for: {short_id}")
         else:
+            log(f"FILE DELETED: {short_id} — no R2 key, no Telegram backup, no healing possible")
             return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#991b1b;'><h2>File Deleted</h2></div>", status_code=404)
 
     if entry.get("r2_cache_key"):
@@ -689,13 +725,30 @@ async def api_upload(request: Request):
         client = await get_client()
         file_size = os.path.getsize(tmp_path)
 
-        if file_size < 10 * 1024 * 1024:
-            # Small files: direct send_file with file path
-            msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
-        else:
-            # Large files: parallel upload first, then send with InputFileBig
-            uploaded_file = await parallel_upload(client, tmp_path)
-            msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
+        try:
+            if file_size < 10 * 1024 * 1024:
+                # Small files: direct send_file with file path
+                msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
+            else:
+                # Large files: parallel upload first, then send with InputFileBig
+                uploaded_file = await parallel_upload(client, tmp_path)
+                msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
+        except Exception as send_err:
+            log(f"Telegram send_file failed for {filename}: {str(send_err)}")
+            # Try reconnecting once and retrying
+            global _client
+            async with _client_lock:
+                try:
+                    if _client: await _client.disconnect()
+                except: pass
+                _client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+                await _client.start(bot_token=BOT_TOKEN)
+                client = _client
+            if file_size < 10 * 1024 * 1024:
+                msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
+            else:
+                uploaded_file = await parallel_upload(client, tmp_path)
+                msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
 
         short_id = str(uuid.uuid4())[:8]
         await asyncio.to_thread(save_file_entry, short_id, {
@@ -708,11 +761,13 @@ async def api_upload(request: Request):
         # Clean up temp file safely
         try: os.unlink(tmp_path)
         except: pass
+        log(f"upload OK: {short_id} → msg:{msg.id} ({filename} {format_size(file_size)})")
         return JSONResponse(content=[{"file_code": short_id, "file_status": "OK"}])
     except Exception as e:
         # Clean up temp file on error too
         try: os.unlink(tmp_path)
         except: pass
+        log(f"upload FAILED: {str(e)}")
         return JSONResponse(status_code=500, content=[{"error": str(e)}])
 
 @app.post("/api/remote_upload")
@@ -781,13 +836,27 @@ async def remote_upload(request: Request):
         import mimetypes
         detected_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         
-        if actual_size < 10 * 1024 * 1024:
-            # Small files: direct send_file - fast, no chunked upload needed
-            msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
-        else:
-            # Large files: parallel chunked upload, then send
-            uploaded_file = await parallel_upload(client, tmp_path)
-            msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
+        try:
+            if actual_size < 10 * 1024 * 1024:
+                msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
+            else:
+                uploaded_file = await parallel_upload(client, tmp_path)
+                msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
+        except Exception as send_err:
+            log(f"remote_upload: TG send failed, reconnecting: {str(send_err)}")
+            global _client
+            async with _client_lock:
+                try:
+                    if _client: await _client.disconnect()
+                except: pass
+                _client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+                await _client.start(bot_token=BOT_TOKEN)
+                client = _client
+            if actual_size < 10 * 1024 * 1024:
+                msg = await client.send_file(CHANNEL_ID, tmp_path, force_document=True)
+            else:
+                uploaded_file = await parallel_upload(client, tmp_path)
+                msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
 
         short_id = str(uuid.uuid4())[:8]
 
@@ -802,12 +871,14 @@ async def remote_upload(request: Request):
         # Clean up temp file safely
         try: os.unlink(tmp_path)
         except: pass
+        log(f"remote_upload OK: {short_id} → msg:{msg.id} ({filename} {format_size(actual_size)})")
         
         return [{"file_code": short_id, "file_status": "OK"}]
     except Exception as e:
         # Clean up temp file on error too
         try: os.unlink(tmp_path)
         except: pass
+        log(f"remote_upload FAILED: {str(e)}")
         return {"error": str(e)}
 
 # ============================================================
@@ -824,6 +895,14 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
 
     if not new_r2_key:
         raise HTTPException(status_code=400, detail="Missing r2_key")
+
+    # ALWAYS verify the new upload actually exists in R2 before proceeding
+    new_status = await asyncio.to_thread(check_r2_file_exists, new_r2_key)
+    if new_status == 'not_found':
+        log(f"register_r2: CRITICAL — new key {new_r2_key} doesn't exist in R2! Upload may have failed.")
+        # Don't fail — still save, download flow will try self-heal
+    elif new_status == 'exists':
+        log(f"register_r2: new key {new_r2_key} verified in R2")
 
     def check_existing_db():
         conn = get_db_connection()
@@ -842,12 +921,20 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
 
     if existing:
         master_r2_key = existing["r2_key"]
-        # CRITICAL FIX: Verify master_r2_key actually exists in R2 before using it.
-        # If the old deduplication bug deleted it, using a dead key would make
-        # this new entry also show "File Deleted" at download time.
+        
+        # If master is the same as new key, just save — nothing to dedup
+        if master_r2_key == new_r2_key:
+            await asyncio.to_thread(save_file_entry, data["short_id"], {
+                "filename": filename, "size": size, "storage_type": "r2",
+                "r2_key": new_r2_key, "content_type": "application/octet-stream",
+                "file_hash": file_hash
+            })
+            return {"status": "OK", "msg": "Same key, saved directly"}
+        
+        # Verify master_r2_key actually exists in R2 before trusting it
         master_status = await asyncio.to_thread(check_r2_file_exists, master_r2_key)
         
-        if master_status == 'exists' and master_r2_key != new_r2_key:
+        if master_status == 'exists':
             # Master exists and is different — use it, delete the new redundant upload
             await asyncio.to_thread(save_file_entry, data["short_id"], {
                 "filename": filename, "size": size, "storage_type": "r2",
@@ -862,16 +949,28 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
             log(f"register_r2: duplicate handled, using existing master key {master_r2_key}")
             return {"status": "OK", "msg": "Duplicate handled instantly"}
         
-        elif master_status != 'exists':
-            # Master key is dead (deleted by old bug) — use the NEW key instead
+        else:
+            # Master key is dead or error — DON'T delete the new upload!
+            # Also fix ALL other entries that were pointing to the dead master
             log(f"register_r2: master key {master_r2_key} is dead ({master_status}), using new key {new_r2_key}")
-            # Fall through to save with new key below
+            
+            def fix_dead_master():
+                conn = get_db_connection()
+                try:
+                    # Point ALL entries with the dead master to the new working key
+                    conn.execute("UPDATE files SET r2_key = ? WHERE r2_key = ? AND storage_type = 'r2'", (new_r2_key, master_r2_key))
+                    conn.commit()
+                finally:
+                    conn.close()
+            await asyncio.to_thread(fix_dead_master)
 
+    # Save with the new (verified) key
     await asyncio.to_thread(save_file_entry, data["short_id"], {
         "filename": filename, "size": size, "storage_type": "r2",
         "r2_key": new_r2_key, "content_type": "application/octet-stream",
         "file_hash": file_hash
     })
+    log(f"register_r2: saved {data['short_id']} → {new_r2_key}")
     return {"status": "OK"}
 
 @app.get("/api/file/clone")
