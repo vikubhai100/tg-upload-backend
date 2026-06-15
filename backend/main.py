@@ -443,20 +443,76 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                 pass  # Fall through to Telegram backup check
         
         # r2_status == 'not_found' or redirect retry also failed
+        # SELF-HEALING: Try to find the file in R2 before giving up
+        log(f"R2 key dead for {short_id}, attempting self-heal...")
+        
+        healed_key = None
+        filename = entry.get("filename", "")
+        file_hash = entry.get("file_hash")
+        
+        # Strategy 1: Find by file_hash in DB
+        if file_hash:
+            def find_by_hash():
+                c = get_db_connection()
+                try:
+                    r = c.execute("SELECT r2_key FROM files WHERE file_hash = ? AND r2_key IS NOT NULL AND short_id != ?", (file_hash, short_id)).fetchone()
+                    return r["r2_key"] if r else None
+                finally:
+                    c.close()
+            candidate = await asyncio.to_thread(find_by_hash)
+            if candidate:
+                cs = await asyncio.to_thread(check_r2_file_exists, candidate)
+                if cs == 'exists':
+                    healed_key = candidate
+        
+        # Strategy 2: Search R2 by filename
+        if not healed_key and filename:
+            def search_r2():
+                try:
+                    resp = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, MaxKeys=100)
+                    if 'Contents' in resp:
+                        for obj in resp['Contents']:
+                            k = obj['Key']
+                            if k.startswith('cache_') or k == r2_key:
+                                continue
+                            if filename in k:
+                                try:
+                                    r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=k)
+                                    return k
+                                except:
+                                    pass
+                    return None
+                except:
+                    return None
+            found = await asyncio.to_thread(search_r2)
+            if found:
+                healed_key = found
+        
+        if healed_key:
+            # Heal the DB entry — update r2_key to working one
+            def heal_db():
+                c = get_db_connection()
+                try:
+                    c.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (healed_key, short_id))
+                    c.commit()
+                finally:
+                    c.close()
+            await asyncio.to_thread(heal_db)
+            log(f"SELF-HEALED {short_id}: {r2_key} → {healed_key}")
+            return redirect_to_r2(healed_key, entry["filename"], client_ip, "HEALED")
+        
+        # No healing possible — check Telegram backup
         backup_msg_id = entry.get("tg_backup_msg_id") or entry.get("message_id")
         if backup_msg_id and int(backup_msg_id) > 0:
-            # Update DB: mark as telegram since R2 is gone
             def fallback_db_fix():
                 conn = get_db_connection()
                 conn.execute("UPDATE files SET r2_key = NULL, storage_type = 'telegram' WHERE short_id = ?", (short_id,))
                 conn.commit(); conn.close()
             await asyncio.to_thread(fallback_db_fix)
-            # Update entry for streaming below
             entry["storage_type"] = "telegram"
             entry["r2_key"] = None
             entry["message_id"] = int(backup_msg_id)
             log(f"R2 missing, falling back to Telegram backup for: {short_id}")
-            # Continue below to stream from Telegram + restore to R2 in background
         else:
             return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#991b1b;'><h2>File Deleted</h2></div>", status_code=404)
 
@@ -1172,208 +1228,140 @@ async def list_files(key: str, page: int = 1, limit: int = 10):
 # ============================================================
 # 🔧 REPAIR R2 ENTRIES — Fix broken links caused by old dedup bug
 # ============================================================
-@app.post("/api/repair_r2")
-async def repair_r2(key: str):
-    """Scan all R2 entries in DB, verify each one exists in R2.
-    If a master key is dead but the file exists in R2 under a different key,
-    update the DB entry. Also scans R2 bucket for orphaned objects and
-    creates DB entries for them if they match a known file_hash.
+def _repair_r2_sync():
+    """Synchronous R2 repair — runs in thread pool.
+    Scans DB entries, checks R2, fixes dead keys.
+    Returns result dict."""
+    conn = get_db_connection()
+    entries = conn.execute("SELECT short_id, r2_key, filename, size, file_hash, storage_type, message_id, tg_backup_msg_id FROM files WHERE storage_type = 'r2' AND r2_key IS NOT NULL").fetchall()
+    conn.close()
     
-    This recovers old links that were broken by the deduplication bug."""
-    verify_key(key)
-    
-    def get_all_r2_entries():
-        conn = get_db_connection()
-        try:
-            return conn.execute("SELECT short_id, r2_key, filename, size, file_hash, storage_type, message_id FROM files WHERE storage_type = 'r2' AND r2_key IS NOT NULL").fetchall()
-        finally:
-            conn.close()
-    
-    entries = await asyncio.to_thread(get_all_r2_entries)
-    fixed = 0
-    broken = 0
-    ok = 0
+    ok = 0; broken = 0; fixed = 0; unfixed = 0
     
     for entry in entries:
-        r2_key = entry["r2_key"]
-        status = await asyncio.to_thread(check_r2_file_exists, r2_key)
-        
-        if status == 'exists':
-            ok += 1
-        else:
-            broken += 1
+        try:
+            r2_key = entry["r2_key"]
             short_id = entry["short_id"]
-            log(f"repair_r2: {short_id} has dead r2_key={r2_key} (status={status})")
             
-            # Try to find the file in R2 by listing objects that match the filename
-            filename = entry["filename"]
+            # Check if R2 object exists
+            try:
+                r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=r2_key)
+                ok += 1
+                continue
+            except Exception as e:
+                err_str = str(e).lower()
+                if '404' not in err_str and 'nosuchkey' not in err_str:
+                    # Transient error — don't count as broken
+                    ok += 1
+                    continue
+            
+            broken += 1
+            
+            # --- FIX STRATEGY 1: Find working key from same hash ---
             file_hash = entry["file_hash"]
+            fixed_key = None
             
-            # First try: find another DB entry with same hash that has a working r2_key
-            def find_working_r2_key():
-                conn = get_db_connection()
+            if file_hash:
+                c2 = get_db_connection()
                 try:
-                    if file_hash:
-                        working = conn.execute("SELECT r2_key FROM files WHERE file_hash = ? AND r2_key IS NOT NULL AND short_id != ? LIMIT 1", (file_hash, short_id)).fetchone()
-                        if working:
-                            return working["r2_key"]
+                    row = c2.execute("SELECT r2_key FROM files WHERE file_hash = ? AND r2_key IS NOT NULL AND short_id != ?", (file_hash, short_id)).fetchone()
+                    if row:
+                        candidate = row["r2_key"]
+                        try:
+                            r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=candidate)
+                            fixed_key = candidate
+                        except:
+                            pass
                 finally:
-                    conn.close()
-                return None
+                    c2.close()
             
-            working_key = await asyncio.to_thread(find_working_r2_key)
-            
-            if working_key and working_key != r2_key:
-                wk_status = await asyncio.to_thread(check_r2_file_exists, working_key)
-                if wk_status == 'exists':
-                    # Found a working key — update this entry
-                    def fix_entry():
-                        conn = get_db_connection()
-                        try:
-                            conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (working_key, short_id))
-                            conn.commit()
-                        finally:
-                            conn.close()
-                    await asyncio.to_thread(fix_entry)
-                    fixed += 1
-                    log(f"repair_r2: FIXED {short_id} → {working_key}")
-                    continue
-            
-            # Second try: list R2 objects matching the filename pattern
-            # The r2_key format is usually: {code}_{filename}
-            def search_r2_by_filename():
+            if fixed_key:
+                c3 = get_db_connection()
                 try:
-                    # Search for objects containing the filename
-                    response = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, MaxKeys=50)
-                    if 'Contents' in response:
-                        for obj in response['Contents']:
-                            obj_key = obj['Key']
-                            # Skip cache keys
-                            if obj_key.startswith('cache_'):
-                                continue
-                            # Check if filename matches
-                            if filename and filename in obj_key:
-                                # Verify this isn't the same dead key
-                                if obj_key != r2_key:
-                                    return obj_key
-                    return None
-                except:
-                    return None
-            
-            found_key = await asyncio.to_thread(search_r2_by_filename)
-            if found_key:
-                found_status = await asyncio.to_thread(check_r2_file_exists, found_key)
-                if found_status == 'exists':
-                    def fix_entry2():
-                        conn = get_db_connection()
-                        try:
-                            conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (found_key, short_id))
-                            conn.commit()
-                        finally:
-                            conn.close()
-                    await asyncio.to_thread(fix_entry2)
-                    fixed += 1
-                    log(f"repair_r2: FIXED {short_id} via R2 scan → {found_key}")
-                    continue
-            
-            # Third try: check if Telegram backup exists
-            backup_msg_id = entry.get("tg_backup_msg_id") or entry.get("message_id")
-            if backup_msg_id and int(backup_msg_id) > 0:
-                def fallback_to_tg():
-                    conn = get_db_connection()
-                    try:
-                        conn.execute("UPDATE files SET r2_key = NULL, storage_type = 'telegram' WHERE short_id = ?", (short_id,))
-                        conn.commit()
-                    finally:
-                        conn.close()
-                await asyncio.to_thread(fallback_to_tg)
+                    c3.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (fixed_key, short_id))
+                    c3.commit()
+                finally:
+                    c3.close()
                 fixed += 1
-                log(f"repair_r2: FIXED {short_id} → fallback to Telegram msg:{backup_msg_id}")
-    
-    # Also scan R2 for orphaned objects (files in R2 with no DB entry)
-    def list_r2_objects():
-        try:
-            all_keys = []
-            paginator = r2_client.get_paginator('list_objects_v2')
-            for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
-                if 'Contents' in page:
-                    for obj in page['Contents']:
-                        key = obj['Key']
-                        if not key.startswith('cache_'):  # Skip cache objects
-                            all_keys.append({'key': key, 'size': obj['Size'], 'last_modified': str(obj['LastModified'])})
-            return all_keys
-        except Exception as e:
-            log(f"repair_r2: R2 list error: {str(e)}")
-            return []
-    
-    def get_all_db_r2_keys():
-        conn = get_db_connection()
-        try:
-            rows = conn.execute("SELECT DISTINCT r2_key FROM files WHERE r2_key IS NOT NULL").fetchall()
-            return {r["r2_key"] for r in rows}
-        finally:
-            conn.close()
-    
-    r2_objects = await asyncio.to_thread(list_r2_objects)
-    db_r2_keys = await asyncio.to_thread(get_all_db_r2_keys)
-    
-    orphans = []
-    for obj in r2_objects:
-        if obj['key'] not in db_r2_keys:
-            orphans.append(obj)
-    
-    # Create DB entries for orphans so they can be downloaded
-    orphan_fixed = 0
-    for obj in orphans:
-        key = obj['key']
-        # Extract filename from key (format: {code}_{filename})
-        parts = key.split('_', 1)
-        filename = parts[1] if len(parts) > 1 else key
-        short_id = str(uuid.uuid4())[:8]
-        try:
-            def save_orphan():
-                conn = get_db_connection()
+                log(f"repair: {short_id} fixed via hash → {fixed_key}")
+                continue
+            
+            # --- FIX STRATEGY 2: Search R2 for filename match ---
+            filename = entry["filename"]
+            if filename:
                 try:
-                    conn.execute('''REPLACE INTO files (short_id, message_id, filename, size, content_type, channel_id, doc_id, access_hash, file_reference, dc_id, storage_type, r2_key, last_accessed, r2_cache_key, file_hash, tg_backup_msg_id)
-                        VALUES (?, 0, ?, ?, 'application/octet-stream', 0, '0', '0', '0', 0, 'r2', ?, ?, NULL, NULL, 0)''',
-                        (short_id, filename, obj.get('size', 0), key, int(time.time())))
-                    conn.commit()
+                    resp = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, MaxKeys=100)
+                    if 'Contents' in resp:
+                        for obj in resp['Contents']:
+                            k = obj['Key']
+                            if k.startswith('cache_') or k == r2_key:
+                                continue
+                            if filename in k:
+                                try:
+                                    r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=k)
+                                    fixed_key = k
+                                    break
+                                except:
+                                    pass
+                except Exception as e:
+                    log(f"repair: R2 list failed: {str(e)[:100]}")
+            
+            if fixed_key:
+                c4 = get_db_connection()
+                try:
+                    c4.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (fixed_key, short_id))
+                    c4.commit()
                 finally:
-                    conn.close()
-            await asyncio.to_thread(save_orphan)
-            orphan_fixed += 1
-            log(f"repair_r2: Recovered orphan R2 object {key} → {short_id}")
+                    c4.close()
+                fixed += 1
+                log(f"repair: {short_id} fixed via R2 search → {fixed_key}")
+                continue
+            
+            # --- FIX STRATEGY 3: Fallback to Telegram ---
+            backup_msg_id = entry.get("tg_backup_msg_id") or entry.get("message_id")
+            if backup_msg_id and int(backup_msg_id or 0) > 0:
+                c5 = get_db_connection()
+                try:
+                    c5.execute("UPDATE files SET r2_key = NULL, storage_type = 'telegram' WHERE short_id = ?", (short_id,))
+                    c5.commit()
+                finally:
+                    c5.close()
+                fixed += 1
+                log(f"repair: {short_id} fallback to Telegram msg:{backup_msg_id}")
+                continue
+            
+            unfixed += 1
+            log(f"repair: {short_id} UNFIXED — no recovery possible")
+        
         except Exception as e:
-            log(f"repair_r2: Failed to save orphan {key}: {str(e)}")
+            log(f"repair: error processing {entry['short_id']}: {str(e)[:100]}")
+            unfixed += 1
     
-    result = {
-        "status": "OK",
-        "scanned": len(entries),
-        "ok": ok,
-        "broken": broken,
-        "fixed": fixed,
-        "orphan_r2_objects": len(orphans),
-        "orphans_recovered": orphan_fixed
-    }
-    log(f"repair_r2 complete: {result}")
-    return result
+    return {"scanned": len(entries), "ok": ok, "broken": broken, "fixed": fixed, "unfixed": unfixed}
 
 
-@app.get("/api/repair_status")
-async def repair_status(key: str):
-    """Quick check: how many R2 entries have dead keys?"""
+@app.post("/api/repair_r2")
+async def repair_r2(key: str):
+    """Scan and fix all broken R2 entries. Runs in background thread."""
     verify_key(key)
-    
-    def count_entries():
-        conn = get_db_connection()
-        try:
-            total = conn.execute("SELECT COUNT(*) FROM files WHERE storage_type = 'r2' AND r2_key IS NOT NULL").fetchone()[0]
-            return total
-        finally:
-            conn.close()
-    
-    total = await asyncio.to_thread(count_entries)
-    return {"total_r2_entries": total}
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_repair_r2_sync),
+            timeout=300  # 5 min max
+        )
+        log(f"repair_r2 complete: {result}")
+        return {"status": "OK", **result}
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"status": "timeout", "msg": "Repair took too long, run again"})
+    except Exception as e:
+        log(f"repair_r2 failed: {str(e)}")
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)})
+
+
+@app.get("/api/repair_r2")
+async def repair_r2_get(key: str):
+    """GET version — so browser testing works too."""
+    return await repair_r2(key)
 
 _client = None
 _client_lock = asyncio.Lock()
@@ -1394,29 +1382,16 @@ async def on_startup():
     init_db()
     asyncio.create_task(cache_cleanup_loop())
     asyncio.create_task(r2_deduplication_loop())
-    # Auto-repair on startup: fix entries broken by old deduplication bug
+    # Auto-repair on startup: fix entries broken by old dedup bug
     async def auto_repair():
-        await asyncio.sleep(30)  # Wait for system to stabilize
+        await asyncio.sleep(30)
         try:
-            log("Auto-repair: scanning for broken R2 entries...")
-            # Run repair internally
-            def get_broken_count():
-                conn = get_db_connection()
-                try:
-                    total = conn.execute("SELECT COUNT(*) FROM files WHERE storage_type = 'r2' AND r2_key IS NOT NULL").fetchone()[0]
-                    return total
-                finally:
-                    conn.close()
-            count = await asyncio.to_thread(get_broken_count)
-            if count > 0:
-                log(f"Auto-repair: checking {count} R2 entries...")
-                # Import and call the repair function
-                import inspect
-                # Direct internal call — avoids HTTP overhead
-                result = await repair_r2(key=INTERNAL_API_KEY)
-                log(f"Auto-repair result: {result}")
-            else:
-                log("Auto-repair: no R2 entries to check")
+            log("Auto-repair: starting R2 entry scan...")
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_repair_r2_sync),
+                timeout=300
+            )
+            log(f"Auto-repair done: {result}")
         except Exception as e:
             log(f"Auto-repair error: {str(e)}")
     asyncio.create_task(auto_repair())
