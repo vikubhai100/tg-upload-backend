@@ -455,8 +455,28 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
         filename = entry.get("filename", "")
         file_hash = entry.get("file_hash")
         
+        # Strategy 0 (FASTEST): Check for 'restored_<shortid>_*' key in R2
+        # The auto-restore feature saves files as 'restored_<shortid>_<random>'
+        # but the DB still has the old dead key. This is the most common case!
+        def find_restored_key():
+            try:
+                prefix = f"restored_{short_id}_"
+                resp = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix, MaxKeys=5)
+                if 'Contents' in resp:
+                    for obj in resp['Contents']:
+                        k = obj['Key']
+                        if k.startswith(prefix) and obj['Size'] > 0:
+                            return k
+            except:
+                pass
+            return None
+        restored = await asyncio.to_thread(find_restored_key)
+        if restored:
+            healed_key = restored
+            log(f"self-heal: found restored key for {short_id}: {restored}")
+        
         # Strategy 1: Find by file_hash in DB
-        if file_hash:
+        if not healed_key and file_hash:
             def find_by_hash():
                 c = get_db_connection()
                 try:
@@ -470,7 +490,26 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                 if cs == 'exists':
                     healed_key = candidate
         
-        # Strategy 2: Search ALL R2 objects for filename match
+        # Strategy 2: Check for key that starts with short_id (bot format: rCode_filename)
+        if not healed_key:
+            def find_by_shortid_prefix():
+                try:
+                    prefix = f"{short_id}_"
+                    resp = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix, MaxKeys=5)
+                    if 'Contents' in resp:
+                        for obj in resp['Contents']:
+                            k = obj['Key']
+                            if k.startswith(prefix) and obj['Size'] > 0:
+                                return k
+                except:
+                    pass
+                return None
+            found = await asyncio.to_thread(find_by_shortid_prefix)
+            if found:
+                healed_key = found
+                log(f"self-heal: found by short_id prefix for {short_id}: {found}")
+        
+        # Strategy 3: Search ALL R2 objects for filename match
         if not healed_key and filename:
             def search_r2():
                 try:
@@ -496,7 +535,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
             if found:
                 healed_key = found
         
-        # Strategy 3: Search R2 by file hash prefix (R2 keys contain hash-like patterns)
+        # Strategy 4: Search R2 by file hash prefix
         if not healed_key and file_hash:
             def search_r2_by_hash():
                 try:
@@ -507,7 +546,6 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                                 k = obj['Key']
                                 if k.startswith('cache_') or k == r2_key:
                                     continue
-                                # Check if key starts with hash-like prefix
                                 if file_hash[:8] in k:
                                     try:
                                         r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=k)
@@ -1356,9 +1394,56 @@ def _repair_r2_sync():
             
             broken += 1
             
+            # --- FIX STRATEGY 0: Check for 'restored_<shortid>_*' key (MOST COMMON) ---
+            # Auto-restore creates files as 'restored_<shortid>_<random>' but DB has old dead key
+            fixed_key = None
+            try:
+                prefix = f"restored_{short_id}_"
+                resp = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix, MaxKeys=5)
+                if 'Contents' in resp:
+                    for obj in resp['Contents']:
+                        if obj['Key'].startswith(prefix) and obj['Size'] > 0:
+                            fixed_key = obj['Key']
+                            break
+            except:
+                pass
+            
+            if fixed_key:
+                c_r = get_db_connection()
+                try:
+                    c_r.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (fixed_key, short_id))
+                    c_r.commit()
+                finally:
+                    c_r.close()
+                fixed += 1
+                log(f"repair: {short_id} fixed via restored key → {fixed_key}")
+                continue
+            
+            # --- FIX STRATEGY 0b: Check for '<shortid>_*' key (bot upload format) ---
+            try:
+                prefix = f"{short_id}_"
+                resp = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix, MaxKeys=5)
+                if 'Contents' in resp:
+                    for obj in resp['Contents']:
+                        if obj['Key'].startswith(prefix) and obj['Size'] > 0:
+                            fixed_key = obj['Key']
+                            break
+            except:
+                pass
+            
+            if fixed_key:
+                c_s = get_db_connection()
+                try:
+                    c_s.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (fixed_key, short_id))
+                    c_s.commit()
+                finally:
+                    c_s.close()
+                fixed += 1
+                log(f"repair: {short_id} fixed via shortid prefix → {fixed_key}")
+                continue
+            
             # --- FIX STRATEGY 1: Find working key from same hash ---
             file_hash = entry["file_hash"]
-            fixed_key = None
             
             if file_hash:
                 c2 = get_db_connection()
@@ -1385,23 +1470,26 @@ def _repair_r2_sync():
                 log(f"repair: {short_id} fixed via hash → {fixed_key}")
                 continue
             
-            # --- FIX STRATEGY 2: Search R2 for filename match ---
+            # --- FIX STRATEGY 2: Search ALL R2 for filename match ---
             filename = entry["filename"]
             if filename:
                 try:
-                    resp = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, MaxKeys=100)
-                    if 'Contents' in resp:
-                        for obj in resp['Contents']:
-                            k = obj['Key']
-                            if k.startswith('cache_') or k == r2_key:
-                                continue
-                            if filename in k:
-                                try:
-                                    r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=k)
-                                    fixed_key = k
-                                    break
-                                except:
-                                    pass
+                    paginator = r2_client.get_paginator('list_objects_v2')
+                    for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
+                        if 'Contents' in page:
+                            for obj in page['Contents']:
+                                k = obj['Key']
+                                if k.startswith('cache_') or k == r2_key:
+                                    continue
+                                if filename in k:
+                                    try:
+                                        r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=k)
+                                        fixed_key = k
+                                        break
+                                    except:
+                                        pass
+                        if fixed_key:
+                            break
                 except Exception as e:
                     log(f"repair: R2 list failed: {str(e)[:100]}")
             
