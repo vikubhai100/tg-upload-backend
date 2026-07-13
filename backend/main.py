@@ -70,31 +70,23 @@ def get_client_ip(request: Request):
     return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "Unknown")
 
 def check_r2_file_exists(key):
-    """Check if an R2 object exists. Returns 'exists', 'not_found', or 'error'.
-    CRITICAL FIX: Old version swallowed ALL exceptions and returned False,
-    causing 'File Deleted' even when R2 had a transient API error.
-    Now differentiates between genuine 404 and API errors."""
+    """Check if an R2 object exists. Returns 'exists', 'not_found', or 'error'."""
     try:
         r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=key)
         return 'exists'
     except Exception as e:
         err_str = str(e).lower()
-        # NoSuchKey / 404 = genuinely not found
         if 'nosuchkey' in err_str or '404' in err_str or 'not found' in err_str:
             return 'not_found'
-        # Anything else (network error, credentials, timeout) = transient error
         log(f"R2 head_object error for {key}: {str(e)[:120]}")
         return 'error'
 
 app = FastAPI(title="URLKING Hybrid Storage")
 
-# Separate thread pools — lightweight DB ops won't get stuck behind heavy uploads
 _light_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="light_db")
 _heavy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="heavy_io")
 
 async def db_thread(fn, *args, timeout=10.0):
-    """Run lightweight DB function in dedicated pool with timeout protection.
-    Prevents clone/rename from getting stuck when heavy uploads fill the default pool."""
     try:
         return await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(_light_executor, fn, *args),
@@ -194,13 +186,12 @@ def init_db():
     conn.close()
 
 def get_db_connection():
-    # Adding 30 seconds timeout to prevent "database is locked" 500 errors
     c = sqlite3.connect(DB_FILE_SQLITE, check_same_thread=False, timeout=30.0)
     c.row_factory = sqlite3.Row
     return c
 
 def save_file_entry(short_id, data):
-    for _ in range(5):  # Safety retry mechanism
+    for _ in range(5):  
         try:
             conn = get_db_connection()
             existing = conn.execute("SELECT last_accessed, r2_cache_key, tg_backup_msg_id FROM files WHERE short_id = ?", (short_id,)).fetchone()
@@ -233,7 +224,6 @@ def get_file_entry(short_id):
         conn.close()
 
 def execute_r2_cleanup():
-    """Deduplicate R2 entries in DB."""
     try:
         conn = get_db_connection()
         duplicates_hash = conn.execute('''
@@ -293,13 +283,14 @@ async def cache_cleanup_loop():
         await asyncio.to_thread(execute_cache_sweeper)
         await asyncio.sleep(12 * 3600) 
 
+# ============================================================
+# 🔥 UPDATED REDIRECT FUNCTION (Custom Domain Integration)
+# ============================================================
 def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
     try:
-        url = r2_client.generate_presigned_url('get_object', Params={
-            'Bucket': R2_BUCKET_NAME, 'Key': r2_key,
-            'ResponseContentDisposition': f"attachment; filename=\"{filename}\""
-        }, ExpiresIn=3600)  # 1 hour instead of 12 seconds — slow connections need time
-        log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip}")
+        CUSTOM_DOMAIN = "https://db.urlking.site"
+        url = f"{CUSTOM_DOMAIN}/{quote(r2_key)}"
+        log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip} | Target: {url}")
         return RedirectResponse(url=url)
     except Exception: 
         raise HTTPException(status_code=500)
@@ -375,14 +366,11 @@ async def bg_fetch_and_cache(short_id, entry):
         except: pass
 
 # ============================================================
-# 📥 DOWNLOAD ENDPOINT (SECURITY RELAXED / EASY DOWNLOAD)
+# 📥 DOWNLOAD ENDPOINT
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_handle(request: Request, short_id: str, exp: int = 0, sign: str = ""):
     client_ip = get_client_ip(request)
-
-    # 🛑 ABHI KE LIYE SAARI STRICT SECURITY BYPASS KAR DI GAYI HAI
-    # HMAC, Expiry, aur IP binding hata diya gaya hai easy download ke liye.
 
     def update_last_accessed():
         conn = get_db_connection()
@@ -393,7 +381,6 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
             conn.close()
 
     await asyncio.to_thread(update_last_accessed)
-
     entry = await asyncio.to_thread(get_file_entry, short_id)
 
     if not entry:
@@ -414,7 +401,6 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                 pass  
 
         log(f"R2 key dead for {short_id}, attempting self-heal...")
-
         healed_key = None
         filename = entry.get("filename", "")
         file_hash = entry.get("file_hash")
@@ -426,15 +412,12 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                 if 'Contents' in resp:
                     for obj in resp['Contents']:
                         k = obj['Key']
-                        if k.startswith(prefix) and obj['Size'] > 0:
-                            return k
-            except:
-                pass
+                        if k.startswith(prefix) and obj['Size'] > 0: return k
+            except: pass
             return None
+            
         restored = await asyncio.to_thread(find_restored_key)
-        if restored:
-            healed_key = restored
-            log(f"self-heal: found restored key for {short_id}: {restored}")
+        if restored: healed_key = restored
 
         if not healed_key and file_hash:
             def find_by_hash():
@@ -442,12 +425,10 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                 try:
                     r = c.execute("SELECT r2_key FROM files WHERE file_hash = ? AND r2_key IS NOT NULL AND short_id != ?", (file_hash, short_id)).fetchone()
                     return r["r2_key"] if r else None
-                finally:
-                    c.close()
+                finally: c.close()
             candidate = await asyncio.to_thread(find_by_hash)
             if candidate:
-                cs = await asyncio.to_thread(check_r2_file_exists, candidate)
-                if cs == 'exists':
+                if await asyncio.to_thread(check_r2_file_exists, candidate) == 'exists':
                     healed_key = candidate
 
         if not healed_key:
@@ -458,61 +439,29 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                     if 'Contents' in resp:
                         for obj in resp['Contents']:
                             k = obj['Key']
-                            if k.startswith(prefix) and obj['Size'] > 0:
-                                return k
-                except:
-                    pass
+                            if k.startswith(prefix) and obj['Size'] > 0: return k
+                except: pass
                 return None
             found = await asyncio.to_thread(find_by_shortid_prefix)
-            if found:
-                healed_key = found
-                log(f"self-heal: found by short_id prefix for {short_id}: {found}")
+            if found: healed_key = found
 
         if not healed_key and filename:
             def search_r2():
                 try:
-                    paginator = r2_client.get_paginator('list_objects_v2')
-                    for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
+                    for page in r2_client.get_paginator('list_objects_v2').paginate(Bucket=R2_BUCKET_NAME):
                         if 'Contents' in page:
                             for obj in page['Contents']:
                                 k = obj['Key']
-                                if k.startswith('cache_') or k == r2_key:
-                                    continue
+                                if k.startswith('cache_') or k == r2_key: continue
                                 if filename in k or k.endswith(safeFile(filename)):
                                     try:
                                         r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=k)
                                         return k
-                                    except:
-                                        pass
+                                    except: pass
                     return None
-                except:
-                    return None
+                except: return None
             found = await asyncio.to_thread(search_r2)
-            if found:
-                healed_key = found
-
-        if not healed_key and file_hash:
-            def search_r2_by_hash():
-                try:
-                    paginator = r2_client.get_paginator('list_objects_v2')
-                    for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
-                        if 'Contents' in page:
-                            for obj in page['Contents']:
-                                k = obj['Key']
-                                if k.startswith('cache_') or k == r2_key:
-                                    continue
-                                if file_hash[:8] in k:
-                                    try:
-                                        r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=k)
-                                        return k
-                                    except:
-                                        pass
-                    return None
-                except:
-                    return None
-            found = await asyncio.to_thread(search_r2_by_hash)
-            if found:
-                healed_key = found
+            if found: healed_key = found
 
         if healed_key:
             def heal_db():
@@ -521,10 +470,8 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                     c.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (healed_key, short_id))
                     c.execute("UPDATE files SET r2_key = ? WHERE r2_key = ? AND storage_type = 'r2'", (healed_key, r2_key))
                     c.commit()
-                finally:
-                    c.close()
+                finally: c.close()
             await asyncio.to_thread(heal_db)
-            log(f"SELF-HEALED {short_id}: {r2_key} → {healed_key}")
             return redirect_to_r2(healed_key, entry["filename"], client_ip, "HEALED")
 
         backup_msg_id = entry.get("tg_backup_msg_id") or entry.get("message_id")
@@ -537,9 +484,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
             entry["storage_type"] = "telegram"
             entry["r2_key"] = None
             entry["message_id"] = int(backup_msg_id)
-            log(f"R2 missing, falling back to Telegram backup for: {short_id}")
         else:
-            log(f"FILE DELETED: {short_id} — no R2 key, no Telegram backup, no healing possible")
             return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#991b1b;'><h2>File Deleted</h2></div>", status_code=404)
 
     if entry.get("r2_cache_key"):
@@ -548,10 +493,8 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
         if cache_status == 'exists':
             return redirect_to_r2(r2_cache_key, entry["filename"], client_ip, "CACHED LINK")
         elif cache_status == 'error':
-            try:
-                return redirect_to_r2(r2_cache_key, entry["filename"], client_ip, "CACHED-RETRY")
-            except:
-                pass
+            try: return redirect_to_r2(r2_cache_key, entry["filename"], client_ip, "CACHED-RETRY")
+            except: pass
         if entry.get("message_id") and int(entry.get("message_id")) > 0:
             def remove_cache_key():
                 conn = get_db_connection()
@@ -650,14 +593,9 @@ async def parallel_upload(client, file_path):
                 await client(SaveBigFilePartRequest(f_id, idx, parts, chunk))
             except Exception as e:
                 upload_errors.append(f"Part {idx}: {str(e)}")
-                log(f"⚠️ Upload part {idx}/{parts} failed: {str(e)}")
                 raise
 
     await asyncio.gather(*[up_part(i) for i in range(parts)], return_exceptions=False)
-
-    if upload_errors:
-        log(f"⚠️ Upload completed with {len(upload_errors)} errors for {name}")
-
     return InputFileBig(id=f_id, parts=parts, name=name)
 
 @app.post("/api/upload")
@@ -713,7 +651,6 @@ async def api_upload(request: Request):
                 uploaded_file = await parallel_upload(client, tmp_path)
                 msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
         except Exception as send_err:
-            log(f"Telegram send_file failed for {filename}: {str(send_err)}")
             global _client
             async with _client_lock:
                 try:
@@ -738,12 +675,10 @@ async def api_upload(request: Request):
         })
         try: os.unlink(tmp_path)
         except: pass
-        log(f"upload OK: {short_id} → msg:{msg.id} ({filename} {format_size(file_size)})")
         return JSONResponse(content=[{"file_code": short_id, "file_status": "OK"}])
     except Exception as e:
         try: os.unlink(tmp_path)
         except: pass
-        log(f"upload FAILED: {str(e)}")
         return JSONResponse(status_code=500, content=[{"error": str(e)}])
 
 @app.post("/api/remote_upload")
@@ -770,7 +705,6 @@ async def remote_upload(request: Request):
                 break
             except Exception as dl_err:
                 last_err = dl_err
-                log(f"⚠️ Remote download attempt {attempt+1}/3 failed: {str(dl_err)}")
                 if attempt < 2:
                     await asyncio.sleep(3 * (attempt + 1))
                     try: os.unlink(tmp_path)
@@ -816,7 +750,6 @@ async def remote_upload(request: Request):
                 uploaded_file = await parallel_upload(client, tmp_path)
                 msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
         except Exception as send_err:
-            log(f"remote_upload: TG send failed, reconnecting: {str(send_err)}")
             global _client
             async with _client_lock:
                 try:
@@ -843,13 +776,10 @@ async def remote_upload(request: Request):
 
         try: os.unlink(tmp_path)
         except: pass
-        log(f"remote_upload OK: {short_id} → msg:{msg.id} ({filename} {format_size(actual_size)})")
-
         return [{"file_code": short_id, "file_status": "OK"}]
     except Exception as e:
         try: os.unlink(tmp_path)
         except: pass
-        log(f"remote_upload FAILED: {str(e)}")
         return {"error": str(e)}
 
 @app.post("/api/file/register_r2")
@@ -863,12 +793,6 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
 
     if not new_r2_key:
         raise HTTPException(status_code=400, detail="Missing r2_key")
-
-    new_status = await asyncio.to_thread(check_r2_file_exists, new_r2_key)
-    if new_status == 'not_found':
-        log(f"register_r2: CRITICAL — new key {new_r2_key} doesn't exist in R2! Upload may have failed.")
-    elif new_status == 'exists':
-        log(f"register_r2: new key {new_r2_key} verified in R2")
 
     def check_existing_db():
         conn = get_db_connection()
@@ -909,12 +833,8 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
                 try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=new_r2_key)
                 except: pass
             background_tasks.add_task(delete_redundant)
-            log(f"register_r2: duplicate handled, using existing master key {master_r2_key}")
             return {"status": "OK", "msg": "Duplicate handled instantly"}
-
         else:
-            log(f"register_r2: master key {master_r2_key} is dead ({master_status}), using new key {new_r2_key}")
-
             def fix_dead_master():
                 conn = get_db_connection()
                 try:
@@ -929,7 +849,6 @@ async def register_r2(key: str, background_tasks: BackgroundTasks, data: dict = 
         "r2_key": new_r2_key, "content_type": "application/octet-stream",
         "file_hash": file_hash
     })
-    log(f"register_r2: saved {data['short_id']} → {new_r2_key}")
     return {"status": "OK"}
 
 @app.get("/api/file/clone")
@@ -943,7 +862,6 @@ async def file_clone(key: str, file_code: str):
     except HTTPException:
         raise
     except Exception as e:
-        log(f"Clone DB lookup failed for {file_code}: {str(e)}")
         return JSONResponse(status_code=500, content={"status": 500, "error": f"Database error: {str(e)}"})
 
     if not entry:
@@ -957,10 +875,7 @@ async def file_clone(key: str, file_code: str):
     except HTTPException:
         raise
     except Exception as e:
-        log(f"Clone save failed for new_id={new_id}: {str(e)}")
         return JSONResponse(status_code=500, content={"status": 500, "error": f"Failed to save clone: {str(e)}"})
-
-    log(f"Clone OK: {file_code} -> {new_id}")
     return {"status": 200, "result": {"filecode": new_id}}
 
 @app.get("/api/file/delete")
@@ -969,7 +884,6 @@ async def file_delete(key: str, file_code: str):
     try:
         entry = await db_thread(get_file_entry, file_code, timeout=10.0)
     except Exception as e:
-        log(f"Delete lookup failed for {file_code}: {str(e)}")
         return {"status": 500, "error": str(e)}
     if entry:
         def run_delete():
@@ -1012,7 +926,6 @@ async def file_rename(key: str, file_code: str, name: str):
     except HTTPException:
         raise
     except Exception as e:
-        log(f"Rename failed for {file_code}: {str(e)}")
         return JSONResponse(status_code=500, content={"status": 500, "error": f"Rename failed: {str(e)}"})
 
     if changed == 0: return JSONResponse(status_code=404, content={"status": 404, "msg": "File not found"})
@@ -1060,7 +973,6 @@ async def index_forwarded(key: str, message_id: int, filename: str):
                 "file_hash": existing.get("file_hash"), "r2_cache_key": existing.get("r2_cache_key")
             }, timeout=10.0)
         except Exception as e:
-            log(f"⚠️ index_forwarded: save existing failed: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Save failed: {str(e)}")
         return [{"file_code": new_id, "file_status": "OK"}]
 
@@ -1074,14 +986,12 @@ async def index_forwarded(key: str, message_id: int, filename: str):
             "storage_type": "telegram"
         }, timeout=10.0)
     except Exception as e:
-        log(f"⚠️ index_forwarded: save new failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Save failed: {str(e)}")
     return [{"file_code": short_id, "file_status": "OK"}]
 
 @app.post("/api/fast_index")
 async def fast_index(key: str, data: dict = Body(...)):
     verify_key(key)
-
     message_id = data.get("message_id")
     filename = data.get("filename")
     size = data.get("size", 0)
@@ -1102,7 +1012,6 @@ async def fast_index(key: str, data: dict = Body(...)):
         try:
             existing = await db_thread(fetch_existing, timeout=10.0)
         except Exception as e:
-            log(f"⚠️ fast_index: existing lookup failed: {str(e)}")
             existing = None
 
         if existing:
@@ -1117,7 +1026,6 @@ async def fast_index(key: str, data: dict = Body(...)):
                     "file_hash": existing.get("file_hash"), "r2_cache_key": existing.get("r2_cache_key")
                 }, timeout=10.0)
             except Exception as e:
-                log(f"⚠️ fast_index: save existing failed: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Failed to save: {str(e)}")
             return [{"file_code": new_id, "file_status": "OK"}]
 
@@ -1131,15 +1039,12 @@ async def fast_index(key: str, data: dict = Body(...)):
             "storage_type": "telegram"
         }, timeout=10.0)
     except Exception as e:
-        log(f"⚠️ fast_index: save new failed for {short_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to save entry: {str(e)}")
-    log(f"⚡ Fast indexed: {short_id} → msg:{message_id} ({filename})")
     return [{"file_code": short_id, "file_status": "OK"}]
 
 @app.post("/api/re_index")
 async def re_index(key: str, data: dict = Body(...)):
     verify_key(key)
-
     short_id = data.get("short_id")
     message_id = data.get("message_id")
     filename = data.get("filename")
@@ -1168,12 +1073,9 @@ async def re_index(key: str, data: dict = Body(...)):
             "file_reference": str(file_reference or "0"), "dc_id": int(dc_id or 0),
             "storage_type": storage_type, "r2_key": r2_key, "file_hash": file_hash
         }, timeout=10.0)
-        log(f"✅ Re-indexed: {short_id} → msg:{message_id} ({filename})")
         return {"status": "OK", "msg": "Entry created", "file_code": short_id}
     except Exception as e:
-        log(f"❌ Re-index failed for {short_id}: {str(e)}")
         return JSONResponse(status_code=500, content={"status": 500, "error": str(e)})
-
 
 @app.post("/api/file/backup_to_telegram")
 async def backup_to_telegram(key: str, data: dict = Body(...)):
@@ -1232,11 +1134,9 @@ async def backup_to_telegram(key: str, data: dict = Body(...)):
                 conn.close()
         await asyncio.to_thread(update_backup)
 
-        log(f"✅ Backup to Telegram complete: {file_code} → msg_id={msg.id}")
         return {"status": "OK", "msg": "Backed up to Telegram", "backup_msg_id": msg.id}
 
     except Exception as e:
-        log(f"❌ Backup failed for {file_code}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
     finally:
         try:
@@ -1244,7 +1144,6 @@ async def backup_to_telegram(key: str, data: dict = Body(...)):
                 os.unlink(tmp_path)
         except:
             pass
-
 
 @app.get("/files")
 async def list_files(key: str, page: int = 1, limit: int = 10):
@@ -1309,7 +1208,6 @@ def _repair_r2_sync():
                 finally:
                     c_r.close()
                 fixed += 1
-                log(f"repair: {short_id} fixed via restored key → {fixed_key}")
                 continue
 
             try:
@@ -1331,7 +1229,6 @@ def _repair_r2_sync():
                 finally:
                     c_s.close()
                 fixed += 1
-                log(f"repair: {short_id} fixed via shortid prefix → {fixed_key}")
                 continue
 
             file_hash = entry["file_hash"]
@@ -1358,14 +1255,12 @@ def _repair_r2_sync():
                 finally:
                     c3.close()
                 fixed += 1
-                log(f"repair: {short_id} fixed via hash → {fixed_key}")
                 continue
 
             filename = entry["filename"]
             if filename:
                 try:
-                    paginator = r2_client.get_paginator('list_objects_v2')
-                    for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
+                    for page in r2_client.get_paginator('list_objects_v2').paginate(Bucket=R2_BUCKET_NAME):
                         if 'Contents' in page:
                             for obj in page['Contents']:
                                 k = obj['Key']
@@ -1380,8 +1275,8 @@ def _repair_r2_sync():
                                         pass
                         if fixed_key:
                             break
-                except Exception as e:
-                    log(f"repair: R2 list failed: {str(e)[:100]}")
+                except Exception:
+                    pass
 
             if fixed_key:
                 c4 = get_db_connection()
@@ -1391,7 +1286,6 @@ def _repair_r2_sync():
                 finally:
                     c4.close()
                 fixed += 1
-                log(f"repair: {short_id} fixed via R2 search → {fixed_key}")
                 continue
 
             backup_msg_id = entry.get("tg_backup_msg_id") or entry.get("message_id")
@@ -1403,18 +1297,14 @@ def _repair_r2_sync():
                 finally:
                     c5.close()
                 fixed += 1
-                log(f"repair: {short_id} fallback to Telegram msg:{backup_msg_id}")
                 continue
 
             unfixed += 1
-            log(f"repair: {short_id} UNFIXED — no recovery possible")
 
-        except Exception as e:
-            log(f"repair: error processing {entry['short_id']}: {str(e)[:100]}")
+        except Exception:
             unfixed += 1
 
     return {"scanned": len(entries), "ok": ok, "broken": broken, "fixed": fixed, "unfixed": unfixed}
-
 
 @app.post("/api/repair_r2")
 async def repair_r2(key: str):
@@ -1424,14 +1314,11 @@ async def repair_r2(key: str):
             asyncio.to_thread(_repair_r2_sync),
             timeout=300 
         )
-        log(f"repair_r2 complete: {result}")
         return {"status": "OK", **result}
     except asyncio.TimeoutError:
         return JSONResponse(status_code=504, content={"status": "timeout", "msg": "Repair took too long, run again"})
     except Exception as e:
-        log(f"repair_r2 failed: {str(e)}")
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)})
-
 
 @app.get("/api/repair_r2")
 async def repair_r2_get(key: str):
@@ -1459,7 +1346,6 @@ async def on_startup():
     async def auto_repair():
         await asyncio.sleep(30)
         try:
-            log("Auto-repair: starting R2 entry scan...")
             result = await asyncio.wait_for(
                 asyncio.to_thread(_repair_r2_sync),
                 timeout=300
