@@ -131,7 +131,6 @@ BASE_URL         = os.getenv("BASE_URL", "https://db.urlking.in")
 SESSION_STR      = os.getenv("SESSION_STRING", "")
 DB_FILE_SQLITE   = "/app/data/files.db"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "super_secret_key_123")
-DOWNLOAD_SECRET  = "URLKING_ANTI_BOT_SECRET_2024"  
 
 def calculate_hash(file_path):
     hasher = hashlib.md5()
@@ -158,9 +157,8 @@ if FRONTEND_DIR.exists():
 elif (Path(__file__).resolve().parent / "static").exists():
     app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
 
-
 # ============================================================
-# 💾 DB CONNECTION & HANDLERS (OPTIMIZED WITH TIMEOUT & RETRY)
+# 💾 DB CONNECTION & HANDLERS 
 # ============================================================
 def init_db():
     os.makedirs(os.path.dirname(DB_FILE_SQLITE), exist_ok=True)
@@ -284,11 +282,34 @@ async def cache_cleanup_loop():
         await asyncio.sleep(12 * 3600) 
 
 # ============================================================
-# 🔥 UPDATED REDIRECT FUNCTION (Custom Domain Integration)
+# 🔥 UPDATED REDIRECT FUNCTION (Fixes Filename on Download)
 # ============================================================
-def redirect_to_r2(r2_key, filename, client_ip, log_tag="REDIRECT"):
+async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="REDIRECT"):
     try:
         CUSTOM_DOMAIN = "https://db.urlking.site"
+        
+        def fix_r2_name():
+            try:
+                # Check current R2 metadata
+                meta = r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=r2_key)
+                current_cd = meta.get('ContentDisposition', '')
+                
+                # If attachment/filename isn't set properly, fix it on the fly
+                if 'attachment' not in current_cd:
+                    r2_client.copy_object(
+                        Bucket=R2_BUCKET_NAME,
+                        Key=r2_key,
+                        CopySource={'Bucket': R2_BUCKET_NAME, 'Key': r2_key},
+                        MetadataDirective='REPLACE',
+                        ContentType=content_type or "application/octet-stream",
+                        ContentDisposition=f'attachment; filename="{safeFile(filename)}"'
+                    )
+            except Exception as e:
+                log(f"⚠️ R2 Name Fix Error: {str(e)}")
+
+        # Run the fix metadata update right before redirecting
+        await asyncio.to_thread(fix_r2_name)
+        
         url = f"{CUSTOM_DOMAIN}/{quote(r2_key)}"
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip} | Target: {url}")
         return RedirectResponse(url=url)
@@ -392,11 +413,11 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
         r2_status = await asyncio.to_thread(check_r2_file_exists, r2_key)
 
         if r2_status == 'exists':
-            return redirect_to_r2(r2_key, entry["filename"], client_ip, "PERMANENT")
+            return await redirect_to_r2(r2_key, entry["filename"], entry.get("content_type"), client_ip, "PERMANENT")
         elif r2_status == 'error':
             log(f"R2 API error for {short_id}, attempting redirect anyway")
             try:
-                return redirect_to_r2(r2_key, entry["filename"], client_ip, "PERMANENT-RETRY")
+                return await redirect_to_r2(r2_key, entry["filename"], entry.get("content_type"), client_ip, "PERMANENT-RETRY")
             except:
                 pass  
 
@@ -472,7 +493,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                     c.commit()
                 finally: c.close()
             await asyncio.to_thread(heal_db)
-            return redirect_to_r2(healed_key, entry["filename"], client_ip, "HEALED")
+            return await redirect_to_r2(healed_key, entry["filename"], entry.get("content_type"), client_ip, "HEALED")
 
         backup_msg_id = entry.get("tg_backup_msg_id") or entry.get("message_id")
         if backup_msg_id and int(backup_msg_id) > 0:
@@ -491,9 +512,9 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
         r2_cache_key = entry["r2_cache_key"]
         cache_status = await asyncio.to_thread(check_r2_file_exists, r2_cache_key)
         if cache_status == 'exists':
-            return redirect_to_r2(r2_cache_key, entry["filename"], client_ip, "CACHED LINK")
+            return await redirect_to_r2(r2_cache_key, entry["filename"], entry.get("content_type"), client_ip, "CACHED LINK")
         elif cache_status == 'error':
-            try: return redirect_to_r2(r2_cache_key, entry["filename"], client_ip, "CACHED-RETRY")
+            try: return await redirect_to_r2(r2_cache_key, entry["filename"], entry.get("content_type"), client_ip, "CACHED-RETRY")
             except: pass
         if entry.get("message_id") and int(entry.get("message_id")) > 0:
             def remove_cache_key():
