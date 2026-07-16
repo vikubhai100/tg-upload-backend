@@ -308,8 +308,20 @@ async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="RED
                 log(f"⚠️ R2 Name Fix Error: {str(e)}")
 
         await asyncio.to_thread(fix_r2_name)
-        url = f"{CUSTOM_DOMAIN}/{quote(r2_key)}"
-        log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip} | Target: {url}")
+        
+        SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2026"
+        exp = int(time.time()) + 1800  # Link active for 30 minutes
+        
+        # Calculate HMAC SHA-256 signature
+        data_to_sign = f"{r2_key}:{exp}:{client_ip}"
+        signature = hmac.new(
+            SECURE_SECRET.encode('utf-8'),
+            data_to_sign.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        
+        url = f"{CUSTOM_DOMAIN}/d?key={quote(r2_key)}&exp={exp}&ip={client_ip}&sign={signature}"
+        log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip} | Secure Target Generated")
         return RedirectResponse(url=url)
     except Exception: 
         raise HTTPException(status_code=500)
