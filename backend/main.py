@@ -289,7 +289,7 @@ async def cache_cleanup_loop():
 # ============================================================
 async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="REDIRECT"):
     try:
-        CUSTOM_DOMAIN = "https://db.urlking.space"
+        CUSTOM_DOMAIN = "https://db.urlking.site"
 
         def fix_r2_name():
             try:
