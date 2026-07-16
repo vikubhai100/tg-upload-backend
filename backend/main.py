@@ -13,6 +13,8 @@ import hashlib
 import hmac      
 import aiofiles
 import concurrent.futures
+import subprocess # 🔥 Added for running scan.py
+import json       # 🔥 Added for reading scan progress
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -33,6 +35,7 @@ R2_ENDPOINT = "https://c756225d2d945ebc6c51149e7a1e3cfe.r2.cloudflarestorage.com
 R2_ACCESS_KEY = "6725033f7581ed01c53a5b4411dc0614"
 R2_SECRET_KEY = "21295882807a0d4940dc9330e146795043b6c69ce83520f04b0be5a49262d28f"
 R2_BUCKET_NAME = "urlking"
+STATE_FILE = "/tmp/scan_progress.json" # 🔥 Scan state file path
 
 r2_client = boto3.client(
     service_name='s3',
@@ -287,14 +290,11 @@ async def cache_cleanup_loop():
 async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="REDIRECT"):
     try:
         CUSTOM_DOMAIN = "https://db.urlking.space"
-        
+
         def fix_r2_name():
             try:
-                # Check current R2 metadata
                 meta = r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=r2_key)
                 current_cd = meta.get('ContentDisposition', '')
-                
-                # If attachment/filename isn't set properly, fix it on the fly
                 if 'attachment' not in current_cd:
                     r2_client.copy_object(
                         Bucket=R2_BUCKET_NAME,
@@ -307,9 +307,7 @@ async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="RED
             except Exception as e:
                 log(f"⚠️ R2 Name Fix Error: {str(e)}")
 
-        # Run the fix metadata update right before redirecting
         await asyncio.to_thread(fix_r2_name)
-        
         url = f"{CUSTOM_DOMAIN}/{quote(r2_key)}"
         log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip} | Target: {url}")
         return RedirectResponse(url=url)
@@ -436,7 +434,7 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                         if k.startswith(prefix) and obj['Size'] > 0: return k
             except: pass
             return None
-            
+
         restored = await asyncio.to_thread(find_restored_key)
         if restored: healed_key = restored
 
@@ -899,6 +897,9 @@ async def file_clone(key: str, file_code: str):
         return JSONResponse(status_code=500, content={"status": 500, "error": f"Failed to save clone: {str(e)}"})
     return {"status": 200, "result": {"filecode": new_id}}
 
+# ============================================================
+# 🔥 FILE DELETE LOGIC
+# ============================================================
 @app.get("/api/file/delete")
 async def file_delete(key: str, file_code: str):
     verify_key(key)
@@ -1341,33 +1342,58 @@ async def repair_r2(key: str):
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)})
 
-
-@app.get("/api/scan/start")
-async def start_scan(key: str, background_tasks: BackgroundTasks):
-    verify_key(key)
-    # Background task me scanner chalayein
-    background_tasks.add_task(run_scan)
-    return {"status": "Scanning started"}
-
-@app.get("/api/scan/progress")
-async def get_progress():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f: return json.load(f)
-    return {"status": "idle"}
-
-@app.post("/api/scan/delete")
-async def delete_file(key: str, data: dict = Body(...)):
-    verify_key(key)
-    file_code = data.get("file_code")
-    # Yahan wahi delete logic call karein jo aapne 'file_delete' endpoint me likha hai
-    # await file_delete(key, file_code) 
-    return {"status": "Deleted"}
-
-
-
 @app.get("/api/repair_r2")
 async def repair_r2_get(key: str):
     return await repair_r2(key)
+
+
+# ============================================================
+# 🛡️ SCANNER API ENDPOINTS
+# ============================================================
+@app.get("/api/scan/start")
+async def start_scan_api(key: str, background_tasks: BackgroundTasks):
+    verify_key(key)
+    
+    # Check if scan is already running
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+                if state.get("status") in ["running", "initializing"]:
+                    return {"status": "Already scanning", "progress": state}
+        except:
+            pass
+            
+    # Process ko background me spawn karna taaki FastAPI block na ho
+    def run_scanner_process():
+        # Aapka sys.executable directly python environment utha lega
+        subprocess.Popen([sys.executable, "scan.py"])
+        
+    background_tasks.add_task(run_scanner_process)
+    return {"status": "Scanning started"}
+
+@app.get("/api/scan/progress")
+async def scan_progress(key: str):
+    verify_key(key) # Security check for progress reading
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {"status": "reading_error"}
+    return {"status": "idle"}
+
+@app.post("/api/scan/delete")
+async def scan_delete_file(key: str, data: dict = Body(...)):
+    verify_key(key)
+    file_code = data.get("file_code")
+    if not file_code:
+        raise HTTPException(status_code=400, detail="Missing file_code")
+        
+    # Yahan existing 'file_delete' function ko seedha call kar rahe hain
+    result = await file_delete(key, file_code)
+    return result
+
 
 _client = None
 _client_lock = asyncio.Lock()
