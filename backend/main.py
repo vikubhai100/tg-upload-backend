@@ -69,6 +69,8 @@ def safeFile(name):
     return re.sub(r'[<>:"/\\|?*\x00-\x1F]', '_', (name or 'file')).strip() or 'file'
 
 def get_client_ip(request: Request):
+    cf = request.headers.get("CF-Connecting-IP")
+    if cf: return cf.strip()
     fwd = request.headers.get("X-Forwarded-For")
     return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "Unknown")
 
