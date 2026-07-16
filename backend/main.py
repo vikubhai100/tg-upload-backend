@@ -1341,6 +1341,30 @@ async def repair_r2(key: str):
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)})
 
+
+@app.get("/api/scan/start")
+async def start_scan(key: str, background_tasks: BackgroundTasks):
+    verify_key(key)
+    # Background task me scanner chalayein
+    background_tasks.add_task(run_scan)
+    return {"status": "Scanning started"}
+
+@app.get("/api/scan/progress")
+async def get_progress():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f: return json.load(f)
+    return {"status": "idle"}
+
+@app.post("/api/scan/delete")
+async def delete_file(key: str, data: dict = Body(...)):
+    verify_key(key)
+    file_code = data.get("file_code")
+    # Yahan wahi delete logic call karein jo aapne 'file_delete' endpoint me likha hai
+    # await file_delete(key, file_code) 
+    return {"status": "Deleted"}
+
+
+
 @app.get("/api/repair_r2")
 async def repair_r2_get(key: str):
     return await repair_r2(key)
