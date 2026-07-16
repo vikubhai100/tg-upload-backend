@@ -312,7 +312,7 @@ async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="RED
         await asyncio.to_thread(fix_r2_name)
         
         SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2026"
-        exp = int(time.time()) + 1800  # Link active for 30 minutes
+        exp = int(time.time()) + 300  # Link active for 5 minutes
         
         # Calculate HMAC SHA-256 signature
         data_to_sign = f"{r2_key}:{exp}:{client_ip}"
