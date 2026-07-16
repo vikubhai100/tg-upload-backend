@@ -8,7 +8,7 @@ import sys
 # ==========================================
 # 🛠️ CONFIGURATION
 # ==========================================
-VT_API_KEY = "YAHAN_APNI_VIRUSTOTAL_API_KEY_DAALEIN"
+VT_API_KEY = "5d93c3a803e809b42dd04d4a0859830db80887eb21d81fd630f33b2539e779fe"
 DB_PATH = "/app/data/files.db" # Aapke FastAPI code ke hisaab se DB path
 STATE_FILE = "/tmp/scan_progress.json"
 DELAY_SEC = 16 # API rate limit (4 req/min for VT Free)
