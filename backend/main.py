@@ -13,8 +13,9 @@ import hashlib
 import hmac      
 import aiofiles
 import concurrent.futures
-import subprocess # 🔥 Added for running scan.py
-import json       # 🔥 Added for reading scan progress
+import subprocess 
+import json       
+import base64     # 🔥 Added for Base64 URL Encoding
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -35,7 +36,7 @@ R2_ENDPOINT = "https://c756225d2d945ebc6c51149e7a1e3cfe.r2.cloudflarestorage.com
 R2_ACCESS_KEY = "6725033f7581ed01c53a5b4411dc0614"
 R2_SECRET_KEY = "21295882807a0d4940dc9330e146795043b6c69ce83520f04b0be5a49262d28f"
 R2_BUCKET_NAME = "urlking"
-STATE_FILE = "/tmp/scan_progress.json" # 🔥 Scan state file path
+STATE_FILE = "/tmp/scan_progress.json"
 
 r2_client = boto3.client(
     service_name='s3',
@@ -64,7 +65,6 @@ def format_size(size_bytes):
     return f"{size_bytes:.1f} TB"
 
 def safeFile(name):
-    """Sanitize filename for safe matching — mirrors Node.js safeFile()"""
     import re
     return re.sub(r'[<>:"/\\|?*\x00-\x1F]', '_', (name or 'file')).strip() or 'file'
 
@@ -75,7 +75,6 @@ def get_client_ip(request: Request):
     return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "Unknown")
 
 def check_r2_file_exists(key):
-    """Check if an R2 object exists. Returns 'exists', 'not_found', or 'error'."""
     try:
         r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=key)
         return 'exists'
@@ -119,11 +118,9 @@ async def bot_guard_middleware(request: Request, call_next):
     ua = request.headers.get("user-agent", "").lower()
     sec_ch_ua = request.headers.get("sec-ch-ua", "").lower()
 
-    # 1. Google Bots ko Hard Block karke Fake 404 dikhao
     if any(bot in ua for bot in ["googlebot", "google", "safebrowsing", "mediapartners", "adsbot", "bingbot", "yandex", "slurp"]):
         return HTMLResponse(content="<h1>404 Not Found</h1>", status_code=404)
 
-    # 2. General Scrapers
     if any(b in ua for b in ["python", "curl", "wget", "httpie", "postman", "crawler", "spider", "telegram", "axios", "node-fetch", "libwww"]):
         return JSONResponse(status_code=403, content={"error": "Bot Access Denied"})
 
@@ -292,33 +289,44 @@ async def cache_cleanup_loop():
         await asyncio.sleep(12 * 3600) 
 
 # ============================================================
-# 🔥 STEALTH CLOUDFLARE WORKER REDIRECT (SAVES BANDWIDTH)
+# 🔥 OPAQUE TOKEN REDIRECT (HIDES FILENAMES & EXTENSIONS)
 # ============================================================
 async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="REDIRECT"):
     try:
-        # Aapka worker domain jo R2 se direct fetch karega bina public kiye
+        # Worker URL
         CUSTOM_DOMAIN = "https://d.urlking.workers.dev"
-
         SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2110"
         exp = int(time.time()) + 300  # Link active for 5 minutes
 
-        # Calculate HMAC SHA-256 signature for security
-        data_to_sign = f"{r2_key}:{exp}:{client_ip}"
+        safe_name = safeFile(filename)
+        
+        # 1. Pack data into JSON dictionary
+        payload_data = {
+            "k": r2_key,
+            "n": safe_name,
+            "e": exp,
+            "i": client_ip
+        }
+        
+        # 2. Encode to Base64 to hide the filename and details in the URL
+        payload_json = json.dumps(payload_data)
+        token = base64.urlsafe_b64encode(payload_json.encode('utf-8')).decode('utf-8').rstrip('=')
+
+        # 3. Generate Signature using the Token
         signature = hmac.new(
             SECURE_SECRET.encode('utf-8'),
-            data_to_sign.encode('utf-8'),
+            token.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
 
-        # Generate secure URL for the worker
-        safe_name = safeFile(filename)
-        url = f"{CUSTOM_DOMAIN}/d?key={quote(r2_key)}&exp={exp}&ip={client_ip}&sign={signature}&name={quote(safe_name)}"
+        # 4. Final URL (Looks like /d?id=eyJr...&sig=abcd123...)
+        url = f"{CUSTOM_DOMAIN}/d?id={token}&sig={signature}"
         
-        log(f"🚀 R2 {log_tag} | {filename} | IP: {client_ip} | Secure Target Generated")
+        log(f"🚀 R2 {log_tag} | HIDDEN: {safe_name} | IP: {client_ip}")
         
-        # 🛡️ Return a redirect with 'noindex' to stop Google from tracking the worker URL
+        # Add noindex to instruct valid search bots not to index this redirect
         return RedirectResponse(url=url, headers={"X-Robots-Tag": "noindex, nofollow"})
-    except Exception as e:
+    except Exception as e: 
         log(f"⚠️ Redirect Error: {str(e)}")
         raise HTTPException(status_code=500)
 
@@ -396,7 +404,7 @@ async def bg_fetch_and_cache(short_id, entry):
 # 📥 DOWNLOAD ENDPOINT
 # ============================================================
 @app.get("/download/{short_id}")
-async def download_handle(request: Request, short_id: str, exp: int = 0, sign: str = ""):
+async def download_handle(request: Request, short_id: str):
     # 🛡️ Bot check at endpoint level (double safety)
     ua = request.headers.get("user-agent", "").lower()
     if any(bot in ua for bot in ["googlebot", "google", "safebrowsing", "bingbot"]):
@@ -424,7 +432,6 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
         r2_status = await asyncio.to_thread(check_r2_file_exists, r2_key)
 
         if r2_status == 'exists' or r2_status == 'error':
-            # Uses redirect, 0 bandwidth consumed here!
             return await redirect_to_r2(r2_key, entry["filename"], entry.get("content_type"), client_ip, "PERMANENT")
 
         log(f"R2 key dead for {short_id}, attempting self-heal...")
@@ -527,7 +534,6 @@ async def download_handle(request: Request, short_id: str, exp: int = 0, sign: s
                 conn.commit(); conn.close()
             await asyncio.to_thread(remove_cache_key)
 
-    # Note: Telegram downloads still stream via the server (uses bandwidth) since Telegram gives no direct public URL
     tmp_path = f"/tmp/dl_{short_id}.bin"
     if short_id not in _active_dl:
         _active_dl[short_id] = {"dl_bytes": 0, "done": False, "err": False}
@@ -1365,7 +1371,6 @@ async def repair_r2_get(key: str):
 async def start_scan_api(key: str, background_tasks: BackgroundTasks):
     verify_key(key)
 
-    # Check if scan is already running
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
@@ -1375,9 +1380,7 @@ async def start_scan_api(key: str, background_tasks: BackgroundTasks):
         except:
             pass
 
-    # Process ko background me spawn karna taaki FastAPI block na ho
     def run_scanner_process():
-        # Aapka sys.executable directly python environment utha lega
         subprocess.Popen([sys.executable, "scan.py"])
 
     background_tasks.add_task(run_scanner_process)
@@ -1385,7 +1388,7 @@ async def start_scan_api(key: str, background_tasks: BackgroundTasks):
 
 @app.get("/api/scan/progress")
 async def scan_progress(key: str):
-    verify_key(key) # Security check for progress reading
+    verify_key(key) 
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
@@ -1401,10 +1404,8 @@ async def scan_delete_file(key: str, data: dict = Body(...)):
     if not file_code:
         raise HTTPException(status_code=400, detail="Missing file_code")
 
-    # Yahan existing 'file_delete' function ko seedha call kar rahe hain
     result = await file_delete(key, file_code)
     return result
-
 
 _client = None
 _client_lock = asyncio.Lock()
