@@ -21,8 +21,13 @@ def init_db():
     conn.execute('''CREATE TABLE IF NOT EXISTS workers (
         url TEXT PRIMARY KEY,
         status TEXT DEFAULT 'healthy',
-        last_checked INTEGER DEFAULT 0
+        last_checked INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT 0
     )''')
+    try:
+        conn.execute("ALTER TABLE workers ADD COLUMN created_at INTEGER DEFAULT 0")
+    except:
+        pass
     try:
         cur = conn.cursor()
         default_workers = [

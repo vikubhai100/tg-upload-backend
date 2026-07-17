@@ -244,8 +244,12 @@ async def deploy_new_cloudflare_worker():
                                 log(f"⏳ [CLOUDFLARE API] Retrying health check for {worker_url} (attempt {attempt+1}/5)...")
                                 
                             if is_safe:
+                                import time
                                 conn = get_db_connection()
-                                conn.execute("INSERT OR REPLACE INTO workers (url, status) VALUES (?, 'healthy')", (worker_url,))
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO workers (url, status, created_at) VALUES (?, 'healthy', ?)",
+                                    (worker_url, int(time.time()))
+                                )
                                 conn.commit()
                                 conn.close()
                                 return worker_url
@@ -350,6 +354,15 @@ async def workers_health_check_loop():
             for r in rows:
                 url = r["url"]
                 status = r["status"]
+                created_at = r["created_at"] if r["created_at"] else 0
+                
+                # Skip health check for workers deployed less than 2 minutes ago
+                # (DNS propagation takes time, checking too early causes false failures)
+                import time
+                age_seconds = int(time.time()) - created_at
+                if age_seconds < 120:
+                    log(f"⏳ [HEALTH CHECK] Skipping {url} — only {age_seconds}s old, waiting for DNS propagation...")
+                    continue
                 
                 # Check status and health
                 is_flagged_in_db = (status == "flagged")
