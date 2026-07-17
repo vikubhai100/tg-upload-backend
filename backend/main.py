@@ -494,11 +494,19 @@ async def deploy_new_cloudflare_worker():
                         s_result = await s_resp.json()
                         if s_result.get("success"):
                             log(f"✅ [CLOUDFLARE API] Subdomain enabled successfully for {script_name}")
-                            conn = get_db_connection()
-                            conn.execute("INSERT OR REPLACE INTO workers (url, status) VALUES (?, 'healthy')", (worker_url,))
-                            conn.commit()
-                            conn.close()
-                            return worker_url
+                            # Wait 3 seconds for Cloudflare routing to propagate
+                            await asyncio.sleep(3)
+                            
+                            # Verify if the newly created worker is healthy and safe before committing
+                            is_safe = await check_worker_health(worker_url)
+                            if is_safe:
+                                conn = get_db_connection()
+                                conn.execute("INSERT OR REPLACE INTO workers (url, status) VALUES (?, 'healthy')", (worker_url,))
+                                conn.commit()
+                                conn.close()
+                                return worker_url
+                            else:
+                                log(f"❌ [CLOUDFLARE API] Newly created worker {worker_url} failed safe health check.")
                 log(f"❌ [CLOUDFLARE API] Failed to deploy worker: {result}")
     except Exception as e:
         log(f"❌ [CLOUDFLARE API] Exception during deployment: {str(e)}")
