@@ -302,12 +302,50 @@ async def delete_cloudflare_worker_script(url_or_name):
         log(f"❌ [CLOUDFLARE API] Exception during deletion: {str(e)}")
     return False
 
+async def update_existing_cloudflare_worker_script(name, script_code):
+    log(f"🔄 [CLOUDFLARE API] Syncing latest GitHub code to active worker: {name}")
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts/{name}"
+    
+    metadata = {
+        "main_module": "worker.js",
+        "bindings": [
+            {
+                "name": "dataURLKING",
+                "type": "r2_bucket",
+                "bucket_name": "urlking"
+            }
+        ]
+    }
+    
+    data = aiohttp.FormData()
+    data.add_field('metadata', json.dumps(metadata), content_type='application/json')
+    data.add_field('script', script_code, filename='worker.js', content_type='application/javascript+module')
+    
+    headers = {
+        "Authorization": f"Bearer {CLOUDFLARE_TOKEN}"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url, data=data, headers=headers) as resp:
+                result = await resp.json()
+                if result.get("success"):
+                    log(f"✅ [CLOUDFLARE API] Successfully updated code in {name}")
+                    return True
+                else:
+                    log(f"❌ [CLOUDFLARE API] Failed to update script code {name}: {result}")
+    except Exception as e:
+        log(f"❌ [CLOUDFLARE API] Exception during update: {str(e)}")
+    return False
+
 async def workers_health_check_loop():
     # Loop that runs every 5 minutes to verify all workers.
     # If any worker is flagged/unhealthy, it automatically deploys a new worker and deletes the unhealthy one.
     await asyncio.sleep(30)
     while True:
         try:
+            # Fetch latest script code from GitHub raw source to sync to healthy workers
+            script_code = await fetch_latest_worker_script_from_github()
+            
             conn = get_db_connection()
             rows = conn.execute("SELECT url, status FROM workers").fetchall()
             conn.close()
@@ -337,6 +375,10 @@ async def workers_health_check_loop():
                         log(f"✅ [HEALTH CHECK] Successfully deployed replacement worker: {new_worker}")
                     else:
                         log(f"❌ [HEALTH CHECK] Auto-replacement failed to deploy for {url}")
+                else:
+                    # Sync GitHub changes to the active healthy worker domain
+                    name = url.replace("https://", "").replace("http://", "").split(".")[0]
+                    await update_existing_cloudflare_worker_script(name, script_code)
         except Exception as e:
             log(f"❌ [HEALTH CHECK] Loop exception: {str(e)}")
         await asyncio.sleep(300)
