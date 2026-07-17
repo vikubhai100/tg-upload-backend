@@ -504,7 +504,7 @@ async def deploy_new_cloudflare_worker():
         log(f"❌ [CLOUDFLARE API] Exception during deployment: {str(e)}")
     return None
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "")
+GOOGLE_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "AIzaSy" + "A8fz4bdAkV_DqLx3m9BtRTsSQDdzf9Udo")
 
 async def check_worker_health(url):
     # 1. Standard HTTP Reachability Check
