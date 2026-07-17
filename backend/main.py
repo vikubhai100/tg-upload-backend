@@ -8,6 +8,8 @@ import threading
 import math
 import boto3
 import sys
+import random
+import string
 import aiohttp
 import hashlib
 import hmac      
@@ -182,6 +184,23 @@ def init_db():
         client_ip TEXT,
         expires_at INTEGER
     )''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS workers (
+        url TEXT PRIMARY KEY,
+        status TEXT DEFAULT 'healthy',
+        last_checked INTEGER DEFAULT 0
+    )''')
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM workers")
+        if cur.fetchone()[0] == 0:
+            default_workers = [
+                "https://d1.urlking.workers.dev",
+                "https://download.urlking.workers.dev"
+            ]
+            for w in default_workers:
+                cur.execute("INSERT OR IGNORE INTO workers (url, status) VALUES (?, 'healthy')", (w,))
+    except Exception:
+        pass
     try:
         conn.execute("ALTER TABLE files ADD COLUMN tg_backup_msg_id INTEGER DEFAULT 0")
     except:
@@ -289,11 +308,238 @@ async def cache_cleanup_loop():
         await asyncio.sleep(12 * 3600) 
 
 # ============================================================
+# ⛅ CLOUDFLARE WORKERS AUTODEPLOY & ROTATION SYSTEM
+# ============================================================
+CLOUDFLARE_TOKEN = os.getenv("CLOUDFLARE_TOKEN", "")
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "c756225d2d945ebc6c51149e7a1e3cfe")
+
+UNIFIED_WORKER_JS = """const SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2110";
+
+async function verifySignature(token, signature) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(SECURE_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+  const sigBuffer = new Uint8Array(
+    signature.match(/.{1,2}/g).map(byte => parseInt(byte, 16))
+  );
+  return await crypto.subtle.verify(
+    "HMAC",
+    key,
+    sigBuffer,
+    encoder.encode(token)
+  );
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    if (path === "/health") {
+      return new Response("OK", { status: 200 });
+    }
+    const userAgent = (request.headers.get("user-agent") || "").toLowerCase();
+    const bannedCrawlers = [
+      'googlebot', 'mediapartners-google', 'adsbot-google', 'bingbot', 'yandexbot', 
+      'baiduspider', 'twitterbot', 'facebookexternalhit', 'google-publisher-plugin',
+      'lighthouse', 'chrome-lighthouse', 'duckduckbot', 'slurp', 'ia_archiver'
+    ];
+    if (bannedCrawlers.some(bot => userAgent.includes(bot))) {
+      return new Response("Access Denied.", { status: 403 });
+    }
+    if (path === "/" || path === "" || path !== "/d") {
+      return new Response(`
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Nothing Here</title>
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                    background-color: #ffffff;
+                    color: #000000;
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: center;
+                    height: 100vh;
+                    margin: 0;
+                    text-align: center;
+                }
+                .container { max-width: 600px; padding: 20px; }
+                h1 { font-size: 32px; font-weight: 600; margin: 0 0 10px 0; }
+                p { font-size: 16px; color: #333333; margin: 0 0 5px 0; }
+                .footer { position: absolute; bottom: 20px; right: 30px; font-size: 12px; color: #666666; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <svg width="280" height="280" viewBox="0 0 280 280" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <circle cx="140" cy="140" r="80" fill="#E0F2FE"/>
+                    <path d="M110 115H170V155H110V115Z" fill="#0284C7"/>
+                    <rect x="115" y="120" width="8" height="8" rx="4" fill="#F59E0B"/>
+                    <rect x="127" y="120" width="8" height="8" rx="4" fill="#F59E0B"/>
+                    <rect x="139" y="120" width="8" height="8" rx="4" fill="#F59E0B"/>
+                    <path d="M125 145C125 140 155 140 155 145" stroke="white" stroke-width="3" stroke-linecap="round"/>
+                    <circle cx="140" cy="140" r="120" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="4 4"/>
+                </svg>
+                <h1>There is nothing here yet</h1>
+                <p>If you expect something to be here, it may take some time.</p>
+                <p>Please check back again later.</p>
+            </div>
+            <div class="footer">Powered by Cloudflare</div>
+        </body>
+        </html>
+      `, { status: 200, headers: { "Content-Type": "text/html" } });
+    }
+    const token = url.searchParams.get("id");
+    const signature = url.searchParams.get("sig");
+    if (!token || !signature) {
+      return new Response("Access Denied: Missing parameters.", { status: 400 });
+    }
+    const isValid = await verifySignature(token, signature);
+    if (!isValid) {
+      return new Response("Access Denied: Invalid signature token.", { status: 403 });
+    }
+    let payload;
+    try {
+      const decodedStr = atob(token.replace(/-/g, "+").replace(/_/g, "/"));
+      payload = JSON.parse(decodedStr);
+    } catch (e) {
+      return new Response("Access Denied: Corrupted payload.", { status: 400 });
+    }
+    const { k: fileKey, n: filename, e: exp, i: authorizedIp } = payload;
+    const currentTime = Math.floor(Date.now() / 1000);
+    if (currentTime > parseInt(exp)) {
+      return new Response("Link Expired: Download session has expired.", { status: 410 });
+    }
+    const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || "unknown";
+    function getSubnet(ip) {
+      if (ip.includes(".")) {
+        return ip.split(".").slice(0, 3).join(".");
+      } else if (ip.includes(":")) {
+        return ip.split(":").slice(0, 3).join(":");
+      }
+      return ip;
+    }
+    if (getSubnet(clientIp) !== getSubnet(authorizedIp)) {
+      return new Response("Forbidden: Restricted download network.", { status: 403 });
+    }
+    try {
+      const object = await env.dataURLKING.get(fileKey);
+      if (object === null) {
+        return new Response("File Not Found.", { status: 404 });
+      }
+      const headers = new Headers();
+      object.writeHttpMetadata(headers);
+      headers.set("etag", object.httpEtag);
+      headers.set("Content-Security-Policy", "default-src 'none'");
+      headers.set("X-Content-Type-Options", "nosniff");
+      headers.set("Content-Disposition", `attachment; filename="${filename}"`);
+      return new Response(object.body, { headers });
+    } catch (err) {
+      return new Response("Error retrieving stream: " + err.message, { status: 500 });
+    }
+  }
+};
+"""
+
+async def deploy_new_cloudflare_worker():
+    import random
+    import string
+    
+    random_suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    script_name = f"download-{random_suffix}"
+    worker_url = f"https://{script_name}.urlking.workers.dev"
+    
+    log(f"⚡ [CLOUDFLARE API] Deploying fresh worker: {worker_url}")
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts/{script_name}"
+    
+    metadata = {
+        "main_module": "worker.js",
+        "bindings": [
+            {
+                "name": "dataURLKING",
+                "type": "r2_bucket",
+                "bucket_name": "urlking"
+            }
+        ]
+    }
+    
+    data = aiohttp.FormData()
+    data.add_field('metadata', json.dumps(metadata), content_type='application/json')
+    data.add_field('script', UNIFIED_WORKER_JS, filename='worker.js', content_type='application/javascript+module')
+    
+    headers = {
+        "Authorization": f"Bearer {CLOUDFLARE_TOKEN}"
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url, data=data, headers=headers) as resp:
+                result = await resp.json()
+                if result.get("success"):
+                    subdomain_url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts/{script_name}/subdomain"
+                    async with session.post(subdomain_url, json={"enabled": True}, headers=headers) as s_resp:
+                        s_result = await s_resp.json()
+                        if s_result.get("success"):
+                            log(f"✅ [CLOUDFLARE API] Subdomain enabled successfully for {script_name}")
+                            conn = get_db_connection()
+                            conn.execute("INSERT OR REPLACE INTO workers (url, status) VALUES (?, 'healthy')", (worker_url,))
+                            conn.commit()
+                            conn.close()
+                            return worker_url
+                log(f"❌ [CLOUDFLARE API] Failed to deploy worker: {result}")
+    except Exception as e:
+        log(f"❌ [CLOUDFLARE API] Exception during deployment: {str(e)}")
+    return None
+
+async def check_worker_health(url):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(f"{url}/health", timeout=2) as resp:
+                return resp.status == 200
+    except Exception:
+        return False
+
+async def get_active_worker():
+    conn = get_db_connection()
+    rows = conn.execute("SELECT url FROM workers WHERE status = 'healthy'").fetchall()
+    conn.close()
+    
+    workers = [r["url"] for r in rows]
+    import random
+    random.shuffle(workers)
+    
+    for w in workers:
+        if await check_worker_health(w):
+            return w
+        else:
+            conn = get_db_connection()
+            conn.execute("UPDATE workers SET status = 'flagged' WHERE url = ?", (w,))
+            conn.commit()
+            conn.close()
+            log(f"🚨 [ROTATOR] Flagged worker removed from active rotation: {w}")
+            
+    # Auto-deploy a fresh worker if all current ones are flagged/blocked
+    new_worker = await deploy_new_cloudflare_worker()
+    if new_worker:
+        return new_worker
+        
+    return "https://download.urlking.workers.dev"
+
+# ============================================================
 # 🔥 OPAQUE TOKEN REDIRECT
 # ============================================================
 async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="REDIRECT"):
     try:
-        CUSTOM_DOMAIN = "https://d1.urlking.workers.dev"
+        CUSTOM_DOMAIN = await get_active_worker()
         SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2110"
         exp = int(time.time()) + 300 
 
@@ -309,7 +555,7 @@ async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="RED
         ).hexdigest()
 
         url = f"{CUSTOM_DOMAIN}/d?id={token}&sig={signature}"
-        log(f"🚀 R2 {log_tag} | HIDDEN: {safe_name} | IP: {client_ip}")
+        log(f"🚀 R2 {log_tag} | HIDDEN: {safe_name} | IP: {client_ip} | Worker: {CUSTOM_DOMAIN}")
 
         return RedirectResponse(url=url, headers={"X-Robots-Tag": "noindex, nofollow"})
     except Exception as e: 
