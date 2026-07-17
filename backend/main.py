@@ -37,7 +37,7 @@ from backend.config import (
     BOT_TOKEN, API_ID, API_HASH, CHANNEL_ID, BASE_URL, SESSION_STR, DB_FILE_SQLITE,
     INTERNAL_API_KEY, BASE_DIR, FRONTEND_DIR, log, format_size, safeFile
 )
-from backend.database import init_db, get_db_connection, save_file_entry, get_file_entry
+from backend.database import init_db, get_db_connection, save_file_entry, get_file_entry, cache_cleanup_loop, r2_deduplication_loop
 from backend.cloudflare import get_active_worker
 from backend.bot_guard import bot_guard_middleware
 

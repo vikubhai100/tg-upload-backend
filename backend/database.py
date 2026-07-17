@@ -83,3 +83,80 @@ def get_file_entry(short_id):
         return dict(row) if row else None
     finally:
         conn.close()
+
+# ============================================================
+# 🔄 R2 CLEANUP & CACHE SWEEPER BACKGROUND LOOPS
+# ============================================================
+import boto3
+import asyncio
+from datetime import datetime, timezone, timedelta
+from botocore.config import Config
+from backend.config import R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET_NAME
+
+db_r2_client = boto3.client(
+    service_name='s3',
+    endpoint_url=R2_ENDPOINT,
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY,
+    config=Config(signature_version='s3v4')
+)
+
+def execute_r2_cleanup():
+    try:
+        conn = get_db_connection()
+        duplicates_hash = conn.execute('''
+            SELECT file_hash, COUNT(*) as c FROM files 
+            WHERE storage_type = 'r2' AND file_hash IS NOT NULL AND file_hash != '' AND r2_key IS NOT NULL
+            GROUP BY file_hash HAVING c > 1
+        ''').fetchall()
+
+        for dup in duplicates_hash:
+            f_hash = dup["file_hash"]
+            rows = conn.execute("SELECT short_id, r2_key FROM files WHERE file_hash = ? AND storage_type = 'r2' ORDER BY rowid ASC", (f_hash,)).fetchall()
+            if len(rows) > 1:
+                master_r2_key = rows[0]["r2_key"]
+                for i in range(1, len(rows)):
+                    row_key = rows[i]["r2_key"]
+                    conn.execute("UPDATE files SET r2_key = ? WHERE short_id = ?", (master_r2_key, rows[i]["short_id"]))
+                    if row_key and row_key != master_r2_key:
+                        still_used = conn.execute("SELECT COUNT(*) FROM files WHERE r2_key = ? AND short_id != ?", (row_key, rows[i]["short_id"])).fetchone()[0]
+                        if still_used == 0:
+                            try: db_r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=row_key)
+                            except: pass
+        conn.commit(); conn.close()
+        log("R2 deduplication completed safely")
+    except Exception as e:
+        log(f"R2 cleanup error: {str(e)}")
+
+def execute_cache_sweeper():
+    try:
+        cutoff_date = datetime.now(timezone.utc) - timedelta(hours=24)
+        paginator = db_r2_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix='cache_')
+        conn = get_db_connection()
+
+        for page in pages:
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    if obj['LastModified'] < cutoff_date:
+                        try:
+                            db_r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=obj['Key'])
+                            conn.execute("UPDATE files SET r2_cache_key = NULL WHERE r2_cache_key = ?", (obj['Key'],))
+                        except: pass
+
+        current_time = int(time.time())
+        conn.execute("DELETE FROM used_tokens WHERE expires_at < ?", (current_time,))
+        conn.commit(); conn.close()
+    except Exception: pass
+
+async def r2_deduplication_loop():
+    await asyncio.sleep(60) 
+    while True:
+        await asyncio.to_thread(execute_r2_cleanup)
+        await asyncio.sleep(86400) 
+
+async def cache_cleanup_loop():
+    await asyncio.sleep(120) 
+    while True:
+        await asyncio.to_thread(execute_cache_sweeper)
+        await asyncio.sleep(12 * 3600)
