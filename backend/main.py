@@ -195,7 +195,11 @@ def init_db():
         if cur.fetchone()[0] == 0:
             default_workers = [
                 "https://d1.urlking.workers.dev",
-                "https://download.urlking.workers.dev"
+                "https://download.urlking.workers.dev",
+                "https://download2.urlking.workers.dev",
+                "https://download3.urlking.workers.dev",
+                "https://download4.urlking.workers.dev",
+                "https://download5.urlking.workers.dev"
             ]
             for w in default_workers:
                 cur.execute("INSERT OR IGNORE INTO workers (url, status) VALUES (?, 'healthy')", (w,))
