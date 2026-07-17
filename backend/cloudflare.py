@@ -178,6 +178,21 @@ async def check_worker_health(url):
             
     return True
 
+async def fetch_latest_worker_script_from_github():
+    # Fetch the latest worker.js from your GitHub repository raw URL
+    raw_url = "https://raw.githubusercontent.com/vikubhai100/downloadURLKING_Cloudflare_workers/main/worker.js"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(raw_url, timeout=5) as resp:
+                if resp.status == 200:
+                    code = await resp.text()
+                    if "export default" in code or "addEventListener" in code:
+                        return code
+    except Exception as e:
+        log(f"⚠️ [GITHUB FETCH] Failed to get latest script from GitHub: {str(e)}")
+    # Fallback to local hardcoded script if GitHub is unreachable
+    return UNIFIED_WORKER_JS
+
 async def deploy_new_cloudflare_worker():
     random_suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
     script_name = f"download-{random_suffix}"
@@ -185,6 +200,9 @@ async def deploy_new_cloudflare_worker():
     
     log(f"⚡ [CLOUDFLARE API] Deploying fresh worker: {worker_url}")
     url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts/{script_name}"
+    
+    # Dynamically fetch the latest code from GitHub
+    script_code = await fetch_latest_worker_script_from_github()
     
     metadata = {
         "main_module": "worker.js",
@@ -199,7 +217,7 @@ async def deploy_new_cloudflare_worker():
     
     data = aiohttp.FormData()
     data.add_field('metadata', json.dumps(metadata), content_type='application/json')
-    data.add_field('script', UNIFIED_WORKER_JS, filename='worker.js', content_type='application/javascript+module')
+    data.add_field('script', script_code, filename='worker.js', content_type='application/javascript+module')
     
     headers = {
         "Authorization": f"Bearer {CLOUDFLARE_TOKEN}"
