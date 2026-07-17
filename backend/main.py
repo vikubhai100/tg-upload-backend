@@ -38,7 +38,7 @@ from backend.config import (
     INTERNAL_API_KEY, BASE_DIR, FRONTEND_DIR, log, format_size, safeFile
 )
 from backend.database import init_db, get_db_connection, save_file_entry, get_file_entry, cache_cleanup_loop, r2_deduplication_loop
-from backend.cloudflare import get_active_worker, deploy_new_cloudflare_worker, workers_health_check_loop
+from backend.cloudflare import get_active_worker, deploy_new_cloudflare_worker, workers_health_check_loop, delete_cloudflare_worker_script
 from backend.bot_guard import bot_guard_middleware
 
 r2_client = boto3.client(
@@ -880,6 +880,9 @@ async def delete_worker(key: str, data: dict = Body(...)):
     if not url:
         raise HTTPException(status_code=400, detail="Missing URL")
     
+    # Delete from Cloudflare
+    await delete_cloudflare_worker_script(url)
+    
     def run_delete():
         conn = get_db_connection()
         try:
@@ -901,6 +904,9 @@ async def replace_worker(key: str, data: dict = Body(...)):
     if not new_url:
         raise HTTPException(status_code=500, detail="Failed to deploy new Cloudflare Worker")
         
+    # Delete the replaced flagged worker from Cloudflare
+    await delete_cloudflare_worker_script(url)
+    
     def run_db_replace():
         conn = get_db_connection()
         try:

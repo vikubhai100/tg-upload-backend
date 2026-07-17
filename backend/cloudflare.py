@@ -262,6 +262,28 @@ async def get_active_worker():
         
     return "https://download.urlking.workers.dev"
 
+async def delete_cloudflare_worker_script(url_or_name):
+    # Extracts name from URL if URL is passed, e.g. https://download-xyz.urlking.workers.dev
+    name = url_or_name.replace("https://", "").replace("http://", "").split(".")[0]
+    
+    log(f"🗑️ [CLOUDFLARE API] Deleting worker script from Cloudflare: {name}")
+    api_url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts/{name}"
+    headers = {
+        "Authorization": f"Bearer {CLOUDFLARE_TOKEN}"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(api_url, headers=headers) as resp:
+                result = await resp.json()
+                if result.get("success"):
+                    log(f"✅ [CLOUDFLARE API] Successfully deleted {name} from Cloudflare")
+                    return True
+                else:
+                    log(f"❌ [CLOUDFLARE API] Failed to delete script {name}: {result}")
+    except Exception as e:
+        log(f"❌ [CLOUDFLARE API] Exception during deletion: {str(e)}")
+    return False
+
 async def workers_health_check_loop():
     # Loop that runs every 5 minutes to verify all workers.
     # If any worker is flagged/unhealthy, it automatically deploys a new worker and deletes the unhealthy one.
@@ -288,6 +310,9 @@ async def workers_health_check_loop():
                     conn.execute("DELETE FROM workers WHERE url = ?", (url,))
                     conn.commit()
                     conn.close()
+                    
+                    # Delete from Cloudflare to keep account clean
+                    await delete_cloudflare_worker_script(url)
                     
                     new_worker = await deploy_new_cloudflare_worker()
                     if new_worker:
