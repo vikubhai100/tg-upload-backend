@@ -215,8 +215,16 @@ async def deploy_new_cloudflare_worker():
                         s_result = await s_resp.json()
                         if s_result.get("success"):
                             log(f"✅ [CLOUDFLARE API] Subdomain enabled successfully for {script_name}")
-                            await asyncio.sleep(3)
-                            is_safe = await check_worker_health(worker_url)
+                            
+                            # Let's retry checking health up to 5 times (total 25 seconds) to allow DNS propagation
+                            is_safe = False
+                            for attempt in range(5):
+                                await asyncio.sleep(5)
+                                if await check_worker_health(worker_url):
+                                    is_safe = True
+                                    break
+                                log(f"⏳ [CLOUDFLARE API] Retrying health check for {worker_url} (attempt {attempt+1}/5)...")
+                                
                             if is_safe:
                                 conn = get_db_connection()
                                 conn.execute("INSERT OR REPLACE INTO workers (url, status) VALUES (?, 'healthy')", (worker_url,))
@@ -266,16 +274,24 @@ async def workers_health_check_loop():
             
             for r in rows:
                 url = r["url"]
-                is_safe = await check_worker_health(url)
+                status = r["status"]
+                
+                # Check status and health
+                is_flagged_in_db = (status == "flagged")
+                is_safe = await check_worker_health(url) if not is_flagged_in_db else False
+                
                 if not is_safe:
                     log(f"⚠️ [HEALTH CHECK] Worker {url} is unhealthy/flagged. Initiating auto-replacement...")
+                    
+                    # Delete the flagged worker FIRST to avoid duplicate loop checks
+                    conn = get_db_connection()
+                    conn.execute("DELETE FROM workers WHERE url = ?", (url,))
+                    conn.commit()
+                    conn.close()
+                    
                     new_worker = await deploy_new_cloudflare_worker()
                     if new_worker:
                         log(f"✅ [HEALTH CHECK] Successfully deployed replacement worker: {new_worker}")
-                        conn = get_db_connection()
-                        conn.execute("DELETE FROM workers WHERE url = ?", (url,))
-                        conn.commit()
-                        conn.close()
                     else:
                         log(f"❌ [HEALTH CHECK] Auto-replacement failed to deploy for {url}")
         except Exception as e:
