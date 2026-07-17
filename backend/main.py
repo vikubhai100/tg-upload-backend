@@ -191,18 +191,18 @@ def init_db():
     )''')
     try:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM workers")
-        if cur.fetchone()[0] == 0:
-            default_workers = [
-                "https://d1.urlking.workers.dev",
-                "https://download.urlking.workers.dev",
-                "https://download2.urlking.workers.dev",
-                "https://download3.urlking.workers.dev",
-                "https://download4.urlking.workers.dev",
-                "https://download5.urlking.workers.dev"
-            ]
-            for w in default_workers:
-                cur.execute("INSERT OR IGNORE INTO workers (url, status) VALUES (?, 'healthy')", (w,))
+        default_workers = [
+            "https://d1.urlking.workers.dev",
+            "https://download.urlking.workers.dev",
+            "https://download2.urlking.workers.dev",
+            "https://download3.urlking.workers.dev",
+            "https://download4.urlking.workers.dev",
+            "https://download5.urlking.workers.dev"
+        ]
+        for w in default_workers:
+            cur.execute("INSERT OR IGNORE INTO workers (url, status) VALUES (?, 'healthy')", (w,))
+            # Reset default workers to healthy on startup so rotation is fresh
+            cur.execute("UPDATE workers SET status = 'healthy' WHERE url = ?", (w,))
     except Exception:
         pass
     try:
