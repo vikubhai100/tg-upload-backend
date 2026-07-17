@@ -111,6 +111,13 @@ async def serve_index():
         return index_alt.read_text(encoding="utf-8")
     return "<h2>Frontend Not Found (Check your /frontend folder)</h2>"
 
+@app.get("/workers", response_class=HTMLResponse)
+async def serve_workers_page():
+    workers_file = FRONTEND_DIR / "workers.html"
+    if workers_file.exists():
+        return workers_file.read_text(encoding="utf-8")
+    return "<h2>Workers Manager page not found.</h2>"
+
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 elif (Path(__file__).resolve().parent / "static").exists():
@@ -876,6 +883,15 @@ async def add_worker(key: str, data: dict = Body(...)):
             conn.close()
     await db_thread(run_add)
     return {"status": 200, "msg": "Worker added"}
+
+@app.post("/api/workers/deploy")
+async def deploy_worker(key: str):
+    verify_key(key)
+    new_url = await deploy_new_cloudflare_worker()
+    if not new_url:
+        raise HTTPException(status_code=500, detail="Failed to deploy new Cloudflare Worker")
+    return {"status": 200, "msg": "Worker deployed successfully", "url": new_url}
+
 
 @app.post("/api/workers/delete")
 async def delete_worker(key: str, data: dict = Body(...)):

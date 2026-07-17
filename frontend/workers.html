@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>URLKING — Workers Manager</title>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    :root {
+      --indigo: #4f46e5;
+      --indigo-light: #e0e7ff;
+      --indigo-dark: #3730a3;
+      --green: #059669;
+      --green-light: #ecfdf5;
+      --red: #dc2626;
+      --red-light: #fef2f2;
+      --yellow: #d97706;
+      --yellow-light: #fffbeb;
+    }
+
+    body { font-family: 'Plus Jakarta Sans', sans-serif; }
+
+    /* ===== PAGE LAYOUT ===== */
+    .workers-page {
+      min-height: 100vh;
+      background: var(--bg);
+      padding: 0 0 60px 0;
+    }
+
+    /* ===== TOP NAV BAR ===== */
+    .wm-topbar {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      backdrop-filter: blur(12px);
+    }
+
+    .wm-topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .wm-back-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 16px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-decoration: none;
+      transition: all 0.2s;
+    }
+    .wm-back-btn:hover { background: var(--border); color: var(--text); }
+
+    .wm-title {
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .wm-title span { color: var(--indigo); }
+
+    .wm-badge {
+      background: var(--indigo-light);
+      color: var(--indigo);
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-family: 'JetBrains Mono';
+    }
+
+    /* ===== STATS CARDS ===== */
+    .wm-stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+      padding: 32px 32px 0;
+    }
+
+    .wm-stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+    }
+    .wm-stat-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .wm-stat-value {
+      font-size: 32px;
+      font-weight: 800;
+      color: var(--text);
+      margin: 4px 0 0;
+      font-family: 'JetBrains Mono';
+    }
+    .wm-stat-value.green { color: var(--green); }
+    .wm-stat-value.red { color: var(--red); }
+    .wm-stat-value.yellow { color: var(--yellow); }
+
+    /* ===== MAIN CONTENT ===== */
+    .wm-content { padding: 24px 32px; }
+
+    /* ===== ADD WORKER CARD ===== */
+    .wm-add-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 24px;
+      margin-bottom: 24px;
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+      flex-wrap: wrap;
+    }
+    .wm-add-card-inner { flex: 1; min-width: 200px; }
+    .wm-add-card label { font-size: 13px; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 8px; }
+    .wm-add-input {
+      width: 100%;
+      background: var(--bg);
+      border: 1.5px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 16px;
+      color: var(--text);
+      font-size: 14px;
+      font-family: 'JetBrains Mono';
+      outline: none;
+      transition: border-color 0.2s;
+      box-sizing: border-box;
+    }
+    .wm-add-input:focus { border-color: var(--indigo); }
+    .wm-add-input::placeholder { color: var(--text-muted); }
+
+    .wm-btn-add {
+      background: var(--indigo);
+      color: white;
+      border: none;
+      border-radius: 12px;
+      padding: 12px 24px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+    .wm-btn-add:hover { background: var(--indigo-dark); transform: translateY(-1px); }
+    .wm-btn-add:disabled { opacity: 0.6; transform: none; cursor: not-allowed; }
+
+    .wm-btn-deploy {
+      background: linear-gradient(135deg, #059669, #047857);
+      color: white;
+      border: none;
+      border-radius: 12px;
+      padding: 12px 24px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+    .wm-btn-deploy:hover { transform: translateY(-1px); box-shadow: 0 8px 20px rgba(5, 150, 105, 0.3); }
+    .wm-btn-deploy:disabled { opacity: 0.6; transform: none; cursor: not-allowed; }
+
+    /* ===== WORKERS TABLE ===== */
+    .wm-table-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      overflow: hidden;
+    }
+
+    .wm-table-header {
+      padding: 20px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .wm-table-header-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .wm-refresh-btn {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 14px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      transition: all 0.2s;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+    .wm-refresh-btn:hover { background: var(--border); color: var(--text); }
+
+    /* Worker rows */
+    .wm-row {
+      display: flex;
+      align-items: center;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--border);
+      gap: 16px;
+      transition: background 0.15s;
+    }
+    .wm-row:last-child { border-bottom: none; }
+    .wm-row:hover { background: var(--bg); }
+
+    .wm-row-index {
+      font-family: 'JetBrains Mono';
+      font-size: 12px;
+      color: var(--text-muted);
+      width: 24px;
+      text-align: center;
+      flex-shrink: 0;
+    }
+
+    .wm-row-info { flex: 1; min-width: 0; }
+
+    .wm-row-url {
+      font-family: 'JetBrains Mono';
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 100%;
+    }
+    .wm-row-url a { color: inherit; text-decoration: none; }
+    .wm-row-url a:hover { color: var(--indigo); text-decoration: underline; }
+
+    .wm-row-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 3px;
+    }
+
+    .wm-status-badge {
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      flex-shrink: 0;
+    }
+    .wm-status-badge.healthy { background: var(--green-light); color: var(--green); }
+    .wm-status-badge.flagged { background: var(--red-light); color: var(--red); }
+    .wm-status-badge.unknown { background: var(--yellow-light); color: var(--yellow); }
+
+    .wm-row-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+    .wm-btn-sm {
+      padding: 7px 14px;
+      border-radius: 9px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      border: none;
+      transition: all 0.2s;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+    .wm-btn-sm:disabled { opacity: 0.5; cursor: not-allowed; }
+    .wm-btn-replace { background: var(--indigo-light); color: var(--indigo); }
+    .wm-btn-replace:hover:not(:disabled) { background: var(--indigo); color: white; }
+    .wm-btn-delete { background: var(--red-light); color: var(--red); }
+    .wm-btn-delete:hover:not(:disabled) { background: var(--red); color: white; }
+
+    /* ===== EMPTY STATE ===== */
+    .wm-empty {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-muted);
+    }
+    .wm-empty-icon { font-size: 48px; margin-bottom: 16px; }
+    .wm-empty-text { font-size: 16px; font-weight: 600; }
+
+    /* ===== LOADING STATE ===== */
+    .wm-loading {
+      text-align: center;
+      padding: 40px;
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    /* ===== PAGINATION ===== */
+    .wm-pagination {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 20px 24px;
+      border-top: 1px solid var(--border);
+    }
+    .wm-page-btn {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 18px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      cursor: pointer;
+      transition: all 0.2s;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+    .wm-page-btn:hover:not(:disabled) { background: var(--indigo); color: white; border-color: var(--indigo); }
+    .wm-page-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .wm-page-info {
+      font-family: 'JetBrains Mono';
+      font-size: 13px;
+      color: var(--text-muted);
+      min-width: 90px;
+      text-align: center;
+    }
+
+    /* ===== TOAST ===== */
+    #wm-toast {
+      position: fixed;
+      bottom: 30px;
+      right: 30px;
+      background: #1e293b;
+      color: white;
+      padding: 14px 22px;
+      border-radius: 14px;
+      font-size: 14px;
+      font-weight: 600;
+      display: none;
+      z-index: 9999;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+      animation: slideIn 0.3s ease;
+    }
+    @keyframes slideIn { from { opacity:0; transform: translateY(20px); } to { opacity:1; transform: translateY(0); } }
+
+    @media (max-width: 600px) {
+      .wm-topbar { padding: 12px 16px; }
+      .wm-stats, .wm-content { padding: 16px; }
+      .wm-add-card { padding: 16px; }
+      .wm-row { padding: 14px 16px; flex-wrap: wrap; }
+      .wm-row-url { font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="workers-page">
+
+  <!-- TOP NAV -->
+  <div class="wm-topbar">
+    <div class="wm-topbar-left">
+      <a href="/" class="wm-back-btn" id="backBtn">← Back to Files</a>
+      <div class="wm-title">
+        ☁️ <span>Workers</span> Manager
+        <span class="wm-badge" id="totalBadge">0 TOTAL</span>
+      </div>
+    </div>
+    <button class="wm-refresh-btn" onclick="loadWorkers()">🔄 Refresh</button>
+  </div>
+
+  <!-- STATS -->
+  <div class="wm-stats">
+    <div class="wm-stat-card">
+      <div class="wm-stat-label">Total Workers</div>
+      <div class="wm-stat-value" id="statTotal">—</div>
+    </div>
+    <div class="wm-stat-card">
+      <div class="wm-stat-label">Healthy</div>
+      <div class="wm-stat-value green" id="statHealthy">—</div>
+    </div>
+    <div class="wm-stat-card">
+      <div class="wm-stat-label">Flagged</div>
+      <div class="wm-stat-value red" id="statFlagged">—</div>
+    </div>
+  </div>
+
+  <!-- MAIN CONTENT -->
+  <div class="wm-content">
+
+    <!-- ADD WORKER -->
+    <div class="wm-add-card">
+      <div class="wm-add-card-inner">
+        <label>Add Existing Worker URL</label>
+        <input type="text" id="addWorkerUrl" class="wm-add-input" placeholder="https://example.urlking.workers.dev" />
+      </div>
+      <button class="wm-btn-add" id="btnAddWorker" onclick="addWorkerByUrl()">
+        + Add Worker
+      </button>
+      <button class="wm-btn-deploy" id="btnDeployNew" onclick="deployNewWorker()">
+        🚀 Deploy New Worker
+      </button>
+    </div>
+
+    <!-- WORKERS TABLE -->
+    <div class="wm-table-card">
+      <div class="wm-table-header">
+        <div class="wm-table-header-title">
+          Active Worker Domains
+        </div>
+        <div style="font-size:13px; color: var(--text-muted);" id="pageCountLabel">Page 1 of 1</div>
+      </div>
+
+      <div id="wmWorkersList">
+        <div class="wm-loading">Loading workers...</div>
+      </div>
+
+      <!-- PAGINATION -->
+      <div class="wm-pagination" id="wmPagination" style="display:none;">
+        <button class="wm-page-btn" id="wmBtnPrev" onclick="changePage(-1)">← Prev</button>
+        <span class="wm-page-info" id="wmPageInfo">1 / 1</span>
+        <button class="wm-page-btn" id="wmBtnNext" onclick="changePage(1)">Next →</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- TOAST -->
+<div id="wm-toast"></div>
+
+<script>
+const API_BASE = window.location.origin;
+const PER_PAGE = 5;
+let secretKey = localStorage.getItem('telestore_v2_key') || '';
+let allWorkers = [];
+let currentPage = 1;
+let totalPages = 1;
+
+// ============ AUTH CHECK ============
+if (!secretKey) {
+  window.location.href = '/';
+}
+
+// ============ TOAST ============
+function toast(msg, duration = 3000) {
+  const el = document.getElementById('wm-toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => { el.style.display = 'none'; }, duration);
+}
+
+// ============ LOAD WORKERS ============
+async function loadWorkers() {
+  document.getElementById('wmWorkersList').innerHTML = '<div class="wm-loading">⏳ Loading workers...</div>';
+  try {
+    const res = await fetch(`${API_BASE}/api/workers?key=${encodeURIComponent(secretKey)}`);
+    if (!res.ok) { 
+      if (res.status === 403) { window.location.href = '/'; return; }
+      throw new Error('Failed');
+    }
+    allWorkers = await res.json();
+    updateStats();
+    renderPage(1);
+  } catch(e) {
+    document.getElementById('wmWorkersList').innerHTML = '<div class="wm-empty"><div class="wm-empty-icon">⚠️</div><div class="wm-empty-text">Failed to load workers. Check your session.</div></div>';
+  }
+}
+
+// ============ STATS ============
+function updateStats() {
+  const total = allWorkers.length;
+  const healthy = allWorkers.filter(w => w.status === 'healthy').length;
+  const flagged = allWorkers.filter(w => w.status === 'flagged').length;
+  document.getElementById('statTotal').textContent = total;
+  document.getElementById('statHealthy').textContent = healthy;
+  document.getElementById('statFlagged').textContent = flagged;
+  document.getElementById('totalBadge').textContent = `${total} TOTAL`;
+}
+
+// ============ RENDER PAGE ============
+function renderPage(page) {
+  currentPage = page;
+  totalPages = Math.max(1, Math.ceil(allWorkers.length / PER_PAGE));
+  const start = (page - 1) * PER_PAGE;
+  const pageItems = allWorkers.slice(start, start + PER_PAGE);
+
+  document.getElementById('wmPageInfo').textContent = `${currentPage} / ${totalPages}`;
+  document.getElementById('pageCountLabel').textContent = `Page ${currentPage} of ${totalPages}`;
+  document.getElementById('wmBtnPrev').disabled = currentPage <= 1;
+  document.getElementById('wmBtnNext').disabled = currentPage >= totalPages;
+  document.getElementById('wmPagination').style.display = totalPages > 1 ? 'flex' : 'none';
+
+  if (pageItems.length === 0) {
+    document.getElementById('wmWorkersList').innerHTML = `
+      <div class="wm-empty">
+        <div class="wm-empty-icon">☁️</div>
+        <div class="wm-empty-text">No workers added yet.</div>
+        <p style="font-size:13px; color: var(--text-muted); margin-top: 8px;">Add a worker URL above or deploy a new one.</p>
+      </div>`;
+    return;
+  }
+
+  document.getElementById('wmWorkersList').innerHTML = pageItems.map((w, idx) => {
+    const globalIdx = start + idx + 1;
+    const isHealthy = w.status === 'healthy';
+    const badgeClass = isHealthy ? 'healthy' : (w.status === 'flagged' ? 'flagged' : 'unknown');
+    const domain = w.url.replace('https://', '');
+    const actionBtn = isHealthy
+      ? `<button class="wm-btn-sm wm-btn-delete" onclick="deleteWorker('${w.url}', this)">🗑 Remove</button>`
+      : `<button class="wm-btn-sm wm-btn-replace" onclick="replaceWorker('${w.url}', this)">🔄 Replace</button>
+         <button class="wm-btn-sm wm-btn-delete" onclick="deleteWorker('${w.url}', this)">🗑 Remove</button>`;
+
+    return `
+      <div class="wm-row" id="row-${globalIdx}">
+        <div class="wm-row-index">${globalIdx}</div>
+        <div class="wm-row-info">
+          <div class="wm-row-url"><a href="${w.url}" target="_blank">${domain}</a></div>
+          <div class="wm-row-meta">Full URL: ${w.url}</div>
+        </div>
+        <span class="wm-status-badge ${badgeClass}">${w.status}</span>
+        <div class="wm-row-actions">${actionBtn}</div>
+      </div>`;
+  }).join('');
+}
+
+function changePage(dir) {
+  const newPage = currentPage + dir;
+  if (newPage < 1 || newPage > totalPages) return;
+  renderPage(newPage);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// ============ ADD WORKER BY URL ============
+async function addWorkerByUrl() {
+  const url = document.getElementById('addWorkerUrl').value.trim();
+  if (!url || !secretKey) return;
+  if (!url.startsWith('http')) { toast('❌ Invalid URL. Must start with https://'); return; }
+
+  const btn = document.getElementById('btnAddWorker');
+  btn.textContent = 'Adding...'; btn.disabled = true;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/workers/add?key=${encodeURIComponent(secretKey)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    if (res.ok) {
+      document.getElementById('addWorkerUrl').value = '';
+      toast('✅ Worker added successfully!');
+      await loadWorkers();
+    } else {
+      toast('❌ Failed to add worker.');
+    }
+  } catch(e) {
+    toast('❌ Network error.');
+  } finally {
+    btn.textContent = '+ Add Worker'; btn.disabled = false;
+  }
+}
+
+// ============ DEPLOY NEW WORKER ============
+async function deployNewWorker() {
+  if (!confirm('Deploy a brand new Cloudflare Worker with the latest code from GitHub?')) return;
+  const btn = document.getElementById('btnDeployNew');
+  btn.textContent = '🚀 Deploying...'; btn.disabled = true;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/workers/deploy?key=${encodeURIComponent(secretKey)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    const data = await res.json();
+    if (res.ok && data.url) {
+      toast(`✅ Deployed: ${data.url}`);
+      await loadWorkers();
+    } else {
+      toast(`❌ Deployment failed: ${data.detail || 'Unknown error'}`);
+    }
+  } catch(e) {
+    toast('❌ Network error during deployment.');
+  } finally {
+    btn.textContent = '🚀 Deploy New Worker'; btn.disabled = false;
+  }
+}
+
+// ============ DELETE WORKER ============
+async function deleteWorker(url, btn) {
+  if (!confirm(`Remove this worker?\n${url}\n\nThis will also delete it from Cloudflare.`)) return;
+
+  btn.textContent = 'Removing...'; btn.disabled = true;
+  try {
+    const res = await fetch(`${API_BASE}/api/workers/delete?key=${encodeURIComponent(secretKey)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    if (res.ok) {
+      toast('✅ Worker removed from Cloudflare and database.');
+      await loadWorkers();
+    } else {
+      toast('❌ Failed to remove worker.');
+      btn.textContent = '🗑 Remove'; btn.disabled = false;
+    }
+  } catch(e) {
+    toast('❌ Network error.');
+    btn.textContent = '🗑 Remove'; btn.disabled = false;
+  }
+}
+
+// ============ REPLACE FLAGGED WORKER ============
+async function replaceWorker(url, btn) {
+  if (!confirm(`Replace this flagged worker with a fresh deployment?\n${url}`)) return;
+  btn.textContent = 'Replacing...'; btn.disabled = true;
+  try {
+    const res = await fetch(`${API_BASE}/api/workers/replace?key=${encodeURIComponent(secretKey)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      toast(`✅ Replaced! New URL: ${data.new_url}`);
+      await loadWorkers();
+    } else {
+      toast(`❌ Replacement failed: ${data.detail || 'Error'}`);
+      btn.textContent = '🔄 Replace'; btn.disabled = false;
+    }
+  } catch(e) {
+    toast('❌ Network error.');
+    btn.textContent = '🔄 Replace'; btn.disabled = false;
+  }
+}
+
+// ============ INIT ============
+loadWorkers();
+</script>
+</body>
+</html>
