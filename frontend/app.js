@@ -243,17 +243,51 @@ async function loadWorkers() {
       const statusBorder = isHealthy ? '#a7f3d0' : '#fecaca';
       const statusColor = isHealthy ? '#065f46' : '#991b1b';
       
+      const actionButton = isHealthy 
+        ? `<button class="btn-danger" style="background:#f1f5f9; color:var(--text); border:1px solid var(--border);" onclick="deleteWorker('${w.url}')">Remove</button>`
+        : `<div style="display: flex; gap: 8px;">
+             <button class="btn-cta" style="padding: 8px 14px; font-size: 13px; background:#4f46e5; border-radius: 8px;" onclick="replaceWorker('${w.url}', this)">Auto-Replace</button>
+             <button class="btn-danger" onclick="deleteWorker('${w.url}')">Remove</button>
+           </div>`;
+      
       return `
         <div class="infected-item" style="background: ${statusBg}; border-color: ${statusBorder};">
           <div>
             <strong style="color: var(--text); font-size: 14px;">${w.url}</strong><br>
             <span style="font-size: 12px; color: ${statusColor}; font-weight: bold;">Status: ${w.status.toUpperCase()}</span>
           </div>
-          <button class="btn-danger" onclick="deleteWorker('${w.url}')">Remove</button>
+          ${actionButton}
         </div>
       `;
     }).join('');
   } catch(e) { console.error("Load Workers Error:", e); }
+}
+
+async function replaceWorker(url, btnElement) {
+  if (!confirm(`Are you sure you want to replace this flagged worker with a fresh one?\n${url}`)) return;
+  if (!secretKey) return;
+  
+  try {
+    btnElement.textContent = "Replacing...";
+    btnElement.disabled = true;
+    
+    const res = await fetch(`${API_BASE}/api/workers/replace?key=${encodeURIComponent(secretKey)}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: url})
+    });
+    
+    const data = await res.json();
+    if (res.ok) {
+      alert(`Worker replaced successfully!\nNew URL: ${data.new_url}`);
+    } else {
+      alert(`Replacement failed: ${data.detail || 'Error'}`);
+    }
+    loadWorkers();
+  } catch(e) { 
+    alert("Replacement failed."); 
+    console.error(e); 
+  }
 }
 
 async function addWorker() {

@@ -38,7 +38,7 @@ from backend.config import (
     INTERNAL_API_KEY, BASE_DIR, FRONTEND_DIR, log, format_size, safeFile
 )
 from backend.database import init_db, get_db_connection, save_file_entry, get_file_entry, cache_cleanup_loop, r2_deduplication_loop
-from backend.cloudflare import get_active_worker
+from backend.cloudflare import get_active_worker, deploy_new_cloudflare_worker, workers_health_check_loop
 from backend.bot_guard import bot_guard_middleware
 
 r2_client = boto3.client(
@@ -890,6 +890,28 @@ async def delete_worker(key: str, data: dict = Body(...)):
     await db_thread(run_delete)
     return {"status": 200, "msg": "Worker deleted"}
 
+@app.post("/api/workers/replace")
+async def replace_worker(key: str, data: dict = Body(...)):
+    verify_key(key)
+    url = data.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing URL")
+    
+    new_url = await deploy_new_cloudflare_worker()
+    if not new_url:
+        raise HTTPException(status_code=500, detail="Failed to deploy new Cloudflare Worker")
+        
+    def run_db_replace():
+        conn = get_db_connection()
+        try:
+            conn.execute("DELETE FROM workers WHERE url = ?", (url,))
+            conn.commit()
+        finally:
+            conn.close()
+    await db_thread(run_db_replace)
+    return {"status": 200, "msg": "Worker replaced successfully", "new_url": new_url}
+
+
 @app.get("/api/file/rename")
 async def file_rename(key: str, file_code: str, name: str):
     verify_key(key)
@@ -1371,6 +1393,7 @@ async def on_startup():
     init_db()
     asyncio.create_task(cache_cleanup_loop())
     asyncio.create_task(r2_deduplication_loop())
+    asyncio.create_task(workers_health_check_loop())
     async def auto_repair():
         await asyncio.sleep(30)
         try:

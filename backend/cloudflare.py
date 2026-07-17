@@ -253,3 +253,31 @@ async def get_active_worker():
         return new_worker
         
     return "https://download.urlking.workers.dev"
+
+async def workers_health_check_loop():
+    # Loop that runs every 5 minutes to verify all workers.
+    # If any worker is flagged/unhealthy, it automatically deploys a new worker and deletes the unhealthy one.
+    await asyncio.sleep(30)
+    while True:
+        try:
+            conn = get_db_connection()
+            rows = conn.execute("SELECT url, status FROM workers").fetchall()
+            conn.close()
+            
+            for r in rows:
+                url = r["url"]
+                is_safe = await check_worker_health(url)
+                if not is_safe:
+                    log(f"⚠️ [HEALTH CHECK] Worker {url} is unhealthy/flagged. Initiating auto-replacement...")
+                    new_worker = await deploy_new_cloudflare_worker()
+                    if new_worker:
+                        log(f"✅ [HEALTH CHECK] Successfully deployed replacement worker: {new_worker}")
+                        conn = get_db_connection()
+                        conn.execute("DELETE FROM workers WHERE url = ?", (url,))
+                        conn.commit()
+                        conn.close()
+                    else:
+                        log(f"❌ [HEALTH CHECK] Auto-replacement failed to deploy for {url}")
+        except Exception as e:
+            log(f"❌ [HEALTH CHECK] Loop exception: {str(e)}")
+        await asyncio.sleep(300)
