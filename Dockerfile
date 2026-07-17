@@ -7,6 +7,9 @@ WORKDIR /app
 RUN apt-get update -y && \
     apt-get install -y -o Acquire::Retries=3 --no-install-recommends \
     gcc \
+    g++ \
+    make \
+    python3-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
