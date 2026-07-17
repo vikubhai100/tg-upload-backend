@@ -196,7 +196,7 @@ def init_db():
             "https://download.urlking.workers.dev",
             "https://download2.urlking.workers.dev",
             "https://download3.urlking.workers.dev",
-            "https://download4.urlking.workers.dev",
+            "https://download4.urlking.workers.dev",    
             "https://download5.urlking.workers.dev"
         ]
         for w in default_workers:
@@ -1307,6 +1307,52 @@ async def file_delete(key: str, file_code: str):
                 conn.close()
         await asyncio.to_thread(run_delete)
     return {"status": 200, "msg": "OK"}
+
+@app.get("/api/workers")
+async def get_workers(key: str):
+    verify_key(key)
+    def run_get():
+        conn = get_db_connection()
+        try:
+            rows = conn.execute("SELECT * FROM workers").fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+    return await db_thread(run_get)
+
+@app.post("/api/workers/add")
+async def add_worker(key: str, data: dict = Body(...)):
+    verify_key(key)
+    url = data.get("url", "").strip()
+    if not url or not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+    
+    def run_add():
+        conn = get_db_connection()
+        try:
+            conn.execute("INSERT OR REPLACE INTO workers (url, status) VALUES (?, 'healthy')", (url,))
+            conn.commit()
+        finally:
+            conn.close()
+    await db_thread(run_add)
+    return {"status": 200, "msg": "Worker added"}
+
+@app.post("/api/workers/delete")
+async def delete_worker(key: str, data: dict = Body(...)):
+    verify_key(key)
+    url = data.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing URL")
+    
+    def run_delete():
+        conn = get_db_connection()
+        try:
+            conn.execute("DELETE FROM workers WHERE url = ?", (url,))
+            conn.commit()
+        finally:
+            conn.close()
+    await db_thread(run_delete)
+    return {"status": 200, "msg": "Worker deleted"}
 
 @app.get("/api/file/rename")
 async def file_rename(key: str, file_code: str, name: str):

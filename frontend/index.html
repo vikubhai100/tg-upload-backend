@@ -281,8 +281,11 @@
         <h2 style="font-size: 24px; font-weight: 800;">Private Directory</h2>
         <p style="color: var(--text-muted); font-size: 14px;" id="fileCount">0 files available</p>
       </div>
-      <!-- 🔥 SCANNER TOGGLE BUTTON -->
-      <button class="btn-scan-toggle" onclick="toggleScanner()">🛡️ Virus Scanner</button>
+      <!-- 🔥 SCANNER & WORKERS TOGGLE BUTTONS -->
+      <div style="display: flex; gap: 8px;">
+        <button class="btn-scan-toggle" onclick="toggleScanner()">🛡️ Virus Scanner</button>
+        <button class="btn-scan-toggle" style="background:#4f46e5; box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.2);" onclick="toggleWorkersManager()">☁️ Workers Manager</button>
+      </div>
     </div>
 
     <!-- 🔥 SCANNER PANEL UI -->
@@ -299,6 +302,21 @@
 
       <!-- Yahan Infected Files Dikhayi Dengi -->
       <div class="infected-list" id="infectedList"></div>
+    </div>
+
+    <!-- ☁️ WORKERS MANAGER PANEL -->
+    <div id="workersSection" class="scanner-panel" style="border-color: #4f46e5; box-shadow: 0 10px 15px -3px rgba(79, 70, 229, 0.1);">
+      <div class="scanner-header" style="flex-wrap: wrap; gap: 12px;">
+        <h3 style="color: #4f46e5;">☁️ Cloudflare Workers Manager</h3>
+        <div style="display: flex; gap: 8px; flex: 1; min-width: 280px; justify-content: flex-end;">
+          <input type="text" id="newWorkerUrl" class="auth-input" style="margin-bottom:0; padding: 10px 14px; text-align: left; flex: 1;" placeholder="https://example.workers.dev" />
+          <button class="btn-cta" style="padding: 10px 20px; font-size: 13px; background: #4f46e5;" onclick="addWorker()">Add Worker</button>
+        </div>
+      </div>
+      
+      <div class="scan-status-text">Manage your active and flagged worker domains for link rotation.</div>
+      
+      <div class="infected-list" id="workersList"></div>
     </div>
 
     <div id="filesList"></div>
@@ -539,6 +557,79 @@
       alert("Failed to delete file."); 
       console.error(e); 
     }
+  }
+
+  // =========================================================
+  // ☁️ WORKERS MANAGER JS LOGIC
+  // =========================================================
+
+  function toggleWorkersManager() {
+    const el = document.getElementById('workersSection');
+    el.style.display = el.style.display === 'block' ? 'none' : 'block';
+    if (el.style.display === 'block') {
+      loadWorkers();
+    }
+  }
+
+  async function loadWorkers() {
+    if (!secretKey) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/workers?key=${encodeURIComponent(secretKey)}`);
+      const workers = await res.json();
+      
+      const listEl = document.getElementById('workersList');
+      if (workers.length === 0) {
+        listEl.innerHTML = '<div style="padding:14px; background:#f1f5f9; color:var(--text-muted); border-radius:10px; text-align:center; width: 100%;">No workers added yet.</div>';
+        return;
+      }
+      
+      listEl.innerHTML = workers.map(w => {
+        const isHealthy = w.status === 'healthy';
+        const statusBg = isHealthy ? '#ecfdf5' : '#fef2f2';
+        const statusBorder = isHealthy ? '#a7f3d0' : '#fecaca';
+        const statusColor = isHealthy ? '#065f46' : '#991b1b';
+        
+        return `
+          <div class="infected-item" style="background: ${statusBg}; border-color: ${statusBorder};">
+            <div>
+              <strong style="color: var(--text); font-size: 14px;">${w.url}</strong><br>
+              <span style="font-size: 12px; color: ${statusColor}; font-weight: bold;">Status: ${w.status.toUpperCase()}</span>
+            </div>
+            <button class="btn-danger" onclick="deleteWorker('${w.url}')">Remove</button>
+          </div>
+        `;
+      }).join('');
+    } catch(e) { console.error("Load Workers Error:", e); }
+  }
+
+  async function addWorker() {
+    const urlInput = document.getElementById('newWorkerUrl');
+    const url = urlInput.value.trim();
+    if (!url || !secretKey) return;
+    
+    try {
+      await fetch(`${API_BASE}/api/workers/add?key=${encodeURIComponent(secretKey)}`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({url: url})
+      });
+      urlInput.value = '';
+      loadWorkers();
+    } catch(e) { console.error("Add Worker Error:", e); }
+  }
+
+  async function deleteWorker(url) {
+    if (!confirm(`Are you sure you want to remove this worker?\n${url}`)) return;
+    if (!secretKey) return;
+    
+    try {
+      await fetch(`${API_BASE}/api/workers/delete?key=${encodeURIComponent(secretKey)}`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({url: url})
+      });
+      loadWorkers();
+    } catch(e) { console.error("Delete Worker Error:", e); }
   }
 
   if (secretKey) {
