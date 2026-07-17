@@ -504,13 +504,43 @@ async def deploy_new_cloudflare_worker():
         log(f"❌ [CLOUDFLARE API] Exception during deployment: {str(e)}")
     return None
 
+GOOGLE_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "")
+
 async def check_worker_health(url):
+    # 1. Standard HTTP Reachability Check
     try:
         async with aiohttp.ClientSession() as session:
             async with session.head(f"{url}/health", timeout=2) as resp:
-                return resp.status == 200
+                if resp.status != 200:
+                    return False
     except Exception:
         return False
+
+    # 2. Google Safe Browsing Lookup
+    if GOOGLE_API_KEY:
+        try:
+            domain = url.replace("https://", "").replace("http://", "").split("/")[0]
+            api_url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_API_KEY}"
+            payload = {
+                "client": {"clientId": "urlking-backend", "clientVersion": "1.0.0"},
+                "threatInfo": {
+                    "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+                    "platformTypes": ["ANY_PLATFORM"],
+                    "threatEntryTypes": ["URL"],
+                    "threatEntries": [{"url": domain}]
+                }
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(api_url, json=payload, timeout=3) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if "matches" in data and len(data["matches"]) > 0:
+                            log(f"⚠️ [ROTATOR] Google Safe Browsing flagged domain: {domain}")
+                            return False
+        except Exception as e:
+            log(f"⚠️ [ROTATOR] Safe Browsing check failed: {str(e)}")
+            
+    return True
 
 async def get_active_worker():
     conn = get_db_connection()
