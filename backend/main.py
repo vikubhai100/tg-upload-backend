@@ -294,7 +294,7 @@ async def cache_cleanup_loop():
 async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="REDIRECT"):
     try:
         # Worker URL
-        CUSTOM_DOMAIN = "https://d.urlking.workers.dev"
+        CUSTOM_DOMAIN = "https://d1.urlking.workers.dev"
         SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2110"
         exp = int(time.time()) + 300  # Link active for 5 minutes
 
