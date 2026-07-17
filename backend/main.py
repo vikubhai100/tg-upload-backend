@@ -921,7 +921,7 @@ async def replace_worker(key: str, data: dict = Body(...)):
     await db_thread(run_db_replace)
     return {"status": 200, "msg": "Worker replaced successfully", "new_url": new_url}
 
-@app.post("/api/github/webhook")
+@app.post("/github_push_event")
 async def github_webhook(request: Request):
     # GitHub hits this endpoint whenever you push code changes to GitHub.
     # It reads the latest script from GitHub and updates all active workers.
