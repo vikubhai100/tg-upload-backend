@@ -15,7 +15,7 @@ import aiofiles
 import concurrent.futures
 import subprocess 
 import json       
-import base64     # 🔥 Added for Base64 URL Encoding
+import base64     
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -289,24 +289,16 @@ async def cache_cleanup_loop():
         await asyncio.sleep(12 * 3600) 
 
 # ============================================================
-# 🔥 OPAQUE TOKEN REDIRECT (HIDES FILENAMES & EXTENSIONS)
+# 🔥 OPAQUE TOKEN REDIRECT
 # ============================================================
 async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="REDIRECT"):
     try:
-        # Worker URL
         CUSTOM_DOMAIN = "https://d1.urlking.workers.dev"
         SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2110"
-        exp = int(time.time()) + 300  # Link active for 5 minutes
+        exp = int(time.time()) + 300 
 
         safe_name = safeFile(filename)
-
-        payload_data = {
-            "k": r2_key,
-            "n": safe_name,
-            "e": exp,
-            "i": client_ip
-        }
-
+        payload_data = {"k": r2_key, "n": safe_name, "e": exp, "i": client_ip}
         payload_json = json.dumps(payload_data)
         token = base64.urlsafe_b64encode(payload_json.encode('utf-8')).decode('utf-8').rstrip('=')
 
@@ -317,7 +309,6 @@ async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="RED
         ).hexdigest()
 
         url = f"{CUSTOM_DOMAIN}/d?id={token}&sig={signature}"
-
         log(f"🚀 R2 {log_tag} | HIDDEN: {safe_name} | IP: {client_ip}")
 
         return RedirectResponse(url=url, headers={"X-Robots-Tag": "noindex, nofollow"})
@@ -369,7 +360,6 @@ async def bg_fetch_and_cache(short_id, entry):
 
             await asyncio.to_thread(update_cache_db)
 
-            # ♻️ AUTO-RESTORE (Only for large files)
             entry_check = await asyncio.to_thread(get_file_entry, short_id)
             if entry_check and not entry_check.get("r2_key"):
                 try:
@@ -423,8 +413,30 @@ async def download_handle(request: Request, short_id: str):
     entry = await asyncio.to_thread(get_file_entry, short_id)
 
     if not entry:
-        log(f"⚠️ Download: {short_id} not in DB. Attempting auto-recovery...")
         raise HTTPException(status_code=404, detail="File Not Found")
+
+    file_size = int(entry.get("size", 0))
+
+    # 🔥 LAZY CLEANUP: Agar purani file R2 par hai aur wo 100MB se chhoti hai, toh R2 se uda do!
+    if entry.get("storage_type") == "r2" and file_size <= 100 * 1024 * 1024:
+        log(f"🧹 Lazy Cleanup Triggered: {short_id} (<100MB) is marked as R2. Moving to Telegram stream.")
+        old_r2_key = entry.get("r2_key")
+        entry["storage_type"] = "telegram"
+        entry["r2_key"] = None
+
+        def fix_small_file_db():
+            conn = get_db_connection()
+            try:
+                conn.execute("UPDATE files SET storage_type = 'telegram', r2_key = NULL WHERE short_id = ?", (short_id,))
+                conn.commit()
+            finally:
+                conn.close()
+            if old_r2_key:
+                try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=old_r2_key)
+                except: pass
+                
+        # Background me database aur R2 delete karo
+        asyncio.create_task(asyncio.to_thread(fix_small_file_db))
 
     if entry.get("storage_type") == "r2" and entry.get("r2_key"):
         r2_key = entry["r2_key"]
@@ -521,17 +533,32 @@ async def download_handle(request: Request, short_id: str):
             return HTMLResponse(content="<div style='font-family:sans-serif; text-align:center; margin-top:50px; color:#991b1b;'><h2>File Deleted</h2></div>", status_code=404)
 
     if entry.get("r2_cache_key"):
-        r2_cache_key = entry["r2_cache_key"]
-        cache_status = await asyncio.to_thread(check_r2_file_exists, r2_cache_key)
-        if cache_status == 'exists' or cache_status == 'error':
-            return await redirect_to_r2(r2_cache_key, entry["filename"], entry.get("content_type"), client_ip, "CACHED LINK")
-
-        if entry.get("message_id") and int(entry.get("message_id")) > 0:
-            def remove_cache_key():
+        # 🔥 LAZY CACHE CLEANUP: 100MB se chhoti file cache me se delete karo!
+        if file_size <= 100 * 1024 * 1024:
+            old_cache = entry.get("r2_cache_key")
+            entry["r2_cache_key"] = None
+            def fix_small_cache_db():
                 conn = get_db_connection()
-                conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
-                conn.commit(); conn.close()
-            await asyncio.to_thread(remove_cache_key)
+                try:
+                    conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
+                    conn.commit()
+                finally:
+                    conn.close()
+                if old_cache:
+                    try: r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=old_cache)
+                    except: pass
+            asyncio.create_task(asyncio.to_thread(fix_small_cache_db))
+        else:
+            cache_status = await asyncio.to_thread(check_r2_file_exists, entry["r2_cache_key"])
+            if cache_status == 'exists' or cache_status == 'error':
+                return await redirect_to_r2(entry["r2_cache_key"], entry["filename"], entry.get("content_type"), client_ip, "CACHED LINK")
+
+            if entry.get("message_id") and int(entry.get("message_id")) > 0:
+                def remove_cache_key():
+                    conn = get_db_connection()
+                    conn.execute("UPDATE files SET r2_cache_key = NULL WHERE short_id = ?", (short_id,))
+                    conn.commit(); conn.close()
+                await asyncio.to_thread(remove_cache_key)
 
     tmp_path = f"/tmp/dl_{short_id}.bin"
     if short_id not in _active_dl:
@@ -544,7 +571,6 @@ async def download_handle(request: Request, short_id: str):
 
     if not os.path.exists(tmp_path): raise HTTPException(500, "Failed to connect to Backend")
 
-    file_size = int(entry["size"])
     filename_raw = entry["filename"]
     content_type = entry["content_type"] or "application/octet-stream"
     range_header = request.headers.get("Range")
@@ -936,6 +962,32 @@ async def file_clone(key: str, file_code: str):
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": 500, "error": f"Failed to save clone: {str(e)}"})
     return {"status": 200, "result": {"filecode": new_id}}
+
+# ============================================================
+# 🔥 ONE-CLICK API TO DELETE ALL <100MB FILES FROM R2
+# ============================================================
+@app.get("/api/clean_r2_small_files")
+async def clean_r2_small_files(key: str):
+    verify_key(key)
+    def run_cleanup():
+        conn = get_db_connection()
+        # Wo saari files find karo jo 100MB se chhoti hain aur R2 pe mapped hain
+        rows = conn.execute("SELECT short_id, r2_key FROM files WHERE size <= ? AND storage_type = 'r2' AND r2_key IS NOT NULL", (100 * 1024 * 1024,)).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                # 1. R2 se uda do
+                r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=row["r2_key"])
+                # 2. Database update kar do
+                conn.execute("UPDATE files SET storage_type = 'telegram', r2_key = NULL WHERE short_id = ?", (row["short_id"],))
+                count += 1
+            except: pass
+        conn.commit()
+        conn.close()
+        return count
+
+    deleted_count = await asyncio.to_thread(run_cleanup)
+    return {"status": "OK", "msg": f"Deleted {deleted_count} small files (<100MB) from R2 and forced to Telegram stream."}
 
 # ============================================================
 # 🔥 FILE DELETE LOGIC
