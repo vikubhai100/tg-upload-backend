@@ -299,32 +299,27 @@ async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="RED
         exp = int(time.time()) + 300  # Link active for 5 minutes
 
         safe_name = safeFile(filename)
-        
-        # 1. Pack data into JSON dictionary
+
         payload_data = {
             "k": r2_key,
             "n": safe_name,
             "e": exp,
             "i": client_ip
         }
-        
-        # 2. Encode to Base64 to hide the filename and details in the URL
+
         payload_json = json.dumps(payload_data)
         token = base64.urlsafe_b64encode(payload_json.encode('utf-8')).decode('utf-8').rstrip('=')
 
-        # 3. Generate Signature using the Token
         signature = hmac.new(
             SECURE_SECRET.encode('utf-8'),
             token.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
 
-        # 4. Final URL (Looks like /d?id=eyJr...&sig=abcd123...)
         url = f"{CUSTOM_DOMAIN}/d?id={token}&sig={signature}"
-        
+
         log(f"🚀 R2 {log_tag} | HIDDEN: {safe_name} | IP: {client_ip}")
-        
-        # Add noindex to instruct valid search bots not to index this redirect
+
         return RedirectResponse(url=url, headers={"X-Robots-Tag": "noindex, nofollow"})
     except Exception as e: 
         log(f"⚠️ Redirect Error: {str(e)}")
@@ -355,42 +350,47 @@ async def bg_fetch_and_cache(short_id, entry):
                 await asyncio.sleep(2)
 
         _active_dl[short_id]["done"] = True
-        r2_cache_key = f"cache_{short_id}_{uuid.uuid4().hex[:6]}"
-        def s3_up():
-            r2_client.upload_file(tmp_path, R2_BUCKET_NAME, r2_cache_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
-        await asyncio.to_thread(s3_up)
 
-        def update_cache_db():
-            conn = get_db_connection()
-            conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
-            doc_id = entry.get("doc_id")
-            if doc_id:
-                conn.execute("UPDATE files SET r2_cache_key = ? WHERE doc_id = ? AND r2_cache_key IS NULL", (r2_cache_key, doc_id))
-            conn.commit()
-            conn.close()
+        # 🔥 STRICT 100MB CHECK: Only cache/restore to R2 if > 100MB
+        if file_size > 100 * 1024 * 1024:
+            r2_cache_key = f"cache_{short_id}_{uuid.uuid4().hex[:6]}"
+            def s3_up():
+                r2_client.upload_file(tmp_path, R2_BUCKET_NAME, r2_cache_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
+            await asyncio.to_thread(s3_up)
 
-        await asyncio.to_thread(update_cache_db)
+            def update_cache_db():
+                conn = get_db_connection()
+                conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
+                doc_id = entry.get("doc_id")
+                if doc_id:
+                    conn.execute("UPDATE files SET r2_cache_key = ? WHERE doc_id = ? AND r2_cache_key IS NULL", (r2_cache_key, doc_id))
+                conn.commit()
+                conn.close()
 
-        # ♻️ AUTO-RESTORE
-        entry_check = await asyncio.to_thread(get_file_entry, short_id)
-        if entry_check and not entry_check.get("r2_key"):
-            try:
-                restore_r2_key = f"restored_{short_id}_{uuid.uuid4().hex[:6]}"
-                def restore_to_r2():
-                    r2_client.upload_file(tmp_path, R2_BUCKET_NAME, restore_r2_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
-                await asyncio.to_thread(restore_to_r2)
+            await asyncio.to_thread(update_cache_db)
 
-                def update_restore_db():
-                    conn = get_db_connection()
-                    try:
-                        conn.execute("UPDATE files SET r2_key = ?, storage_type = 'r2' WHERE short_id = ?", (restore_r2_key, short_id))
-                        conn.commit()
-                    finally:
-                        conn.close()
-                await asyncio.to_thread(update_restore_db)
-                log(f"♻️ Auto-restored to R2: {short_id} → {restore_r2_key}")
-            except Exception as restore_err:
-                log(f"⚠️ R2 restore failed for {short_id}: {str(restore_err)}")
+            # ♻️ AUTO-RESTORE (Only for large files)
+            entry_check = await asyncio.to_thread(get_file_entry, short_id)
+            if entry_check and not entry_check.get("r2_key"):
+                try:
+                    restore_r2_key = f"restored_{short_id}_{uuid.uuid4().hex[:6]}"
+                    def restore_to_r2():
+                        r2_client.upload_file(tmp_path, R2_BUCKET_NAME, restore_r2_key, ExtraArgs={'ContentType': entry["content_type"] or "application/octet-stream"})
+                    await asyncio.to_thread(restore_to_r2)
+
+                    def update_restore_db():
+                        conn = get_db_connection()
+                        try:
+                            conn.execute("UPDATE files SET r2_key = ?, storage_type = 'r2' WHERE short_id = ?", (restore_r2_key, short_id))
+                            conn.commit()
+                        finally:
+                            conn.close()
+                    await asyncio.to_thread(update_restore_db)
+                    log(f"♻️ Auto-restored to R2: {short_id} → {restore_r2_key}")
+                except Exception as restore_err:
+                    log(f"⚠️ R2 restore failed for {short_id}: {str(restore_err)}")
+        else:
+            log(f"⚡ File {short_id} is <100MB ({file_size} bytes). Finished stream, skipping R2 Cache.")
 
     except Exception:
         if short_id in _active_dl: _active_dl[short_id]["err"] = True
@@ -405,7 +405,6 @@ async def bg_fetch_and_cache(short_id, entry):
 # ============================================================
 @app.get("/download/{short_id}")
 async def download_handle(request: Request, short_id: str):
-    # 🛡️ Bot check at endpoint level (double safety)
     ua = request.headers.get("user-agent", "").lower()
     if any(bot in ua for bot in ["googlebot", "google", "safebrowsing", "bingbot"]):
         return HTMLResponse(content="<h1>404 Not Found</h1>", status_code=404)
@@ -526,7 +525,7 @@ async def download_handle(request: Request, short_id: str):
         cache_status = await asyncio.to_thread(check_r2_file_exists, r2_cache_key)
         if cache_status == 'exists' or cache_status == 'error':
             return await redirect_to_r2(r2_cache_key, entry["filename"], entry.get("content_type"), client_ip, "CACHED LINK")
-            
+
         if entry.get("message_id") and int(entry.get("message_id")) > 0:
             def remove_cache_key():
                 conn = get_db_connection()
@@ -598,8 +597,8 @@ async def download_handle(request: Request, short_id: str):
         "Content-Length": str(content_length),
         "Accept-Ranges": "bytes",
         "X-Accel-Buffering": "no",
-        "X-Robots-Tag": "noindex, nofollow",     # 🛡️ Bot index block
-        "X-Content-Type-Options": "nosniff"      # 🛡️ Sniffing prevention
+        "X-Robots-Tag": "noindex, nofollow",     
+        "X-Content-Type-Options": "nosniff"      
     }
     if range_header: headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
     return StreamingResponse(temp_file_streamer(), status_code=206 if range_header else 200, headers=headers)
@@ -650,7 +649,7 @@ async def api_upload(request: Request):
 
         filename = file_obj.filename
         content_type = getattr(file_obj, "content_type", "application/octet-stream")
-        tmp_path = f"/tmp/web_{uuid.uuid4().hex[:8]}.bin"
+        tmp_path = f"/tmp/{uuid.uuid4().hex}.bin"  # 🔥 STRICTLY BIN
 
         async with aiofiles.open(tmp_path, "wb") as f:
             while chunk := await file_obj.read(2 * 1024 * 1024): await f.write(chunk)
@@ -701,13 +700,25 @@ async def api_upload(request: Request):
                 uploaded_file = await parallel_upload(client, tmp_path)
                 msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
 
+        # 🔥 STRICT 100MB CHECK FOR R2 UPLOAD
+        storage_type = "telegram"
+        r2_key = None
+        
+        if file_size > 100 * 1024 * 1024:
+            r2_key = f"r2_{uuid.uuid4().hex[:8]}"
+            def upload_to_r2():
+                with open(tmp_path, 'rb') as f:
+                    r2_client.upload_fileobj(f, R2_BUCKET_NAME, r2_key)
+            await asyncio.to_thread(upload_to_r2)
+            storage_type = "r2"
+
         short_id = str(uuid.uuid4())[:8]
         await asyncio.to_thread(save_file_entry, short_id, {
             "message_id": msg.id, "filename": filename, "size": file_size,
             "content_type": content_type, "channel_id": CHANNEL_ID,
             "doc_id": msg.document.id, "access_hash": msg.document.access_hash,
             "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id,
-            "file_hash": file_hash, "storage_type": "telegram"
+            "file_hash": file_hash, "storage_type": storage_type, "r2_key": r2_key
         })
         try: os.unlink(tmp_path)
         except: pass
@@ -724,7 +735,7 @@ async def remote_upload(request: Request):
         verify_key(data.get("key"))
         url = data.get("url")
         filename = data.get("filename", f"file_{int(time.time())}.bin")
-        tmp_path = f"/tmp/remote_{uuid.uuid4().hex[:8]}"
+        tmp_path = f"/tmp/remote_{uuid.uuid4().hex[:8]}.bin" # 🔥 STRICTLY BIN
 
         download_timeout = aiohttp.ClientTimeout(total=1800, connect=30, sock_read=120) 
         last_err = None
@@ -800,6 +811,18 @@ async def remote_upload(request: Request):
                 uploaded_file = await parallel_upload(client, tmp_path)
                 msg = await client.send_file(CHANNEL_ID, file=uploaded_file, force_document=True)
 
+        # 🔥 STRICT 100MB CHECK FOR R2 UPLOAD
+        storage_type = "telegram"
+        r2_key = None
+
+        if actual_size > 100 * 1024 * 1024:
+            r2_key = f"r2_{uuid.uuid4().hex[:8]}"
+            def upload_to_r2():
+                with open(tmp_path, 'rb') as f:
+                    r2_client.upload_fileobj(f, R2_BUCKET_NAME, r2_key)
+            await asyncio.to_thread(upload_to_r2)
+            storage_type = "r2"
+
         short_id = str(uuid.uuid4())[:8]
 
         await asyncio.to_thread(save_file_entry, short_id, {
@@ -807,7 +830,7 @@ async def remote_upload(request: Request):
             "content_type": detected_type, "channel_id": CHANNEL_ID,
             "doc_id": msg.document.id, "access_hash": msg.document.access_hash,
             "file_reference": msg.document.file_reference.hex(), "dc_id": msg.document.dc_id,
-            "file_hash": file_hash
+            "file_hash": file_hash, "storage_type": storage_type, "r2_key": r2_key
         })
 
         try: os.unlink(tmp_path)
