@@ -38,7 +38,11 @@ from backend.config import (
     INTERNAL_API_KEY, BASE_DIR, FRONTEND_DIR, log, format_size, safeFile
 )
 from backend.database import init_db, get_db_connection, save_file_entry, get_file_entry, cache_cleanup_loop, r2_deduplication_loop
-from backend.cloudflare import get_active_worker, deploy_new_cloudflare_worker, workers_health_check_loop, delete_cloudflare_worker_script
+from backend.cloudflare import (
+    get_active_worker, deploy_new_cloudflare_worker, workers_health_check_loop, 
+    delete_cloudflare_worker_script, update_existing_cloudflare_worker_script, 
+    fetch_latest_worker_script_from_github
+)
 from backend.bot_guard import bot_guard_middleware
 
 r2_client = boto3.client(
@@ -916,6 +920,41 @@ async def replace_worker(key: str, data: dict = Body(...)):
             conn.close()
     await db_thread(run_db_replace)
     return {"status": 200, "msg": "Worker replaced successfully", "new_url": new_url}
+
+@app.post("/api/github/webhook")
+async def github_webhook(request: Request):
+    # GitHub hits this endpoint whenever you push code changes to GitHub.
+    # It reads the latest script from GitHub and updates all active workers.
+    try:
+        payload = await request.json()
+        ref = payload.get("ref", "")
+        if "refs/heads/main" not in ref:
+            return {"status": "ignored", "reason": "not main branch push"}
+            
+        log("📢 [GITHUB WEBHOOK] Push detected on main branch. Starting active workers hot sync...")
+        script_code = await fetch_latest_worker_script_from_github()
+        
+        def get_all_active_workers():
+            conn = get_db_connection()
+            try:
+                rows = conn.execute("SELECT url FROM workers WHERE status = 'healthy'").fetchall()
+                return [r["url"] for r in rows]
+            finally:
+                conn.close()
+        
+        active_urls = await db_thread(get_all_active_workers)
+        updated_count = 0
+        for url in active_urls:
+            name = url.replace("https://", "").replace("http://", "").split(".")[0]
+            success = await update_existing_cloudflare_worker_script(name, script_code)
+            if success:
+                updated_count += 1
+                
+        return {"status": "success", "msg": f"Synced {updated_count} active workers with GitHub"}
+    except Exception as e:
+        log(f"❌ [GITHUB WEBHOOK] Sync error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/api/file/rename")

@@ -343,9 +343,6 @@ async def workers_health_check_loop():
     await asyncio.sleep(30)
     while True:
         try:
-            # Fetch latest script code from GitHub raw source to sync to healthy workers
-            script_code = await fetch_latest_worker_script_from_github()
-            
             conn = get_db_connection()
             rows = conn.execute("SELECT url, status FROM workers").fetchall()
             conn.close()
@@ -375,10 +372,6 @@ async def workers_health_check_loop():
                         log(f"✅ [HEALTH CHECK] Successfully deployed replacement worker: {new_worker}")
                     else:
                         log(f"❌ [HEALTH CHECK] Auto-replacement failed to deploy for {url}")
-                else:
-                    # Sync GitHub changes to the active healthy worker domain
-                    name = url.replace("https://", "").replace("http://", "").split(".")[0]
-                    await update_existing_cloudflare_worker_script(name, script_code)
         except Exception as e:
             log(f"❌ [HEALTH CHECK] Loop exception: {str(e)}")
         await asyncio.sleep(300)
