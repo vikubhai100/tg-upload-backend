@@ -2,6 +2,10 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 async def bot_guard_middleware(request: Request, call_next):
+    ua = request.headers.get("user-agent", "").lower()
+    if "github-hookshot" in ua:
+        return await call_next(request)
+
     if request.url.path.startswith("/api/"):
         return await call_next(request)
 
