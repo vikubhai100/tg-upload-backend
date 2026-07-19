@@ -30,17 +30,18 @@ def init_db():
         pass
     try:
         cur = conn.cursor()
-        default_workers = [
-            "https://d1.urlking.workers.dev",
-            "https://download.urlking.workers.dev",
-            "https://download2.urlking.workers.dev",
-            "https://download3.urlking.workers.dev",
-            "https://download4.urlking.workers.dev",
-            "https://download5.urlking.workers.dev"
-        ]
-        for w in default_workers:
-            cur.execute("INSERT OR IGNORE INTO workers (url, status) VALUES (?, 'healthy')", (w,))
-            cur.execute("UPDATE workers SET status = 'healthy' WHERE url = ?", (w,))
+        count = cur.execute("SELECT COUNT(*) FROM workers").fetchone()[0]
+        if count == 0:
+            default_workers = [
+                "https://d1.urlking.workers.dev",
+                "https://download.urlking.workers.dev",
+                "https://download2.urlking.workers.dev",
+                "https://download3.urlking.workers.dev",
+                "https://download4.urlking.workers.dev",
+                "https://download5.urlking.workers.dev"
+            ]
+            for w in default_workers:
+                cur.execute("INSERT OR IGNORE INTO workers (url, status) VALUES (?, 'healthy')", (w,))
     except Exception:
         pass
     try:
