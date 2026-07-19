@@ -377,8 +377,7 @@ async def workers_health_check_loop():
                     continue
                 
                 # Check status and health
-                is_flagged_in_db = (status == "flagged")
-                h_status = await check_worker_health(url) if not is_flagged_in_db else "flagged"
+                h_status = await check_worker_health(url)
                 
                 if h_status == "flagged":
                     log(f"⚠️ [HEALTH CHECK] Worker {url} is FLAGGED. Initiating auto-replacement...")
