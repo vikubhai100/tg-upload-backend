@@ -14,6 +14,8 @@ CLOUDFLARE_TOKEN = os.getenv("CLOUDFLARE_TOKEN", "")
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "c756225d2d945ebc6c51149e7a1e3cfe")
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "AIzaSy" + "A8fz4bdAkV_DqLx3m9BtRTsSQDdzf9Udo")
+DISABLE_SAFE_BROWSING = os.getenv("DISABLE_SAFE_BROWSING_CHECK", "false").lower() == "true"
+
 
 # ============================================================
 # 📱 TELEGRAM CONFIG

@@ -4,9 +4,10 @@ import random
 import string
 import asyncio
 import aiohttp
-from backend.config import CLOUDFLARE_TOKEN, CLOUDFLARE_ACCOUNT_ID, GOOGLE_API_KEY, log
+from backend.config import CLOUDFLARE_TOKEN, CLOUDFLARE_ACCOUNT_ID, GOOGLE_API_KEY, DISABLE_SAFE_BROWSING, log
 from backend.database import get_db_connection
 
+KV_NAMESPACE_ID = os.getenv("CLOUDFLARE_KV_NAMESPACE_ID", "")
 UNIFIED_WORKER_JS = """const SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2110";
 
 async function verifySignature(token, signature) {
@@ -156,6 +157,9 @@ async def check_worker_health(url):
 
     if not is_up:
         return "unhealthy"
+
+    if DISABLE_SAFE_BROWSING:
+        return "healthy"
 
     if GOOGLE_API_KEY:
         try:
