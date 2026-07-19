@@ -124,7 +124,7 @@ elif (Path(__file__).resolve().parent / "static").exists():
     app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
 
 # ============================================================
-# 🔥 OPAQUE TOKEN REDIRECT
+# 🔥 OPAQUE TOKEN REDIRECT (LEGACY — still used by /download/{short_id})
 # ============================================================
 async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="REDIRECT"):
     try:
@@ -151,7 +151,175 @@ async def redirect_to_r2(r2_key, filename, content_type, client_ip, log_tag="RED
         log(f"⚠️ Redirect Error: {str(e)}")
         raise HTTPException(status_code=500)
 
+# ============================================================
+# 🆕 ZERO-REDIRECT: Generate direct worker download URL (returns JSON)
+# ============================================================
+async def generate_download_url(r2_key, filename, content_type, client_ip):
+    """Generate a one-time worker download URL and return it as a dict (NOT a redirect)."""
+    try:
+        CUSTOM_DOMAIN = await get_active_worker()
+        SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2110"
+        exp = int(time.time()) + 120  # 2 minute expiry (shorter = safer)
+
+        safe_name = safeFile(filename)
+        nonce = uuid.uuid4().hex  # Unique nonce for one-time use validation in Worker KV
+
+        payload_data = {"k": r2_key, "n": safe_name, "e": exp, "i": client_ip, "nonce": nonce}
+        payload_json = json.dumps(payload_data)
+        token = base64.urlsafe_b64encode(payload_json.encode('utf-8')).decode('utf-8').rstrip('=')
+
+        signature = hmac.new(
+            SECURE_SECRET.encode('utf-8'),
+            token.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
+        download_url = f"{CUSTOM_DOMAIN}/d?id={token}&sig={signature}"
+        log(f"🔗 [ZERO-REDIRECT] Generated download URL | File: {safe_name} | IP: {client_ip} | Worker: {CUSTOM_DOMAIN}")
+
+        return {"download_url": download_url, "expires_in": 120}
+    except Exception as e:
+        log(f"⚠️ [ZERO-REDIRECT] URL generation error: {str(e)}")
+        return None
+
+# Background task: Pre-cache Telegram file to R2 so Worker can serve it
+async def precache_telegram_to_r2(short_id, entry):
+    """Download file from Telegram and upload to R2 as a cache, so Worker can serve it."""
+    tmp_path = f"/tmp/precache_{short_id}.bin"
+    try:
+        client = await get_client()
+        message = await client.get_messages(entry["channel_id"], ids=entry["message_id"])
+        if not message or not message.document:
+            log(f"⚠️ [PRE-CACHE] Message not found for {short_id}")
+            return
+
+        async with aiofiles.open(tmp_path, "wb") as f_out:
+            async for chunk in client.iter_download(message.document, request_size=1024*1024):
+                await f_out.write(chunk)
+
+        r2_cache_key = f"cache_{short_id}_{uuid.uuid4().hex[:6]}"
+        def s3_up():
+            r2_client.upload_file(tmp_path, R2_BUCKET_NAME, r2_cache_key,
+                ExtraArgs={'ContentType': entry.get("content_type") or "application/octet-stream"})
+        await asyncio.to_thread(s3_up)
+
+        def update_cache_db():
+            conn = get_db_connection()
+            conn.execute("UPDATE files SET r2_cache_key = ? WHERE short_id = ?", (r2_cache_key, short_id))
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(update_cache_db)
+
+        log(f"✅ [PRE-CACHE] Telegram file cached to R2: {short_id} → {r2_cache_key}")
+    except Exception as e:
+        log(f"❌ [PRE-CACHE] Failed for {short_id}: {str(e)}")
+    finally:
+        try: os.remove(tmp_path)
+        except: pass
+
+# ============================================================
+# 🆕 INTERNAL API: Called by urlking.site server-to-server (NO browser access)
+# ============================================================
+@app.post("/api/internal/generate-download-url")
+async def internal_generate_download_url(request: Request):
+    """
+    Internal API endpoint called by the URL Shortener backend (server-to-server).
+    Looks up the file, ensures R2 availability, and returns a direct worker download URL.
+    NO redirects, NO file streaming — just JSON.
+    """
+    # Verify internal API key
+    internal_key = request.headers.get("X-Internal-Key", "")
+    if internal_key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    try:
+        data = await request.json()
+        file_code = data.get("file_code")
+        client_ip = data.get("client_ip", "0.0.0.0")
+
+        if not file_code:
+            return JSONResponse(status_code=400, content={"error": "file_code required"})
+
+        # Look up file entry in database
+        entry = await asyncio.to_thread(get_file_entry, file_code)
+        if not entry:
+            return JSONResponse(status_code=404, content={"error": "File not found"})
+
+        file_size = int(entry.get("size", 0))
+        filename = entry.get("filename", "file")
+        content_type = entry.get("content_type", "application/octet-stream")
+
+        # Update last_accessed
+        def update_access():
+            conn = get_db_connection()
+            try:
+                conn.execute("UPDATE files SET last_accessed = ? WHERE short_id = ?", (int(time.time()), file_code))
+                conn.commit()
+            finally:
+                conn.close()
+        await asyncio.to_thread(update_access)
+
+        # CASE 1: File is on R2 (>100MB files or previously cached)
+        r2_key_to_use = None
+
+        if entry.get("storage_type") == "r2" and entry.get("r2_key"):
+            r2_status = await asyncio.to_thread(check_r2_file_exists, entry["r2_key"])
+            if r2_status == 'exists' or r2_status == 'error':
+                r2_key_to_use = entry["r2_key"]
+
+        # CASE 2: Check R2 cache (for previously cached Telegram files)
+        if not r2_key_to_use and entry.get("r2_cache_key"):
+            cache_status = await asyncio.to_thread(check_r2_file_exists, entry["r2_cache_key"])
+            if cache_status == 'exists' or cache_status == 'error':
+                r2_key_to_use = entry["r2_cache_key"]
+
+        # CASE 3: Telegram-only file — trigger background pre-cache to R2
+        if not r2_key_to_use:
+            msg_id = entry.get("tg_backup_msg_id") or entry.get("message_id")
+            if msg_id and int(msg_id) > 0:
+                # For small files (<100MB), start background pre-cache and generate URL with a temp R2 key
+                temp_cache_key = f"cache_{file_code}_{uuid.uuid4().hex[:6]}"
+
+                # Start background pre-cache task
+                asyncio.create_task(precache_telegram_to_r2(file_code, entry))
+
+                # Wait up to 30 seconds for the cache to become available
+                for _ in range(60):
+                    await asyncio.sleep(0.5)
+                    # Re-check if cache key was written
+                    updated_entry = await asyncio.to_thread(get_file_entry, file_code)
+                    if updated_entry and updated_entry.get("r2_cache_key"):
+                        cache_status = await asyncio.to_thread(check_r2_file_exists, updated_entry["r2_cache_key"])
+                        if cache_status == 'exists':
+                            r2_key_to_use = updated_entry["r2_cache_key"]
+                            break
+
+                if not r2_key_to_use:
+                    return JSONResponse(status_code=503, content={
+                        "error": "File is being prepared. Please try again in a few seconds.",
+                        "retry": True
+                    })
+            else:
+                return JSONResponse(status_code=404, content={"error": "File not available"})
+
+        # Generate the one-time worker download URL
+        result = await generate_download_url(r2_key_to_use, filename, content_type, client_ip)
+        if not result:
+            return JSONResponse(status_code=500, content={"error": "Failed to generate download URL"})
+
+        return JSONResponse(content={
+            "status": "OK",
+            "download_url": result["download_url"],
+            "filename": filename,
+            "expires_in": result["expires_in"]
+        })
+
+    except Exception as e:
+        log(f"❌ [INTERNAL API] Error: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
 _active_dl = {}
+
 
 async def bg_fetch_and_cache(short_id, entry):
     tmp_path = f"/tmp/dl_{short_id}.bin"
