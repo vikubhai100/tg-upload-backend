@@ -56,7 +56,8 @@ async function loadFiles(page, keyToTry = secretKey) {
   if (!keyToTry) return false;
 
   try {
-    const url = `${API_BASE}/files?page=${page}&limit=10&key=${encodeURIComponent(keyToTry)}`;
+    const mode = document.getElementById('downloadMode')?.value || 'random';
+    const url = `${API_BASE}/files?page=${page}&limit=10&key=${encodeURIComponent(keyToTry)}&mode=${mode}`;
     const res = await fetch(url);
 
     if (!res.ok) return false;

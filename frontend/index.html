@@ -36,6 +36,15 @@
         <h2 style="font-size: 24px; font-weight: 800;">Private Directory</h2>
         <p style="color: var(--text-muted); font-size: 14px;" id="fileCount">0 files available</p>
       </div>
+      <!-- Test Routing Mode Selector -->
+      <div style="display: flex; align-items: center; gap: 8px; background: var(--bg-card); padding: 6px 12px; border-radius: 10px; border: 1px solid var(--border);">
+        <span style="font-size: 12px; font-weight: 800; color: var(--text-muted);">ROUTING TEST:</span>
+        <select id="downloadMode" onchange="loadFiles(1)" style="background: none; border: none; color: var(--text); font-weight: 600; font-size: 13px; outline: none; cursor: pointer;">
+          <option value="random" style="background: var(--bg-card);">🔀 Random Rotation</option>
+          <option value="account_a" style="background: var(--bg-card);">🅰️ Account A Only</option>
+          <option value="account_b" style="background: var(--bg-card);">🅱️ Account B Only</option>
+        </select>
+      </div>
       <!-- 🔥 SCANNER & WORKERS TOGGLE BUTTONS -->
       <div style="display: flex; gap: 8px;">
         <button class="btn-scan-toggle" onclick="toggleScanner()">🛡️ Virus Scanner</button>
