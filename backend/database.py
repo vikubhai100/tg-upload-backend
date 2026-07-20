@@ -28,9 +28,10 @@ def init_db():
         conn.execute("ALTER TABLE workers ADD COLUMN created_at INTEGER DEFAULT 0")
     except:
         pass
-    # Always ensure Account B's worker is registered
+    # Always ensure Account B's worker is registered and marked healthy
     try:
         conn.execute("INSERT OR IGNORE INTO workers (url, status) VALUES ('https://urlkingworker.urlkings.workers.dev', 'healthy')")
+        conn.execute("UPDATE workers SET status = 'healthy' WHERE url = 'https://urlkingworker.urlkings.workers.dev'")
     except Exception:
         pass
 
