@@ -28,22 +28,11 @@ def init_db():
         conn.execute("ALTER TABLE workers ADD COLUMN created_at INTEGER DEFAULT 0")
     except:
         pass
-    try:
-        cur = conn.cursor()
-        count = cur.execute("SELECT COUNT(*) FROM workers").fetchone()[0]
-        if count == 0:
-            default_workers = [
-                "https://d1.urlking.workers.dev",
-                "https://download.urlking.workers.dev",
-                "https://download2.urlking.workers.dev",
-                "https://download3.urlking.workers.dev",
-                "https://download4.urlking.workers.dev",
-                "https://download5.urlking.workers.dev"
-            ]
-            for w in default_workers:
-                cur.execute("INSERT OR IGNORE INTO workers (url, status) VALUES (?, 'healthy')", (w,))
-    except Exception:
-        pass
+    
+    # 🔥 Hardcoded default workers hata diye gaye hain. 
+    # Ab workers sirf Cloudflare API sync ya dynamic deployment ke through hi aayenge 
+    # aur unka naam strictly 'd1' ya 'download' se start hona chahiye.
+    
     try:
         conn.execute("ALTER TABLE files ADD COLUMN tg_backup_msg_id INTEGER DEFAULT 0")
     except:
