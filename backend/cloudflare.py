@@ -236,7 +236,12 @@ export default {
         return new Response(response.body, { headers });
       }
 
-      return new Response("Storage configuration not found.", { status: 500 });
+      const missing = [];
+      if (!env.R2_ACCOUNT_ID) missing.push("R2_ACCOUNT_ID");
+      if (!env.R2_ACCESS_KEY_ID) missing.push("R2_ACCESS_KEY_ID");
+      if (!env.R2_SECRET_ACCESS_KEY) missing.push("R2_SECRET_ACCESS_KEY");
+      return new Response("Storage configuration not found. Missing: " + missing.join(", "), { status: 500 });
+
 
     } catch (err) {
       return new Response("Error retrieving file.", { status: 500 });
