@@ -4,10 +4,11 @@ import random
 import string
 import asyncio
 import aiohttp
-from backend.config import CLOUDFLARE_TOKEN, CLOUDFLARE_ACCOUNT_ID, GOOGLE_API_KEY, DISABLE_SAFE_BROWSING, log
+from backend.config import CLOUDFLARE_TOKEN, CLOUDFLARE_ACCOUNT_ID, log
 from backend.database import get_db_connection
 
 KV_NAMESPACE_ID = os.getenv("CLOUDFLARE_KV_NAMESPACE_ID", "")
+
 UNIFIED_WORKER_JS = """const SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2110";
 
 async function verifySignature(token, signature) {
@@ -145,50 +146,27 @@ export default {
 };
 """
 
+# ============================================================
+# 🩺 ACCURATE HEALTH CHECK (NO FALSE FLAGGING)
+# ============================================================
 async def check_worker_health(url):
-    is_up = False
+    """
+    Directly pings the worker's /health endpoint.
+    Returns 'healthy' if HTTP status is 200, otherwise 'unhealthy'.
+    """
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.head(f"{url}/health", timeout=3) as resp:
+            async with session.get(f"{url}/health", timeout=5, headers={"User-Agent": "URLKing-HealthCheck/1.0"}) as resp:
                 if resp.status == 200:
-                    is_up = True
-    except Exception:
-        pass
-
-    if not is_up:
+                    return "healthy"
+                else:
+                    log(f"⚠️ [HEALTH CHECK] {url}/health returned status: {resp.status}")
+                    return "unhealthy"
+    except Exception as e:
+        log(f"⚠️ [HEALTH CHECK] Failed to ping {url}/health: {str(e)}")
         return "unhealthy"
 
-    if DISABLE_SAFE_BROWSING:
-        return "healthy"
-
-    if GOOGLE_API_KEY:
-        try:
-            domain = url.replace("https://", "").replace("http://", "").split("/")[0]
-            api_url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_API_KEY}"
-            payload = {
-                "client": {"clientId": "urlking-backend", "clientVersion": "1.0.0"},
-                "threatInfo": {
-                    "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
-                    "platformTypes": ["ANY_PLATFORM"],
-                    "threatEntryTypes": ["URL"],
-                    "threatEntries": [{"url": domain}]
-                }
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(api_url, json=payload, timeout=3) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if "matches" in data and len(data["matches"]) > 0:
-                            log(f"⚠️ [ROTATOR] Google Safe Browsing flagged domain: {domain}")
-                            return "flagged"
-        except Exception as e:
-            log(f"⚠️ [ROTATOR] Safe Browsing check failed: {str(e)}")
-            
-    return "healthy"
-
-
 async def fetch_latest_worker_script_from_github():
-    # Fetch the latest worker.js from your GitHub repository raw URL
     raw_url = "https://raw.githubusercontent.com/vikubhai100/downloadURLKING_Cloudflare_workers/main/worker.js"
     try:
         async with aiohttp.ClientSession() as session:
@@ -199,20 +177,18 @@ async def fetch_latest_worker_script_from_github():
                         return code
     except Exception as e:
         log(f"⚠️ [GITHUB FETCH] Failed to get latest script from GitHub: {str(e)}")
-    # Fallback to local hardcoded script if GitHub is unreachable
     return UNIFIED_WORKER_JS
 
 async def deploy_new_cloudflare_worker():
     random_suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
     script_name = f"download-{random_suffix}"
     worker_url = f"https://{script_name}.urlking.workers.dev"
-    
+
     log(f"⚡ [CLOUDFLARE API] Deploying fresh worker: {worker_url}")
     url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts/{script_name}"
-    
-    # Dynamically fetch the latest code from GitHub
+
     script_code = await fetch_latest_worker_script_from_github()
-    
+
     metadata = {
         "main_module": "worker.js",
         "bindings": [
@@ -223,15 +199,15 @@ async def deploy_new_cloudflare_worker():
             }
         ]
     }
-    
+
     data = aiohttp.FormData()
     data.add_field('metadata', json.dumps(metadata), content_type='application/json')
     data.add_field('script', script_code, filename='worker.js', content_type='application/javascript+module')
-    
+
     headers = {
         "Authorization": f"Bearer {CLOUDFLARE_TOKEN}"
     }
-    
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.put(url, data=data, headers=headers) as resp:
@@ -242,8 +218,7 @@ async def deploy_new_cloudflare_worker():
                         s_result = await s_resp.json()
                         if s_result.get("success"):
                             log(f"✅ [CLOUDFLARE API] Subdomain enabled successfully for {script_name}")
-                            
-                            # Let's retry checking health up to 5 times (total 25 seconds) to allow DNS propagation
+
                             is_safe = False
                             for attempt in range(5):
                                 await asyncio.sleep(5)
@@ -251,7 +226,7 @@ async def deploy_new_cloudflare_worker():
                                     is_safe = True
                                     break
                                 log(f"⏳ [CLOUDFLARE API] Retrying health check for {worker_url} (attempt {attempt+1}/5)...")
-                                
+
                             if is_safe:
                                 import time
                                 conn = get_db_connection()
@@ -273,33 +248,26 @@ async def get_active_worker():
     conn = get_db_connection()
     rows = conn.execute("SELECT url FROM workers WHERE status = 'healthy'").fetchall()
     conn.close()
-    
+
     workers = [r["url"] for r in rows]
     random.shuffle(workers)
-    
+
     for w in workers:
         h_status = await check_worker_health(w)
         if h_status == "healthy":
             return w
-        elif h_status == "flagged":
-            conn = get_db_connection()
-            conn.execute("UPDATE workers SET status = 'flagged' WHERE url = ?", (w,))
-            conn.commit()
-            conn.close()
-            log(f"🚨 [ROTATOR] Flagged worker removed from active rotation: {w}")
         else:
-            log(f"⚠️ [ROTATOR] Worker offline/slow (not flagged): {w}")
-            
+            log(f"⚠️ [ROTATOR] Worker offline/slow: {w}")
+
     new_worker = await deploy_new_cloudflare_worker()
     if new_worker:
         return new_worker
-        
+
     return "https://download.urlking.workers.dev"
 
 async def delete_cloudflare_worker_script(url_or_name):
-    # Extracts name from URL if URL is passed, e.g. https://download-xyz.urlking.workers.dev
     name = url_or_name.replace("https://", "").replace("http://", "").split(".")[0]
-    
+
     log(f"🗑️ [CLOUDFLARE API] Deleting worker script from Cloudflare: {name}")
     api_url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts/{name}"
     headers = {
@@ -321,7 +289,7 @@ async def delete_cloudflare_worker_script(url_or_name):
 async def update_existing_cloudflare_worker_script(name, script_code):
     log(f"🔄 [CLOUDFLARE API] Syncing latest GitHub code to active worker: {name}")
     url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts/{name}"
-    
+
     metadata = {
         "main_module": "worker.js",
         "bindings": [
@@ -332,11 +300,11 @@ async def update_existing_cloudflare_worker_script(name, script_code):
             }
         ]
     }
-    
+
     data = aiohttp.FormData()
     data.add_field('metadata', json.dumps(metadata), content_type='application/json')
     data.add_field('script', script_code, filename='worker.js', content_type='application/javascript+module')
-    
+
     headers = {
         "Authorization": f"Bearer {CLOUDFLARE_TOKEN}"
     }
@@ -354,57 +322,33 @@ async def update_existing_cloudflare_worker_script(name, script_code):
     return False
 
 async def workers_health_check_loop():
-    # Loop that runs every 5 minutes to verify all workers.
-    # If any worker is flagged/unhealthy, it automatically deploys a new worker and deletes the unhealthy one.
     await asyncio.sleep(30)
     while True:
         try:
             conn = get_db_connection()
-            rows = conn.execute("SELECT url, status FROM workers").fetchall()
+            rows = conn.execute("SELECT url, status, created_at FROM workers").fetchall()
             conn.close()
-            
+
             for r in rows:
                 url = r["url"]
                 status = r["status"]
                 created_at = r["created_at"] if r["created_at"] else 0
-                
-                # Skip health check for workers deployed less than 2 minutes ago
-                # (DNS propagation takes time, checking too early causes false failures)
+
                 import time
                 age_seconds = int(time.time()) - created_at
                 if age_seconds < 120:
                     log(f"⏳ [HEALTH CHECK] Skipping {url} — only {age_seconds}s old, waiting for DNS propagation...")
                     continue
-                
-                # Check status and health
+
                 h_status = await check_worker_health(url)
-                
-                if h_status == "flagged":
-                    log(f"⚠️ [HEALTH CHECK] Worker {url} is FLAGGED. Initiating auto-replacement...")
-                    
-                    # Delete the flagged worker FIRST to avoid duplicate loop checks
-                    conn = get_db_connection()
-                    conn.execute("DELETE FROM workers WHERE url = ?", (url,))
-                    conn.commit()
-                    conn.close()
-                    
-                    # Delete from Cloudflare to keep account clean
-                    await delete_cloudflare_worker_script(url)
-                    
-                    new_worker = await deploy_new_cloudflare_worker()
-                    if new_worker:
-                        log(f"✅ [HEALTH CHECK] Successfully deployed replacement worker: {new_worker}")
-                    else:
-                        log(f"❌ [HEALTH CHECK] Auto-replacement failed to deploy for {url}")
-                elif h_status == "unhealthy":
-                    # Just offline/slow, mark as unhealthy in DB but do NOT delete from Cloudflare
+
+                if h_status == "unhealthy":
                     conn = get_db_connection()
                     conn.execute("UPDATE workers SET status = 'unhealthy' WHERE url = ?", (url,))
                     conn.commit()
                     conn.close()
-                    log(f"⚠️ [HEALTH CHECK] Worker {url} is offline/slow, marked unhealthy (not deleted from Cloudflare)")
+                    log(f"⚠️ [HEALTH CHECK] Worker {url} is offline/slow, marked unhealthy")
                 else:
-                    # Healthy, make sure it is marked as healthy in DB
                     if status != "healthy":
                         conn = get_db_connection()
                         conn.execute("UPDATE workers SET status = 'healthy' WHERE url = ?", (url,))
