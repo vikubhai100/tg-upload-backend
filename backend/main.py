@@ -37,7 +37,7 @@ from backend.config import (
     BOT_TOKEN, API_ID, API_HASH, CHANNEL_ID, BASE_URL, SESSION_STR, DB_FILE_SQLITE,
     INTERNAL_API_KEY, BASE_DIR, FRONTEND_DIR, log, format_size, safeFile
 )
-from backend.database import init_db, get_db_connection, save_file_entry, get_file_entry, cache_cleanup_loop, r2_deduplication_loop
+from backend.database import init_db, get_db_connection, save_file_entry, get_file_entry, cache_cleanup_loop, r2_deduplication_loop, get_setting, set_setting
 from backend.cloudflare import (
     get_active_worker, deploy_new_cloudflare_worker, workers_health_check_loop, 
     delete_cloudflare_worker_script, update_existing_cloudflare_worker_script, 
@@ -273,7 +273,8 @@ async def internal_generate_download_url(request: Request):
                 return JSONResponse(status_code=404, content={"error": "File data not found."})
 
         # Generate Worker Link
-        result = await generate_download_url(r2_key_to_use, filename, content_type, client_ip)
+        mode = await asyncio.to_thread(get_setting, "global_worker_mode", "random")
+        result = await generate_download_url(r2_key_to_use, filename, content_type, client_ip, mode)
         if not result:
             return JSONResponse(status_code=500, content={"error": "Worker generation failed"})
 
@@ -1045,6 +1046,25 @@ async def backup_to_telegram(key: str, data: dict = Body(...)):
                 os.unlink(tmp_path)
         except:
             pass
+
+@app.get("/api/settings/worker-mode")
+async def get_global_worker_mode(key: str):
+    verify_key(key)
+    mode = await asyncio.to_thread(get_setting, "global_worker_mode", "random")
+    return {"status": "OK", "mode": mode}
+
+@app.post("/api/settings/worker-mode")
+async def update_global_worker_mode(request: Request, key: str):
+    verify_key(key)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    mode = data.get("mode", "random")
+    if mode not in ["random", "account_a", "account_b"]:
+        raise HTTPException(status_code=400, detail="Invalid mode")
+    await asyncio.to_thread(set_setting, "global_worker_mode", mode)
+    return {"status": "OK", "mode": mode}
 
 @app.get("/files")
 async def list_files(request: Request, key: str, page: int = 1, limit: int = 10, mode: str = "random"):
