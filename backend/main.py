@@ -1047,8 +1047,9 @@ async def backup_to_telegram(key: str, data: dict = Body(...)):
             pass
 
 @app.get("/files")
-async def list_files(key: str, page: int = 1, limit: int = 10):
+async def list_files(request: Request, key: str, page: int = 1, limit: int = 10):
     verify_key(key)
+    client_ip = get_client_ip(request)
     def get_files():
         conn = get_db_connection()
         try:
@@ -1060,10 +1061,29 @@ async def list_files(key: str, page: int = 1, limit: int = 10):
             conn.close()
 
     total, rows = await asyncio.to_thread(get_files)
+    
+    files_list = []
+    for r in rows:
+        r_dict = dict(r)
+        r2_key = r_dict.get("r2_key") or r_dict.get("r2_cache_key")
+        if r2_key:
+            res = await generate_download_url(r2_key, r_dict["filename"], r_dict["content_type"] or "application/octet-stream", client_ip)
+            download_link = res["download_url"] if res else f"{BASE_URL}/download/{r_dict['short_id']}"
+        else:
+            download_link = f"{BASE_URL}/download/{r_dict['short_id']}"
+            
+        files_list.append({
+            "short_id": r_dict["short_id"],
+            "filename": r_dict["filename"],
+            "size": format_size(r_dict["size"]),
+            "download_link": download_link
+        })
+
     return {
-        "files": [{"short_id": r["short_id"], "filename": r["filename"], "size": format_size(r["size"]), "download_link": f"{BASE_URL}/download/{r['short_id']}"} for r in rows],
+        "files": files_list,
         "total": total, "page": page, "total_pages": math.ceil(total / limit) if total > 0 else 1
     }
+
 
 def _repair_r2_sync():
     conn = get_db_connection()
