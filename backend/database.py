@@ -43,6 +43,40 @@ def init_db():
     conn.commit()
     conn.close()
 
+    # Create Settings Table
+    try:
+        conn = sqlite3.connect(DB_FILE_SQLITE)
+        conn.execute('''CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )''')
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_worker_mode', 'random')")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def get_setting(key, default=""):
+    conn = get_db_connection()
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+    except Exception:
+        return default
+    finally:
+        conn.close()
+
+def set_setting(key, value):
+    conn = get_db_connection()
+    try:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
 def get_db_connection():
     c = sqlite3.connect(DB_FILE_SQLITE, check_same_thread=False, timeout=30.0)
     c.row_factory = sqlite3.Row
