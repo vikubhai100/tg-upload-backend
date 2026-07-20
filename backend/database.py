@@ -28,11 +28,12 @@ def init_db():
         conn.execute("ALTER TABLE workers ADD COLUMN created_at INTEGER DEFAULT 0")
     except:
         pass
-    
-    # 🔥 Hardcoded default workers hata diye gaye hain. 
-    # Ab workers sirf Cloudflare API sync ya dynamic deployment ke through hi aayenge 
-    # aur unka naam strictly 'd1' ya 'download' se start hona chahiye.
-    
+    # Always ensure Account B's worker is registered
+    try:
+        conn.execute("INSERT OR IGNORE INTO workers (url, status) VALUES ('https://urlkingworker.urlkings.workers.dev', 'healthy')")
+    except Exception:
+        pass
+
     try:
         conn.execute("ALTER TABLE files ADD COLUMN tg_backup_msg_id INTEGER DEFAULT 0")
     except:

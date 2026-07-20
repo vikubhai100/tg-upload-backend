@@ -20,9 +20,11 @@ async function verifySignature(token, signature) {
     false,
     ["verify"]
   );
+
   const sigBuffer = new Uint8Array(
     signature.match(/.{1,2}/g).map(byte => parseInt(byte, 16))
   );
+
   return await crypto.subtle.verify(
     "HMAC",
     key,
@@ -31,23 +33,87 @@ async function verifySignature(token, signature) {
   );
 }
 
+class S3Client {
+  constructor(accountId, accessKeyId, secretAccessKey) {
+    this.accountId = accountId;
+    this.accessKeyId = accessKeyId;
+    this.secretAccessKey = secretAccessKey;
+  }
+
+  async getObject(bucketName, key) {
+    const url = `https://${this.accountId}.r2.cloudflarestorage.com/${bucketName}/${key}`;
+    const method = 'GET';
+    const host = `${this.accountId}.r2.cloudflarestorage.com`;
+    const datetime = new Date().toISOString().replace(/[:\-]|\.\d{3}/g, '');
+    const date = datetime.substr(0, 8);
+
+    const credentialScope = `${date}/us-east-1/s3/aws4_request`;
+    const canonicalHeaders = `host:${host}\\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\nx-amz-date:${datetime}\\n`;
+    const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+
+    const canonicalRequest = `${method}\\n/${bucketName}/${key}\\n\\n${canonicalHeaders}\\n${signedHeaders}\\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
+    const canonicalRequestHash = await this.sha256(canonicalRequest);
+
+    const stringToSign = `AWS4-HMAC-SHA256\\n${datetime}\\n${credentialScope}\\n${canonicalRequestHash}`;
+
+    const signingKey = await this.getSigningKey(this.secretAccessKey, date, "us-east-1", "s3");
+    const signature = await this.hmac(signingKey, stringToSign);
+
+    const authHeader = `AWS4-HMAC-SHA256 Credential=${this.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+    return fetch(url, {
+      method: method,
+      headers: {
+        'Authorization': authHeader,
+        'x-amz-date': datetime,
+        'x-amz-content-sha256': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+      }
+    });
+  }
+
+  async sha256(message) {
+    const msgBuffer = new TextEncoder().encode(message);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+    return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  async hmac(key, data) {
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+    );
+    const signature = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(data));
+    return Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  async getSigningKey(secret, date, region, service) {
+    const kDate = await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", new TextEncoder().encode("AWS4" + secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode(date));
+    const kRegion = await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", kDate, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode(region));
+    const kService = await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", kRegion, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode(service));
+    return await crypto.subtle.sign("HMAC", await crypto.subtle.importKey("raw", kService, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), new TextEncoder().encode("aws4_request"));
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
+
     if (path === "/health") {
       return new Response("OK", { status: 200 });
     }
+
     const userAgent = (request.headers.get("user-agent") || "").toLowerCase();
     const bannedCrawlers = [
       'googlebot', 'mediapartners-google', 'adsbot-google', 'bingbot', 'yandexbot', 
       'baiduspider', 'twitterbot', 'facebookexternalhit', 'google-publisher-plugin',
-      'lighthouse', 'chrome-lighthouse', 'duckduckbot', 'slurp', 'ia_archiver'
+      'lighthouse', 'chrome-lighthouse', 'duckduckbot', 'slurp', 'ia_archiver',
+      'safebrowsing'
     ];
     if (bannedCrawlers.some(bot => userAgent.includes(bot))) {
-      return new Response("Access Denied.", { status: 403 });
+      return new Response("Not Found", { status: 404 });
     }
-    if (path === "/" || path === "" || path !== "/d") {
+
+    if (path !== "/d") {
       return new Response(`
         <!DOCTYPE html>
         <html lang="en">
@@ -94,27 +160,32 @@ export default {
         </html>
       `, { status: 200, headers: { "Content-Type": "text/html" } });
     }
+
     const token = url.searchParams.get("id");
     const signature = url.searchParams.get("sig");
     if (!token || !signature) {
-      return new Response("Access Denied: Missing parameters.", { status: 400 });
+      return new Response("Not Found", { status: 404 });
     }
+
     const isValid = await verifySignature(token, signature);
     if (!isValid) {
-      return new Response("Access Denied: Invalid signature token.", { status: 403 });
+      return new Response("Not Found", { status: 404 });
     }
+
     let payload;
     try {
       const decodedStr = atob(token.replace(/-/g, "+").replace(/_/g, "/"));
       payload = JSON.parse(decodedStr);
     } catch (e) {
-      return new Response("Access Denied: Corrupted payload.", { status: 400 });
+      return new Response("Not Found", { status: 404 });
     }
+
     const { k: fileKey, n: filename, e: exp, i: authorizedIp } = payload;
     const currentTime = Math.floor(Date.now() / 1000);
     if (currentTime > parseInt(exp)) {
-      return new Response("Link Expired: Download session has expired.", { status: 410 });
+      return new Response("Link Expired", { status: 404 });
     }
+
     const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || "unknown";
     function getSubnet(ip) {
       if (ip.includes(".")) {
@@ -125,22 +196,50 @@ export default {
       return ip;
     }
     if (getSubnet(clientIp) !== getSubnet(authorizedIp)) {
-      return new Response("Forbidden: Restricted download network.", { status: 403 });
+      return new Response("Not Found", { status: 404 });
     }
+
     try {
-      const object = await env.dataURLKING.get(fileKey);
-      if (object === null) {
-        return new Response("File Not Found.", { status: 404 });
-      }
       const headers = new Headers();
-      object.writeHttpMetadata(headers);
-      headers.set("etag", object.httpEtag);
       headers.set("Content-Security-Policy", "default-src 'none'");
       headers.set("X-Content-Type-Options", "nosniff");
+      headers.set("X-Robots-Tag", "noindex, nofollow, noarchive");
       headers.set("Content-Disposition", `attachment; filename="${filename}"`);
-      return new Response(object.body, { headers });
+
+      if (env.dataURLKING) {
+        const object = await env.dataURLKING.get(fileKey);
+        if (object === null) {
+          return new Response("File Not Found.", { status: 404 });
+        }
+        object.writeHttpMetadata(headers);
+        headers.set("etag", object.httpEtag);
+        return new Response(object.body, { headers });
+      } 
+      
+      if (env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY && env.R2_ACCOUNT_ID) {
+        const s3 = new S3Client(env.R2_ACCOUNT_ID, env.R2_ACCESS_KEY_ID, env.R2_SECRET_ACCESS_KEY);
+        const bucket = env.R2_BUCKET_NAME || "urlking";
+        const response = await s3.getObject(bucket, fileKey);
+
+        if (response.status === 404) {
+          return new Response("File Not Found.", { status: 404 });
+        }
+        if (!response.ok) {
+          return new Response("Error retrieving file from storage.", { status: response.status });
+        }
+
+        for (const [key, value] of response.headers.entries()) {
+          if (['content-type', 'content-length', 'etag', 'last-modified'].includes(key.toLowerCase())) {
+            headers.set(key, value);
+          }
+        }
+        return new Response(response.body, { headers });
+      }
+
+      return new Response("Storage configuration not found.", { status: 500 });
+
     } catch (err) {
-      return new Response("Error retrieving stream: " + err.message, { status: 500 });
+      return new Response("Error retrieving file.", { status: 500 });
     }
   }
 };
