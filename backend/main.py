@@ -204,7 +204,7 @@ async def get_or_create_precache(short_id, entry):
     if short_id in _active_precache:
         log(f"⏳ File {short_id} is already uploading. Waiting for it to finish 100%...")
         return await _active_precache[short_id]
-    
+
     task = asyncio.create_task(precache_telegram_to_r2(short_id, entry))
     _active_precache[short_id] = task
     try:
@@ -266,7 +266,7 @@ async def internal_generate_download_url(request: Request):
             if msg_id and int(msg_id) > 0:
                 # Execution will stop here and WAIT until the upload finishes 100%
                 r2_key_to_use = await get_or_create_precache(file_code, entry)
-                
+
                 if not r2_key_to_use:
                     return JSONResponse(status_code=500, content={"error": "Upload failed."})
             else:
@@ -392,7 +392,7 @@ async def api_upload(request: Request):
 
         storage_type = "telegram"
         r2_key = None
-        
+
         if file_size > 100 * 1024 * 1024:
             r2_key = f"r2_{uuid.uuid4().hex[:8]}"
             def upload_to_r2():
@@ -673,17 +673,40 @@ async def file_delete(key: str, file_code: str):
         await asyncio.to_thread(run_delete)
     return {"status": 200, "msg": "OK"}
 
+# ============================================================
+# 🔄 UPDATED /api/workers WITH LIVE CLOUDFLARE SYNC
+# ============================================================
 @app.get("/api/workers")
 async def get_workers(key: str):
     verify_key(key)
-    def run_get():
+    
+    # Cloudflare API se live scripts fetch karo
+    from backend.cloudflare import fetch_all_cloudflare_workers
+    live_scripts = await fetch_all_cloudflare_workers()
+    
+    def sync_and_get():
         conn = get_db_connection()
         try:
-            rows = conn.execute("SELECT * FROM workers").fetchall()
-            return [dict(r) for r in rows]
+            if live_scripts is not None:
+                # DB ke saare URLs nikalo
+                rows = conn.execute("SELECT url FROM workers").fetchall()
+                for r in rows:
+                    url = r["url"]
+                    script_name = url.replace("https://", "").replace("http://", "").split(".")[0]
+                    
+                    # Agar Cloudflare me nahi hai ya name 'd1'/'download' se start nahi hota -> DELETE
+                    is_valid = script_name.startswith("d1") or script_name.startswith("download")
+                    if script_name not in live_scripts or not is_valid:
+                        conn.execute("DELETE FROM workers WHERE url = ?", (url,))
+                conn.commit()
+
+            # Fresh filtered list return karo
+            updated_rows = conn.execute("SELECT * FROM workers").fetchall()
+            return [dict(r) for r in updated_rows]
         finally:
             conn.close()
-    return await db_thread(run_get)
+
+    return await db_thread(sync_and_get)
 
 @app.post("/api/workers/add")
 async def add_worker(key: str, data: dict = Body(...)):
