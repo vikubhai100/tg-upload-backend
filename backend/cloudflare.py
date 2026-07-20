@@ -454,6 +454,10 @@ async def workers_health_check_loop():
                     url = r["url"]
                     script_name = url.replace("https://", "").replace("http://", "").split(".")[0]
 
+                    # Skip deletion check for Account B worker
+                    if "urlkingworker" in script_name:
+                        continue
+
                     # Filter ghost workers or non-matching workers
                     is_valid_prefix = script_name.startswith("d1") or script_name.startswith("download")
 
