@@ -39,6 +39,7 @@ async function verifyAccess() {
     localStorage.setItem('telestore_v2_key', key);
     closeModal();
     document.getElementById('authError').style.display = 'none';
+    loadGlobalSettings();
   } else {
     document.getElementById('authError').style.display = 'block';
   }
@@ -321,6 +322,52 @@ async function deleteWorker(url) {
   } catch(e) { console.error("Delete Worker Error:", e); }
 }
 
+function openSettingsModal() {
+  document.getElementById('settingsModal').style.display = 'flex';
+  loadGlobalSettings();
+}
+
+function closeSettingsModal() {
+  document.getElementById('settingsModal').style.display = 'none';
+}
+
+async function loadGlobalSettings() {
+  if (!secretKey) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/settings/worker-mode?key=${encodeURIComponent(secretKey)}`);
+    if (res.ok) {
+      const data = await res.json();
+      const select = document.getElementById('globalWorkerMode');
+      if (select) select.value = data.mode;
+    }
+  } catch (e) {
+    console.error("Failed to load settings:", e);
+  }
+}
+
+async function saveGlobalSettings() {
+  const select = document.getElementById('globalWorkerMode');
+  const mode = select?.value || 'random';
+  if (!secretKey) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/settings/worker-mode?key=${encodeURIComponent(secretKey)}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: mode})
+    });
+    if (res.ok) {
+      alert("Success: Global routing mode updated successfully for all users!");
+      closeSettingsModal();
+    } else {
+      alert("Failed to update global routing mode.");
+    }
+  } catch(e) {
+    console.error("Failed to update global routing mode:", e);
+  }
+}
+
 if (secretKey) {
   loadFiles(1);
 }
+
+

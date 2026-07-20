@@ -45,10 +45,11 @@
           <option value="account_b" style="background: var(--bg-card);">🅱️ Account B Only</option>
         </select>
       </div>
-      <!-- 🔥 SCANNER & WORKERS TOGGLE BUTTONS -->
+      <!-- 🔥 SCANNER, WORKERS, & SETTINGS TOGGLE BUTTONS -->
       <div style="display: flex; gap: 8px;">
         <button class="btn-scan-toggle" onclick="toggleScanner()">🛡️ Virus Scanner</button>
         <button class="btn-scan-toggle" style="background:#4f46e5; box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.2);" onclick="window.location.href='/workers'">☁️ Workers Manager</button>
+        <button class="btn-scan-toggle" style="background:#059669; box-shadow: 0 4px 6px -1px rgba(5, 150, 105, 0.2);" onclick="openSettingsModal()">⚙️ Settings</button>
       </div>
     </div>
 
@@ -103,6 +104,27 @@
     <button onclick="closeModal()" style="margin-top: 15px; background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:12px;">Close</button>
   </div>
 </div>
+
+<div id="settingsModal" class="auth-modal" style="display: none; position: fixed; inset: 0; z-index: 80; background: rgba(0,0,0,0.8); backdrop-filter: blur(4px); align-items: center; justify-content: center;">
+  <div class="auth-card" style="width: 100%; max-width: 400px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; text-align: center; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3);">
+    <h3 style="margin-top: 0; font-size: 18px; font-weight: 800;">⚙️ Global Settings</h3>
+    <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">Configure settings that affect all normal users.</p>
+    
+    <div style="text-align: left; margin-bottom: 20px;">
+      <label style="font-size: 13px; font-weight: 600; color: var(--text); display: block; margin-bottom: 8px;">Global Worker Routing:</label>
+      <select id="globalWorkerMode" class="auth-input" style="width: 100%; text-align-last: left; margin-bottom: 0; background: var(--bg-card); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px;">
+        <option value="random">🔀 Random Rotation</option>
+        <option value="account_a">🅰️ Account A Only</option>
+        <option value="account_b">🅱️ Account B Only</option>
+      </select>
+      <span style="font-size: 11px; color: var(--text-muted); display: block; margin-top: 6px;">Select which worker account normal users download from.</span>
+    </div>
+
+    <button class="btn-cta" style="width: 100%; background: #059669; border: none; padding: 12px; border-radius: 8px; color: white; font-weight: bold; cursor: pointer;" onclick="saveGlobalSettings()">Save Settings</button>
+    <button onclick="closeSettingsModal()" style="margin-top: 15px; background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:12px; text-decoration: underline;">Cancel</button>
+  </div>
+</div>
+
 
 <!-- Link to external script -->
 <script src="/static/app.js"></script>
