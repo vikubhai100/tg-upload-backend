@@ -357,12 +357,20 @@ async def deploy_new_cloudflare_worker():
         log(f"❌ [CLOUDFLARE API] Exception during deployment: {str(e)}")
     return None
 
-async def get_active_worker():
+async def get_active_worker(mode="random"):
     conn = get_db_connection()
     rows = conn.execute("SELECT url FROM workers WHERE status = 'healthy'").fetchall()
     conn.close()
 
     workers = [r["url"] for r in rows]
+    
+    if mode == "account_a":
+        # Keep only workers that DO NOT belong to Account B (no urlkingworker)
+        workers = [w for w in workers if "urlkingworker" not in w]
+    elif mode == "account_b":
+        # Keep only Account B worker (urlkingworker)
+        workers = [w for w in workers if "urlkingworker" in w]
+
     random.shuffle(workers)
 
     for w in workers:
@@ -372,11 +380,16 @@ async def get_active_worker():
         else:
             log(f"⚠️ [ROTATOR] Worker offline/slow: {w}")
 
+    # Specific fallbacks if no healthy worker was found in filters
+    if mode == "account_b":
+        return "https://urlkingworker.urlkings.workers.dev"
+
     new_worker = await deploy_new_cloudflare_worker()
     if new_worker:
         return new_worker
 
     return "https://download.urlking.workers.dev"
+
 
 async def delete_cloudflare_worker_script(url_or_name):
     name = url_or_name.replace("https://", "").replace("http://", "").split(".")[0]

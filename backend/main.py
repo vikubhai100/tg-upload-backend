@@ -127,10 +127,10 @@ elif (Path(__file__).resolve().parent / "static").exists():
 # ============================================================
 # 🆕 GENERATE CLOUDFLARE WORKER LINK
 # ============================================================
-async def generate_download_url(r2_key, filename, content_type, client_ip):
+async def generate_download_url(r2_key, filename, content_type, client_ip, mode="random"):
     """Generate a one-time worker download URL and return it as a dict (NOT a redirect)."""
     try:
-        CUSTOM_DOMAIN = await get_active_worker()
+        CUSTOM_DOMAIN = await get_active_worker(mode)
         SECURE_SECRET = "URLKING_ANTI_SHARE_SECRET_2110"
         exp = int(time.time()) + 180  # 3 minute expiry
 
@@ -1047,7 +1047,7 @@ async def backup_to_telegram(key: str, data: dict = Body(...)):
             pass
 
 @app.get("/files")
-async def list_files(request: Request, key: str, page: int = 1, limit: int = 10):
+async def list_files(request: Request, key: str, page: int = 1, limit: int = 10, mode: str = "random"):
     verify_key(key)
     client_ip = get_client_ip(request)
     def get_files():
@@ -1067,7 +1067,7 @@ async def list_files(request: Request, key: str, page: int = 1, limit: int = 10)
         r_dict = dict(r)
         r2_key = r_dict.get("r2_key") or r_dict.get("r2_cache_key")
         if r2_key:
-            res = await generate_download_url(r2_key, r_dict["filename"], r_dict["content_type"] or "application/octet-stream", client_ip)
+            res = await generate_download_url(r2_key, r_dict["filename"], r_dict["content_type"] or "application/octet-stream", client_ip, mode)
             download_link = res["download_url"] if res else f"{BASE_URL}/download/{r_dict['short_id']}"
         else:
             download_link = f"{BASE_URL}/download/{r_dict['short_id']}"
@@ -1083,6 +1083,7 @@ async def list_files(request: Request, key: str, page: int = 1, limit: int = 10)
         "files": files_list,
         "total": total, "page": page, "total_pages": math.ceil(total / limit) if total > 0 else 1
     }
+
 
 
 def _repair_r2_sync():
