@@ -41,7 +41,9 @@ class S3Client {
   }
 
   async getObject(bucketName, key) {
-    const url = `https://${this.accountId}.r2.cloudflarestorage.com/${bucketName}/${key}`;
+    const encodedKey = key.split('/').map(p => encodeURIComponent(p).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase())).join('/');
+    const canonicalUri = `/${bucketName}/${encodedKey}`;
+    const url = `https://${this.accountId}.r2.cloudflarestorage.com${canonicalUri}`;
     const method = 'GET';
     const host = `${this.accountId}.r2.cloudflarestorage.com`;
     const datetime = new Date().toISOString().replace(/[:\-]|\.\d{3}/g, '');
@@ -51,7 +53,7 @@ class S3Client {
     const canonicalHeaders = `host:${host}\\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\nx-amz-date:${datetime}\\n`;
     const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
 
-    const canonicalRequest = `${method}\\n/${bucketName}/${key}\\n\\n${canonicalHeaders}\\n${signedHeaders}\\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
+    const canonicalRequest = `${method}\\n${canonicalUri}\\n\\n${canonicalHeaders}\\n${signedHeaders}\\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
     const canonicalRequestHash = await this.sha256(canonicalRequest);
 
     const stringToSign = `AWS4-HMAC-SHA256\\n${datetime}\\n${credentialScope}\\n${canonicalRequestHash}`;
@@ -364,6 +366,9 @@ async def deploy_new_cloudflare_worker():
     return None
 
 async def get_active_worker(mode="random"):
+    if mode == "account_b":
+        return "https://urlkingworker.urlkings.workers.dev"
+
     conn = get_db_connection()
     rows = conn.execute("SELECT url FROM workers WHERE status = 'healthy'").fetchall()
     conn.close()
@@ -373,9 +378,6 @@ async def get_active_worker(mode="random"):
     if mode == "account_a":
         # Keep only workers that DO NOT belong to Account B (no urlkingworker)
         workers = [w for w in workers if "urlkingworker" not in w]
-    elif mode == "account_b":
-        # Keep only Account B worker (urlkingworker)
-        workers = [w for w in workers if "urlkingworker" in w]
 
     random.shuffle(workers)
 
@@ -386,15 +388,12 @@ async def get_active_worker(mode="random"):
         else:
             log(f"⚠️ [ROTATOR] Worker offline/slow: {w}")
 
-    # Specific fallbacks if no healthy worker was found in filters
-    if mode == "account_b":
-        return "https://urlkingworker.urlkings.workers.dev"
-
     new_worker = await deploy_new_cloudflare_worker()
     if new_worker:
         return new_worker
 
     return "https://download.urlking.workers.dev"
+
 
 
 async def delete_cloudflare_worker_script(url_or_name):
