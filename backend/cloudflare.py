@@ -147,7 +147,7 @@ export default {
 """
 
 # ============================================================
-# 🩺 ACCURATE HEALTH CHECK (NO FALSE FLAGGING)
+# 🩺 ACCURATE HEALTH CHECK
 # ============================================================
 async def check_worker_health(url):
     """
@@ -178,6 +178,20 @@ async def fetch_latest_worker_script_from_github():
     except Exception as e:
         log(f"⚠️ [GITHUB FETCH] Failed to get latest script from GitHub: {str(e)}")
     return UNIFIED_WORKER_JS
+
+async def fetch_all_cloudflare_workers():
+    """Cloudflare API se active scripts ki list fetch karta hai."""
+    api_url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts"
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_TOKEN}"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, headers=headers, timeout=10) as resp:
+                result = await resp.json()
+                if result.get("success"):
+                    return [item["id"] for item in result.get("result", [])]
+    except Exception as e:
+        log(f"⚠️ [CF SYNC] Cloudflare API list fetch failed: {str(e)}")
+    return None
 
 async def deploy_new_cloudflare_worker():
     random_suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
@@ -322,9 +336,37 @@ async def update_existing_cloudflare_worker_script(name, script_code):
     return False
 
 async def workers_health_check_loop():
-    await asyncio.sleep(30)
+    """
+    1. Cloudflare se deleted workers ko DB se SAF kar dega.
+    2. Only 'd1' ya 'download' se start hone wale active workers ko hi rakhega.
+    """
+    await asyncio.sleep(10)
     while True:
         try:
+            # Step A: Cloudflare se live workers fetch karo
+            cf_scripts = await fetch_all_cloudflare_workers()
+
+            conn = get_db_connection()
+            rows = conn.execute("SELECT url, status, created_at FROM workers").fetchall()
+            conn.close()
+
+            if cf_scripts is not None:
+                for r in rows:
+                    url = r["url"]
+                    script_name = url.replace("https://", "").replace("http://", "").split(".")[0]
+
+                    # Filter ghost workers or non-matching workers
+                    is_valid_prefix = script_name.startswith("d1") or script_name.startswith("download")
+
+                    if script_name not in cf_scripts or not is_valid_prefix:
+                        log(f"🧹 [AUTO FILTER] Removing ghost/deleted worker from DB: {url}")
+                        conn = get_db_connection()
+                        conn.execute("DELETE FROM workers WHERE url = ?", (url,))
+                        conn.commit()
+                        conn.close()
+                        continue
+
+            # Step B: Baki workers ki Health Ping Check karo
             conn = get_db_connection()
             rows = conn.execute("SELECT url, status, created_at FROM workers").fetchall()
             conn.close()
@@ -337,7 +379,6 @@ async def workers_health_check_loop():
                 import time
                 age_seconds = int(time.time()) - created_at
                 if age_seconds < 120:
-                    log(f"⏳ [HEALTH CHECK] Skipping {url} — only {age_seconds}s old, waiting for DNS propagation...")
                     continue
 
                 h_status = await check_worker_health(url)
@@ -357,4 +398,4 @@ async def workers_health_check_loop():
 
         except Exception as e:
             log(f"❌ [HEALTH CHECK] Loop exception: {str(e)}")
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)
