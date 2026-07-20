@@ -225,7 +225,8 @@ export default {
           return new Response("File Not Found.", { status: 404 });
         }
         if (!response.ok) {
-          return new Response("Error retrieving file from storage.", { status: response.status });
+          const errorBody = await response.text();
+          return new Response("Error retrieving file from storage. R2 Status: " + response.status + " (" + response.statusText + "). Details: " + errorBody, { status: response.status });
         }
 
         for (const [key, value] of response.headers.entries()) {
