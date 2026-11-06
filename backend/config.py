@@ -29,7 +29,7 @@ SESSION_STR = os.getenv("SESSION_STRING", "")
 # ============================================================
 # 💾 APP CONFIG
 # ============================================================
-BASE_URL = os.getenv("BASE_URL", "https://heroxclash.pro")
+BASE_URL = os.getenv("BASE_URL", "https://storage.urlking.in")
 DB_FILE_SQLITE = "/app/data/files.db"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "super_secret_key_123")
 STATE_FILE = "/tmp/scan_progress.json"
