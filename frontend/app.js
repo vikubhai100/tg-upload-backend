@@ -1,26 +1,55 @@
-const API_BASE = window.location.origin; 
+/* ============================================================
+   URLKING Cloud Console — app.js
+   (API contracts unchanged; UI layer modernized)
+   ============================================================ */
+const API_BASE = window.location.origin;
 let currentPage = 1;
 let totalPages = 1;
 let secretKey = localStorage.getItem('telestore_v2_key') || '';
 let clickCount = 0;
 let clickTimer;
-let scanInterval; // For scanning progress
+let scanInterval;
 
-// Auth Logic
+// ---------- helpers ----------
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function toast(msg, type = 'ok', ms = 3500) {
+  const box = document.getElementById('toastBox');
+  if (!box) return;
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.innerHTML = `<span>${type === 'err' ? '⚠️' : '✅'}</span><span>${esc(msg)}</span>`;
+  box.appendChild(el);
+  setTimeout(() => {
+    el.classList.add('out');
+    setTimeout(() => el.remove(), 260);
+  }, ms);
+}
+
+function getIcon(name) {
+  const ext = String(name || '').split('.').pop().toLowerCase();
+  const map = { mp4:'🎬', mkv:'🎬', avi:'🎬', zip:'📦', rar:'📦', '7z':'📦', pdf:'📕', jpg:'🖼️', jpeg:'🖼️', png:'🖼️', gif:'🖼️', mp3:'🎵', flac:'🎵', apk:'📱', apks:'📱', exe:'⚙️', iso:'💿' };
+  return map[ext] || '📄';
+}
+
+// ---------- auth (3× logo click) ----------
 document.getElementById('secretTrigger').addEventListener('click', () => {
   clickCount++;
   clearTimeout(clickTimer);
-
   if (clickCount >= 3) {
-    document.getElementById('authModal').style.display = 'flex';
+    document.getElementById('authModal').classList.add('open');
     document.getElementById('accessKey').focus();
     clickCount = 0;
   } else {
-    clickTimer = setTimeout(() => { clickCount = 0; }, 1500); 
+    clickTimer = setTimeout(() => { clickCount = 0; }, 1500);
   }
 });
 
-function closeModal() { document.getElementById('authModal').style.display = 'none'; }
+function closeModal() { document.getElementById('authModal').classList.remove('open'); }
 function handleEnter(e) { if (e.key === 'Enter') verifyAccess(); }
 
 async function verifyAccess() {
@@ -28,11 +57,11 @@ async function verifyAccess() {
   if (!key) return;
 
   const btn = document.getElementById('loginBtn');
-  btn.textContent = "Verifying..."; btn.disabled = true;
+  btn.textContent = 'Verifying...'; btn.disabled = true;
 
   const ok = await loadFiles(1, key);
 
-  btn.textContent = "Access Files"; btn.disabled = false;
+  btn.textContent = 'Access Files'; btn.disabled = false;
 
   if (ok) {
     secretKey = key;
@@ -47,10 +76,10 @@ async function verifyAccess() {
 
 function logout() { localStorage.removeItem('telestore_v2_key'); location.reload(); }
 
-function getIcon(name) {
-  const ext = name.split('.').pop().toLowerCase();
-  const map = { mp4:'🎬', mkv:'🎬', zip:'📦', rar:'📦', pdf:'📕', jpg:'🖼️', png:'🖼️', mp3:'🎵', apk:'📱', apks:'📱', exe:'⚙️' };
-  return map[ext] || '📄';
+// ---------- files ----------
+function showSkeletons(n = 5) {
+  document.getElementById('filesList').innerHTML =
+    Array.from({ length: n }, () => '<div class="skeleton"></div>').join('');
 }
 
 async function loadFiles(page, keyToTry = secretKey) {
@@ -60,7 +89,6 @@ async function loadFiles(page, keyToTry = secretKey) {
     const mode = document.getElementById('downloadMode')?.value || 'random';
     const url = `${API_BASE}/files?page=${page}&limit=10&key=${encodeURIComponent(keyToTry)}&mode=${mode}`;
     const res = await fetch(url);
-
     if (!res.ok) return false;
 
     const data = await res.json();
@@ -76,34 +104,45 @@ async function loadFiles(page, keyToTry = secretKey) {
     document.getElementById('pageInfo').textContent = `Page ${currentPage} / ${totalPages}`;
     document.getElementById('btnPrev').disabled = currentPage <= 1;
     document.getElementById('btnNext').disabled = currentPage >= totalPages;
+    document.getElementById('paginationControls').style.display = 'flex';
 
     const list = document.getElementById('filesList');
+    if (!data.files.length) {
+      list.innerHTML = `
+        <div class="empty-state">
+          <div class="big">🗂️</div>
+          <p>No files yet. Upload via the API to see them here.</p>
+        </div>`;
+      return true;
+    }
+
     list.innerHTML = data.files.map(f => `
-      <div class="file-card">
-        <div class="file-icon">${getIcon(f.filename)}</div>
-        <div class="file-info">
-          <div class="file-name" title="${f.filename}">${f.filename}</div>
-          <div class="file-meta">${f.size} • ID: ${f.short_id}</div>
+      <div class="list-row">
+        <div class="row-icon">${getIcon(f.filename)}</div>
+        <div class="row-body">
+          <div class="row-title" title="${esc(f.filename)}">${esc(f.filename)}</div>
+          <div class="row-meta">${esc(f.size)} • ID: ${esc(f.short_id)}</div>
         </div>
-        <a href="${f.download_link}" class="btn-download" target="_blank">Download</a>
+        <div class="row-actions">
+          <a href="${esc(f.download_link)}" class="btn-cta" style="padding: 9px 18px; font-size: 13px;" target="_blank" rel="noopener">Download</a>
+        </div>
       </div>
     `).join('');
 
     return true;
   } catch (e) {
+    console.error('loadFiles error:', e);
     return false;
   }
 }
 
 function changePage(dir) {
+  showSkeletons(3);
   loadFiles(currentPage + dir);
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-// =========================================================
-// 🔥 VIRUS SCANNER JS LOGIC
-// =========================================================
-
+// ---------- virus scanner ----------
 function toggleScanner() {
   const el = document.getElementById('scannerSection');
   el.style.display = el.style.display === 'block' ? 'none' : 'block';
@@ -115,16 +154,20 @@ function toggleScanner() {
 async function startScan() {
   if (!secretKey) return;
   try {
-    document.getElementById('btnStartScan').disabled = true;
-    document.getElementById('btnStartScan').textContent = "Starting...";
-    
+    const btn = document.getElementById('btnStartScan');
+    btn.disabled = true;
+    btn.textContent = 'Starting...';
+
     await fetch(`${API_BASE}/api/scan/start?key=${encodeURIComponent(secretKey)}`);
-    
-    checkScanProgress(); 
+
+    checkScanProgress();
     if (!scanInterval) {
-      scanInterval = setInterval(checkScanProgress, 5000); 
+      scanInterval = setInterval(checkScanProgress, 5000);
     }
-  } catch(e) { console.error("Scan Start Error:", e); }
+  } catch (e) {
+    console.error('Scan Start Error:', e);
+    toast('Scan could not be started.', 'err');
+  }
 }
 
 async function checkScanProgress() {
@@ -132,7 +175,7 @@ async function checkScanProgress() {
   try {
     const res = await fetch(`${API_BASE}/api/scan/progress?key=${encodeURIComponent(secretKey)}`);
     const data = await res.json();
-    
+
     renderScannerUI(data);
 
     if (data.status !== 'running' && data.status !== 'initializing') {
@@ -141,7 +184,9 @@ async function checkScanProgress() {
     } else if (!scanInterval) {
       scanInterval = setInterval(checkScanProgress, 5000);
     }
-  } catch(e) { console.error("Scan Progress Error:", e); }
+  } catch (e) {
+    console.error('Scan Progress Error:', e);
+  }
 }
 
 function renderScannerUI(data) {
@@ -151,74 +196,75 @@ function renderScannerUI(data) {
   const btnStart = document.getElementById('btnStartScan');
 
   if (!data || data.status === 'idle') {
-    statusEl.textContent = 'System Ready. Click Start to scan files.';
+    statusEl.textContent = 'System ready. Click start to scan all files.';
     barEl.style.width = '0%';
     btnStart.disabled = false;
-    btnStart.textContent = "Start Full Scan";
+    btnStart.textContent = 'Start Full Scan';
+    infectedListEl.innerHTML = '';
     return;
   }
 
   if (data.status === 'running' || data.status === 'initializing') {
     btnStart.disabled = true;
-    btnStart.textContent = "Scanning...";
+    btnStart.textContent = 'Scanning...';
     const pct = data.total > 0 ? Math.round((data.scanned / data.total) * 100) : 0;
-    statusEl.textContent = `Scanning Database... ${data.scanned} / ${data.total} (${pct}%)`;
+    statusEl.textContent = `Scanning database... ${data.scanned} / ${data.total} (${pct}%)`;
     barEl.style.width = `${pct}%`;
   } else if (data.status === 'completed') {
     btnStart.disabled = false;
-    btnStart.textContent = "Scan Completed - Run Again";
-    statusEl.textContent = `Scan Finished. Safe Files: ${data.safe || 0} | Infected: ${data.infected ? data.infected.length : 0}`;
-    barEl.style.width = `100%`;
+    btnStart.textContent = 'Scan Completed — Run Again';
+    statusEl.textContent = `Scan finished. Safe files: ${data.safe || 0} | Infected: ${data.infected ? data.infected.length : 0}`;
+    barEl.style.width = '100%';
   } else {
     statusEl.textContent = `Status: ${data.status}`;
     btnStart.disabled = false;
   }
 
-  // Render Infected Files List
   if (data.infected && data.infected.length > 0) {
     infectedListEl.innerHTML = data.infected.map(f => `
-      <div class="infected-item" id="inf-${f.file_code}">
-        <div>
-          <strong style="color: #991b1b; font-size: 14px;">🚨 ${f.filename}</strong><br>
-          <span style="font-size: 12px; color: #b91c1c; font-family: monospace;">ID: ${f.file_code} | Flagged by ${f.engines} engines</span>
+      <div class="list-row danger" id="inf-${esc(f.file_code)}">
+        <div class="row-icon">🚨</div>
+        <div class="row-body">
+          <div class="row-title">${esc(f.filename)}</div>
+          <div class="row-meta">ID: ${esc(f.file_code)} | Flagged by ${esc(f.engines)} engines</div>
         </div>
-        <button class="btn-danger" onclick="deleteInfectedFile('${f.file_code}')">Delete File</button>
+        <div class="row-actions">
+          <button class="btn-danger" onclick="deleteInfectedFile('${esc(f.file_code)}')">Delete File</button>
+        </div>
       </div>
     `).join('');
   } else if (data.status === 'completed') {
-    infectedListEl.innerHTML = `<div style="padding:14px; background:#ecfdf5; color:#065f46; font-weight:700; border-radius:10px; border:1px solid #a7f3d0; text-align:center;">✅ All files are safe! No virus detected.</div>`;
+    infectedListEl.innerHTML = `<div class="safe-banner">✅ All files are safe — no virus detected.</div>`;
   } else {
     infectedListEl.innerHTML = '';
   }
 }
 
 async function deleteInfectedFile(fileCode) {
-  if(!confirm('Are you sure you want to permanently delete this infected file?')) return;
-  
+  if (!confirm('Permanently delete this infected file?')) return;
+
   try {
-    const btn = document.querySelector(`#inf-${fileCode} button`);
-    if(btn) { btn.textContent = "Deleting..."; btn.disabled = true; }
+    const btn = document.querySelector(`#inf-${CSS.escape(fileCode)} button`);
+    if (btn) { btn.textContent = 'Deleting...'; btn.disabled = true; }
 
     await fetch(`${API_BASE}/api/scan/delete?key=${encodeURIComponent(secretKey)}`, {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({file_code: fileCode})
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_code: fileCode })
     });
-    
-    const row = document.getElementById(`inf-${fileCode}`);
-    if(row) row.style.display = 'none';
 
-    loadFiles(currentPage); 
-  } catch(e) { 
-    alert("Failed to delete file."); 
-    console.error(e); 
+    const row = document.getElementById(`inf-${fileCode}`);
+    if (row) row.style.display = 'none';
+
+    toast('Infected file deleted.');
+    loadFiles(currentPage);
+  } catch (e) {
+    toast('Failed to delete file.', 'err');
+    console.error(e);
   }
 }
 
-// =========================================================
-// ☁️ WORKERS MANAGER JS LOGIC
-// =========================================================
-
+// ---------- workers manager ----------
 function toggleWorkersManager() {
   const el = document.getElementById('workersSection');
   el.style.display = el.style.display === 'block' ? 'none' : 'block';
@@ -232,63 +278,65 @@ async function loadWorkers() {
   try {
     const res = await fetch(`${API_BASE}/api/workers?key=${encodeURIComponent(secretKey)}`);
     const workers = await res.json();
-    
+
     const listEl = document.getElementById('workersList');
-    if (workers.length === 0) {
-      listEl.innerHTML = '<div style="padding:14px; background:#f1f5f9; color:var(--text-muted); border-radius:10px; text-align:center; width: 100%;">No workers added yet.</div>';
+    if (!Array.isArray(workers) || workers.length === 0) {
+      listEl.innerHTML = `<div class="muted-banner">No workers added yet.</div>`;
       return;
     }
-    
+
     listEl.innerHTML = workers.map(w => {
       const isHealthy = w.status === 'healthy';
-      const statusBg = isHealthy ? '#ecfdf5' : '#fef2f2';
-      const statusBorder = isHealthy ? '#a7f3d0' : '#fecaca';
-      const statusColor = isHealthy ? '#065f46' : '#991b1b';
-      
-      const actionButton = isHealthy 
-        ? `<button class="btn-danger" style="background:#f1f5f9; color:var(--text); border:1px solid var(--border);" onclick="deleteWorker('${w.url}')">Remove</button>`
-        : `<div style="display: flex; gap: 8px;">
-             <button class="btn-cta" style="padding: 8px 14px; font-size: 13px; background:#4f46e5; border-radius: 8px;" onclick="replaceWorker('${w.url}', this)">Auto-Replace</button>
-             <button class="btn-danger" onclick="deleteWorker('${w.url}')">Remove</button>
-           </div>`;
-      
+      const chip = isHealthy
+        ? '<span class="chip ok">● HEALTHY</span>'
+        : '<span class="chip bad">● FLAGGED</span>';
+
+      const actionButton = isHealthy
+        ? `<button class="btn-ghost" onclick="deleteWorker('${esc(w.url)}')">Remove</button>`
+        : `<button class="btn-cta" style="padding: 8px 14px; font-size: 13px;" onclick="replaceWorker('${esc(w.url)}', this)">Auto-Replace</button>
+           <button class="btn-danger" onclick="deleteWorker('${esc(w.url)}')">Remove</button>`;
+
       return `
-        <div class="infected-item" style="background: ${statusBg}; border-color: ${statusBorder};">
-          <div>
-            <strong style="color: var(--text); font-size: 14px;">${w.url}</strong><br>
-            <span style="font-size: 12px; color: ${statusColor}; font-weight: bold;">Status: ${w.status.toUpperCase()}</span>
+        <div class="list-row">
+          <div class="row-icon">${isHealthy ? '🟢' : '🔴'}</div>
+          <div class="row-body">
+            <div class="row-title" title="${esc(w.url)}">${esc(w.url)}</div>
+            <div class="row-meta" style="margin-top:6px;">${chip}</div>
           </div>
-          ${actionButton}
+          <div class="row-actions">${actionButton}</div>
         </div>
       `;
     }).join('');
-  } catch(e) { console.error("Load Workers Error:", e); }
+  } catch (e) {
+    console.error('Load Workers Error:', e);
+    toast('Workers list load failed.', 'err');
+  }
 }
 
 async function replaceWorker(url, btnElement) {
-  if (!confirm(`Are you sure you want to replace this flagged worker with a fresh one?\n${url}`)) return;
+  if (!confirm(`Replace this flagged worker with a fresh one?\n${url}`)) return;
   if (!secretKey) return;
-  
+
   try {
-    btnElement.textContent = "Replacing...";
+    btnElement.textContent = 'Replacing...';
     btnElement.disabled = true;
-    
+
     const res = await fetch(`${API_BASE}/api/workers/replace?key=${encodeURIComponent(secretKey)}`, {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url: url})
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url })
     });
-    
+
     const data = await res.json();
     if (res.ok) {
-      alert(`Worker replaced successfully!\nNew URL: ${data.new_url}`);
+      toast(`Worker replaced. New URL: ${data.new_url}`, 'ok', 6000);
     } else {
-      alert(`Replacement failed: ${data.detail || 'Error'}`);
+      toast(`Replacement failed: ${data.detail || 'Error'}`, 'err');
     }
     loadWorkers();
-  } catch(e) { 
-    alert("Replacement failed."); 
-    console.error(e); 
+  } catch (e) {
+    toast('Replacement failed.', 'err');
+    console.error(e);
   }
 }
 
@@ -296,39 +344,50 @@ async function addWorker() {
   const urlInput = document.getElementById('newWorkerUrl');
   const url = urlInput.value.trim();
   if (!url || !secretKey) return;
-  
+
   try {
-    await fetch(`${API_BASE}/api/workers/add?key=${encodeURIComponent(secretKey)}`, {
+    const res = await fetch(`${API_BASE}/api/workers/add?key=${encodeURIComponent(secretKey)}`, {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url: url})
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url })
     });
+    if (!res.ok) throw new Error();
     urlInput.value = '';
+    toast('Worker added.');
     loadWorkers();
-  } catch(e) { console.error("Add Worker Error:", e); }
+  } catch (e) {
+    toast('Add worker failed.', 'err');
+    console.error('Add Worker Error:', e);
+  }
 }
 
 async function deleteWorker(url) {
-  if (!confirm(`Are you sure you want to remove this worker?\n${url}`)) return;
+  if (!confirm(`Remove this worker?\n${url}`)) return;
   if (!secretKey) return;
-  
+
   try {
-    await fetch(`${API_BASE}/api/workers/delete?key=${encodeURIComponent(secretKey)}`, {
+    const res = await fetch(`${API_BASE}/api/workers/delete?key=${encodeURIComponent(secretKey)}`, {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url: url})
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url })
     });
+    if (!res.ok) throw new Error();
+    toast('Worker removed.');
     loadWorkers();
-  } catch(e) { console.error("Delete Worker Error:", e); }
+  } catch (e) {
+    toast('Delete worker failed.', 'err');
+    console.error('Delete Worker Error:', e);
+  }
 }
 
+// ---------- settings ----------
 function openSettingsModal() {
-  document.getElementById('settingsModal').style.display = 'flex';
+  document.getElementById('settingsModal').classList.add('open');
   loadGlobalSettings();
 }
 
 function closeSettingsModal() {
-  document.getElementById('settingsModal').style.display = 'none';
+  document.getElementById('settingsModal').classList.remove('open');
 }
 
 async function loadGlobalSettings() {
@@ -341,7 +400,7 @@ async function loadGlobalSettings() {
       if (select) select.value = data.mode;
     }
   } catch (e) {
-    console.error("Failed to load settings:", e);
+    console.error('Failed to load settings:', e);
   }
 }
 
@@ -352,22 +411,33 @@ async function saveGlobalSettings() {
   try {
     const res = await fetch(`${API_BASE}/api/settings/worker-mode?key=${encodeURIComponent(secretKey)}`, {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({mode: mode})
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: mode })
     });
     if (res.ok) {
-      alert("Success: Global routing mode updated successfully for all users!");
+      toast('Global routing mode updated for all users.');
       closeSettingsModal();
     } else {
-      alert("Failed to update global routing mode.");
+      toast('Failed to update routing mode.', 'err');
     }
-  } catch(e) {
-    console.error("Failed to update global routing mode:", e);
+  } catch (e) {
+    toast('Failed to update routing mode.', 'err');
+    console.error('Failed to update global routing mode:', e);
   }
 }
 
+// Modal backdrop click → close
+['authModal', 'settingsModal'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('click', e => {
+    if (e.target === el) {
+      if (id === 'authModal') closeModal(); else closeSettingsModal();
+    }
+  });
+});
+
+// init
 if (secretKey) {
+  showSkeletons(5);
   loadFiles(1);
 }
-
-

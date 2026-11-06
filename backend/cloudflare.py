@@ -2,6 +2,7 @@ import os
 import json
 import random
 import string
+import time
 import asyncio
 import aiohttp
 from backend.config import CLOUDFLARE_TOKEN, CLOUDFLARE_ACCOUNT_ID, log
@@ -365,9 +366,22 @@ async def deploy_new_cloudflare_worker():
         log(f"❌ [CLOUDFLARE API] Exception during deployment: {str(e)}")
     return None
 
+# ⚡ WORKER SELECTION CACHE — pehle HAR download URL ke liye SQLite query +
+# live HTTP health-check (5s timeout tak) chalta tha. /files page par 10
+# files × sequential health-checks = 2-20s page load. Ab selection 30s tak
+# cache hota hai — health-check chain sirf TTL expire par chalti hai.
+_worker_selection_cache = {}  # mode -> {"url": str, "ts": float}
+_WORKER_CACHE_TTL = 30.0
+
+
 async def get_active_worker(mode="random"):
     if mode == "account_b":
         return "https://urlkingworker.urlkings.workers.dev"
+
+    now = time.time()
+    cached = _worker_selection_cache.get(mode)
+    if cached and (now - cached["ts"]) < _WORKER_CACHE_TTL:
+        return cached["url"]
 
     conn = get_db_connection()
     rows = conn.execute("SELECT url FROM workers WHERE status = 'healthy'").fetchall()
@@ -384,15 +398,19 @@ async def get_active_worker(mode="random"):
     for w in workers:
         h_status = await check_worker_health(w)
         if h_status == "healthy":
+            _worker_selection_cache[mode] = {"url": w, "ts": now}
             return w
         else:
             log(f"⚠️ [ROTATOR] Worker offline/slow: {w}")
 
     new_worker = await deploy_new_cloudflare_worker()
     if new_worker:
+        _worker_selection_cache[mode] = {"url": new_worker, "ts": now}
         return new_worker
 
-    return "https://download.urlking.workers.dev"
+    fallback = "https://download.urlking.workers.dev"
+    _worker_selection_cache[mode] = {"url": fallback, "ts": now}
+    return fallback
 
 
 

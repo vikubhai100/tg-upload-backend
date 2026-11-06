@@ -3,130 +3,140 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>URLKING — Cloud Storage</title>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <!-- Link to external stylesheet -->
-  <link rel="stylesheet" href="/static/style.css" />
+  <title>URLKING — Cloud Storage Console</title>
+  <meta name="description" content="URLKING Cloud Storage — secure file storage, management and monetization console." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css?v=5" />
 </head>
 <body>
 
-<div class="container">
-  <header>
-    <div class="logo" id="secretTrigger">
-      <div class="logo-icon">☁️</div>
-      <div class="logo-text">URL<span>KING</span></div>
-    </div>
+<!-- ================= TOPBAR ================= -->
+<header class="uk-topbar">
+  <div class="logo" id="secretTrigger" title="URLKING Cloud">
+    <div class="logo-icon">⚡</div>
+    <div class="logo-text">URL<span>KING</span></div>
+  </div>
+  <div class="uk-topbar-right">
+    <span class="pill-status hide-sm"><span class="dot"></span>System Online</span>
     <div id="logoutBtn" style="display: none;">
-      <button onclick="logout()" style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-weight:600; text-decoration:underline;">Logout</button>
+      <button class="link-quiet" onclick="logout()">Log out</button>
     </div>
-  </header>
+  </div>
+</header>
 
+<div class="container">
+
+  <!-- ================= HERO ================= -->
   <section id="promoSection">
     <div class="promo-content">
-      <div class="promo-badge">CLOUD STORAGE</div>
-      <h1>Secure File Storage, Simplified.</h1>
-      <p>Upload, store, and manage your files securely with URLKING Cloud Storage. High speed, unlimited bandwidth, and seamless monetization.</p>
-      <a href="https://urlking.site/" class="btn-cta" target="_blank">Join URLKING Today →</a>
+      <div class="promo-badge">☁️ CLOUD STORAGE</div>
+      <h1>Secure File Storage, <span class="grad-text">Simplified.</span></h1>
+      <p>Upload, store, and manage your files with URLKING Cloud Storage. High-speed delivery, unlimited bandwidth, and seamless monetization — all in one console.</p>
+      <a href="https://urlking.site/" class="btn-cta" target="_blank" rel="noopener">Join URLKING Today →</a>
     </div>
   </section>
 
+  <!-- ================= FILES CONSOLE ================= -->
   <section id="filesSection">
-    <div class="files-header">
+    <div class="section-head">
       <div>
-        <h2 style="font-size: 24px; font-weight: 800;">Private Directory</h2>
-        <p style="color: var(--text-muted); font-size: 14px;" id="fileCount">0 files available</p>
+        <h2>Private Directory</h2>
+        <div class="sub" id="fileCount">0 files managed</div>
       </div>
-      <!-- Test Routing Mode Selector -->
-      <div style="display: flex; align-items: center; gap: 8px; background: var(--bg-card); padding: 6px 12px; border-radius: 10px; border: 1px solid var(--border);">
-        <span style="font-size: 12px; font-weight: 800; color: var(--text-muted);">ROUTING TEST:</span>
-        <select id="downloadMode" onchange="loadFiles(1)" style="background: none; border: none; color: var(--text); font-weight: 600; font-size: 13px; outline: none; cursor: pointer;">
-          <option value="random" style="background: var(--bg-card);">🔀 Random Rotation</option>
-          <option value="account_a" style="background: var(--bg-card);">🅰️ Account A Only</option>
-          <option value="account_b" style="background: var(--bg-card);">🅱️ Account B Only</option>
-        </select>
-      </div>
-      <!-- 🔥 SCANNER, WORKERS, & SETTINGS TOGGLE BUTTONS -->
-      <div style="display: flex; gap: 8px;">
-        <button class="btn-scan-toggle" onclick="toggleScanner()">🛡️ Virus Scanner</button>
-        <button class="btn-scan-toggle" style="background:#4f46e5; box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.2);" onclick="window.location.href='/workers'">☁️ Workers Manager</button>
-        <button class="btn-scan-toggle" style="background:#059669; box-shadow: 0 4px 6px -1px rgba(5, 150, 105, 0.2);" onclick="openSettingsModal()">⚙️ Settings</button>
+      <div class="toolbar">
+        <div class="select-wrap">
+          <span>ROUTING</span>
+          <select id="downloadMode" onchange="loadFiles(1)">
+            <option value="random">🔀 Random Rotation</option>
+            <option value="account_a">🅰️ Account A Only</option>
+            <option value="account_b">🅱️ Account B Only</option>
+          </select>
+        </div>
+        <button class="btn-ghost" onclick="toggleScanner()">🛡️ Scanner</button>
+        <button class="btn-ghost" onclick="toggleWorkersManager()">☁️ Workers</button>
+        <button class="btn-ghost" onclick="openSettingsModal()">⚙️ Settings</button>
       </div>
     </div>
 
-    <!-- 🔥 SCANNER PANEL UI -->
-    <div id="scannerSection" class="scanner-panel">
-      <div class="scanner-header">
-        <h3>🛡️ System Security Scanner</h3>
+    <!-- Scanner Panel -->
+    <div id="scannerSection" class="uk-panel">
+      <div class="uk-panel-head">
+        <h3 class="emerald">🛡️ System Security Scanner</h3>
         <button class="btn-cta" id="btnStartScan" style="padding: 10px 20px; font-size: 13px;" onclick="startScan()">Start Full Scan</button>
       </div>
-      
-      <div class="scan-status-text" id="scanStatus">System Ready. Click Start to scan files.</div>
-      <div class="progress-bar-bg">
-        <div class="progress-bar-fill" id="scanBar"></div>
-      </div>
-
-      <!-- Yahan Infected Files Dikhayi Dengi -->
-      <div class="infected-list" id="infectedList"></div>
+      <div class="uk-panel-sub">Full database sweep — flags infected files across every engine report.</div>
+      <div class="scan-status-text" id="scanStatus">System ready. Click start to scan all files.</div>
+      <div class="progress-track"><div class="progress-fill" id="scanBar"></div></div>
+      <div class="uk-list" id="infectedList"></div>
     </div>
 
-    <!-- ☁️ WORKERS MANAGER PANEL -->
-    <div id="workersSection" class="scanner-panel" style="border-color: #4f46e5; box-shadow: 0 10px 15px -3px rgba(79, 70, 229, 0.1);">
-      <div class="scanner-header" style="flex-wrap: wrap; gap: 12px;">
-        <h3 style="color: #4f46e5;">☁️ Cloudflare Workers Manager</h3>
-        <div style="display: flex; gap: 8px; flex: 1; min-width: 280px; justify-content: flex-end;">
-          <input type="text" id="newWorkerUrl" class="auth-input" style="margin-bottom:0; padding: 10px 14px; text-align: left; flex: 1;" placeholder="https://example.workers.dev" />
-          <button class="btn-cta" style="padding: 10px 20px; font-size: 13px; background: #4f46e5;" onclick="addWorker()">Add Worker</button>
+    <!-- Workers Panel (inline quick manager) -->
+    <div id="workersSection" class="uk-panel violet">
+      <div class="uk-panel-head">
+        <h3 class="violet">☁️ Cloudflare Workers</h3>
+        <div class="panel-inline-form">
+          <input type="text" id="newWorkerUrl" class="uk-input left" placeholder="https://example.workers.dev" />
+          <button class="btn-cta" style="padding: 10px 20px; font-size: 13px;" onclick="addWorker()">Add</button>
         </div>
       </div>
-      
-      <div class="scan-status-text">Manage your active and flagged worker domains for link rotation.</div>
-      
-      <div class="infected-list" id="workersList"></div>
+      <div class="uk-panel-sub">Manage active &amp; flagged worker domains for link rotation. Full console: <a href="/workers" style="color:#a5b4fc;">Workers Manager →</a></div>
+      <div class="uk-list" id="workersList"></div>
     </div>
 
+    <!-- Files list -->
     <div id="filesList"></div>
 
-    <div class="pagination" id="paginationControls">
-      <button class="btn-nav" id="btnPrev" onclick="changePage(-1)">Previous</button>
-      <span style="font-family: 'JetBrains Mono'; font-size: 14px;" id="pageInfo">Page 1 / 1</span>
-      <button class="btn-nav" id="btnNext" onclick="changePage(1)">Next</button>
+    <!-- Pagination -->
+    <div class="pagination" id="paginationControls" style="display: none;">
+      <button class="btn-nav" id="btnPrev" onclick="changePage(-1)">← Previous</button>
+      <span class="page-info" id="pageInfo">Page 1 / 1</span>
+      <button class="btn-nav" id="btnNext" onclick="changePage(1)">Next →</button>
     </div>
   </section>
+
+  <footer class="uk-footer">URLKING Cloud Console · Hybrid Telegram + R2 Storage</footer>
 </div>
 
-<div id="authModal">
-  <div class="auth-card">
-    <h3>Admin Login</h3>
-    <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">Enter your secret access key</p>
-    <input type="password" id="accessKey" class="auth-input" placeholder="••••••••" onkeypress="handleEnter(event)"/>
-    <button class="btn-cta" id="loginBtn" style="width: 100%;" onclick="verifyAccess()">Access Files</button>
-    <p class="error-txt" id="authError">Invalid Secret Key!</p>
-    <button onclick="closeModal()" style="margin-top: 15px; background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:12px;">Close</button>
+<!-- ================= AUTH MODAL ================= -->
+<div id="authModal" class="uk-modal">
+  <div class="uk-modal-card">
+    <h3>🔐 Admin Access</h3>
+    <p class="modal-sub">Enter your secret access key to open the console.</p>
+    <input type="password" id="accessKey" class="auth-input" style="text-align:center;" placeholder="••••••••••" onkeypress="handleEnter(event)" />
+    <div style="margin-top: 18px;">
+      <button class="btn-cta btn-block" id="loginBtn" onclick="verifyAccess()">Access Files</button>
+    </div>
+    <p class="error-txt" id="authError">Invalid secret key. Try again.</p>
+    <button class="link-btn" onclick="closeModal()">Close</button>
   </div>
 </div>
 
-<div id="settingsModal" class="auth-modal" style="display: none; position: fixed; inset: 0; z-index: 80; background: rgba(0,0,0,0.8); backdrop-filter: blur(4px); align-items: center; justify-content: center;">
-  <div class="auth-card" style="width: 100%; max-width: 400px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; text-align: center; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3);">
-    <h3 style="margin-top: 0; font-size: 18px; font-weight: 800;">⚙️ Global Settings</h3>
-    <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">Configure settings that affect all normal users.</p>
-    
-    <div style="text-align: left; margin-bottom: 20px;">
-      <label style="font-size: 13px; font-weight: 600; color: var(--text); display: block; margin-bottom: 8px;">Global Worker Routing:</label>
-      <select id="globalWorkerMode" class="auth-input" style="width: 100%; text-align-last: left; margin-bottom: 0; background: var(--bg-card); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px;">
+<!-- ================= SETTINGS MODAL ================= -->
+<div id="settingsModal" class="uk-modal">
+  <div class="uk-modal-card" style="text-align: left;">
+    <h3 style="text-align:center;">⚙️ Global Settings</h3>
+    <p class="modal-sub" style="text-align:center;">Settings that apply to every normal user.</p>
+
+    <div class="field">
+      <label>Global Worker Routing</label>
+      <select id="globalWorkerMode" class="uk-input" style="text-align-last:left;">
         <option value="random">🔀 Random Rotation</option>
         <option value="account_a">🅰️ Account A Only</option>
         <option value="account_b">🅱️ Account B Only</option>
       </select>
-      <span style="font-size: 11px; color: var(--text-muted); display: block; margin-top: 6px;">Select which worker account normal users download from.</span>
+      <span class="hint">Select which worker account normal users download from.</span>
     </div>
 
-    <button class="btn-cta" style="width: 100%; background: #059669; border: none; padding: 12px; border-radius: 8px; color: white; font-weight: bold; cursor: pointer;" onclick="saveGlobalSettings()">Save Settings</button>
-    <button onclick="closeSettingsModal()" style="margin-top: 15px; background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:12px; text-decoration: underline;">Cancel</button>
+    <button class="btn-cta btn-block" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); box-shadow: 0 6px 20px -6px rgba(16,185,129,0.5);" onclick="saveGlobalSettings()">Save Settings</button>
+    <button class="link-btn" style="display:block; margin: 14px auto 0;" onclick="closeSettingsModal()">Cancel</button>
   </div>
 </div>
 
+<!-- Toasts -->
+<div id="toastBox"></div>
 
-<!-- Link to external script -->
-<script src="/static/app.js?v=3"></script>
+<script src="/static/app.js?v=5"></script>
 </body>
 </html>

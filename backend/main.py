@@ -103,20 +103,30 @@ def calculate_hash(file_path):
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
-    index_file = FRONTEND_DIR / "index.html"
-    if index_file.exists():
-        return index_file.read_text(encoding="utf-8")
-    index_alt = Path(__file__).resolve().parent / "index.html"
-    if index_alt.exists():
-        return index_alt.read_text(encoding="utf-8")
-    return "<h2>Frontend Not Found (Check your /frontend folder)</h2>"
+    return _read_cached_html(FRONTEND_DIR / "index.html", Path(__file__).resolve().parent / "index.html")
 
 @app.get("/workers", response_class=HTMLResponse)
 async def serve_workers_page():
-    workers_file = FRONTEND_DIR / "workers.html"
-    if workers_file.exists():
-        return workers_file.read_text(encoding="utf-8")
-    return "<h2>Workers Manager page not found.</h2>"
+    return _read_cached_html(FRONTEND_DIR / "workers.html", None)
+
+# ⚡ HTML CACHE — pehle har page view par disk read hota tha; ab mtime-based
+# in-memory cache (file edit hoti hai to turant invalidate)
+_html_cache = {}
+
+def _read_cached_html(primary: Path, fallback: Path | None):
+    try:
+        path = primary if primary.exists() else (fallback if (fallback and fallback.exists()) else None)
+        if not path:
+            return "<h2>Frontend Not Found (Check your /frontend folder)</h2>"
+        mtime = path.stat().st_mtime
+        hit = _html_cache.get(str(path))
+        if hit and hit[0] == mtime:
+            return hit[1]
+        content = path.read_text(encoding="utf-8")
+        _html_cache[str(path)] = (mtime, content)
+        return content
+    except Exception:
+        return "<h2>Frontend load error</h2>"
 
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
@@ -1074,30 +1084,38 @@ async def list_files(request: Request, key: str, page: int = 1, limit: int = 10,
         conn = get_db_connection()
         try:
             offset = (page - 1) * limit
-            total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-            rows = conn.execute("SELECT * FROM files ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+            # ⚡ SINGLE QUERY: COUNT(*) OVER() se total bhi same scan me —
+            # pehle COUNT(*) + SELECT do alag full scans the
+            rows = conn.execute(
+                "SELECT *, COUNT(*) OVER() AS _total FROM files ORDER BY rowid DESC LIMIT ? OFFSET ?",
+                (limit, offset)
+            ).fetchall()
+            total = rows[0]["_total"] if rows else 0
             return total, rows
         finally:
             conn.close()
 
     total, rows = await asyncio.to_thread(get_files)
-    
-    files_list = []
-    for r in rows:
+
+    async def _payload(r):
         r_dict = dict(r)
         r2_key = r_dict.get("r2_key") or r_dict.get("r2_cache_key")
         if r2_key:
+            # ⚡ get_active_worker ab 30s cache se instant hai, phir bhi URLs
+            # parallel generate karte hain (HMAC CPU work bhi overlap hota hai)
             res = await generate_download_url(r2_key, r_dict["filename"], r_dict["content_type"] or "application/octet-stream", client_ip, mode)
             download_link = res["download_url"] if res else f"{BASE_URL}/download/{r_dict['short_id']}"
         else:
             download_link = f"{BASE_URL}/download/{r_dict['short_id']}"
-            
-        files_list.append({
+        return {
             "short_id": r_dict["short_id"],
             "filename": r_dict["filename"],
             "size": format_size(r_dict["size"]),
             "download_link": download_link
-        })
+        }
+
+    # ⚡ PARALLEL: pehle 10 URLs EK KE BAAD EK bante the — ab gather se sab ek saath
+    files_list = await asyncio.gather(*[_payload(r) for r in rows]) if rows else []
 
     return {
         "files": files_list,
