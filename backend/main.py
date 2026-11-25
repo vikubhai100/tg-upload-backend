@@ -1459,7 +1459,10 @@ async def get_client():
         return _client
 
 def verify_key(key: str):
-    if key != INTERNAL_API_KEY: raise HTTPException(status_code=403)
+    # 🔐 SECURITY: INTERNAL_API_KEY unset (empty) ho to SAB deny — warna
+    # key="" bhejne wala koi bhi poora API khol leta (open-door hole).
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=403)
 
 LOOP_LOCK_FILE = "/app/data/.bg_loops.lock"
 
