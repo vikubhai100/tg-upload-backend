@@ -373,7 +373,7 @@ async def api_upload(request: Request):
                 "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
                 "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
                 "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
-                "file_hash": file_hash, "r2_cache_key": existing.get("r2_cache_key")
+                "file_hash": file_hash, "r2_cache_key": dict(existing).get("r2_cache_key")
             })
             return JSONResponse(content=[{"file_code": new_id, "file_status": "OK"}])
 
@@ -480,7 +480,7 @@ async def remote_upload(request: Request):
                 "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
                 "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
                 "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
-                "file_hash": file_hash, "r2_cache_key": existing.get("r2_cache_key")
+                "file_hash": file_hash, "r2_cache_key": dict(existing).get("r2_cache_key")
             })
             return [{"file_code": new_short_id, "file_status": "OK"}]
 
@@ -657,13 +657,30 @@ async def clean_r2_small_files(key: str):
     return {"status": "OK", "msg": f"Deleted {deleted_count} small files (<100MB) from R2 and forced to Telegram stream."}
 
 @app.get("/api/file/delete")
-async def file_delete(key: str, file_code: str):
+async def file_delete(key: str, file_code: str, purge_tg: int = 0):
     verify_key(key)
     try:
         entry = await db_thread(get_file_entry, file_code, timeout=10.0)
     except Exception as e:
         return {"status": 500, "error": str(e)}
     if entry:
+        # 🗑️ PERMANENT DELETE (coldstorage purge_tg=1): Telegram messages bhi hatao
+        if purge_tg:
+            tg_ids = []
+            for _k in ("message_id", "tg_backup_msg_id"):
+                try:
+                    _v = int(entry.get(_k) or 0)
+                    if _v > 0 and _v not in tg_ids:
+                        tg_ids.append(_v)
+                except Exception:
+                    pass
+            if tg_ids:
+                try:
+                    _client = await get_client()
+                    await _client.delete_messages(CHANNEL_ID, tg_ids)
+                    log(f"🗑️ [DELETE] TG messages purged {file_code}: {tg_ids}")
+                except Exception as e:
+                    log(f"⚠️ [DELETE] TG purge failed {file_code}: {e}")
         def run_delete():
             conn = get_db_connection()
             try:
@@ -683,6 +700,53 @@ async def file_delete(key: str, file_code: str):
                 conn.close()
         await asyncio.to_thread(run_delete)
     return {"status": 200, "msg": "OK"}
+
+# ============================================================
+# ❄️ COLD STORAGE: R2 evict (row RAKHO, Telegram backup active)
+#    /file/delete se different — wo row bhi delete karta hai.
+#    Cold move: backup_to_telegram → evict_r2 → file TG-only mode.
+# ============================================================
+@app.get("/api/file/evict_r2")
+async def file_evict_r2(key: str, file_code: str):
+    verify_key(key)
+    try:
+        entry = await db_thread(get_file_entry, file_code, timeout=10.0)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": 500, "error": str(e)})
+    if not entry:
+        return JSONResponse(status_code=404, content={"status": 404, "error": "File not found"})
+
+    def run_evict():
+        conn = get_db_connection()
+        removed = []
+        try:
+            # Refcount guard — doosri rows isi R2 object share kar rahi hon to object rehne do
+            if entry.get("storage_type") == "r2" and entry.get("r2_key"):
+                cnt = conn.execute("SELECT COUNT(*) FROM files WHERE r2_key = ? AND short_id != ?", (entry["r2_key"], file_code)).fetchone()[0]
+                if cnt <= 0:
+                    try:
+                        r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_key"])
+                        removed.append(entry["r2_key"])
+                    except Exception as e:
+                        log(f"⚠️ [EVICT] r2_key delete failed {file_code}: {e}")
+            if entry.get("r2_cache_key"):
+                cnt = conn.execute("SELECT COUNT(*) FROM files WHERE r2_cache_key = ? AND short_id != ?", (entry["r2_cache_key"], file_code)).fetchone()[0]
+                if cnt <= 0:
+                    try:
+                        r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=entry["r2_cache_key"])
+                        removed.append(entry["r2_cache_key"])
+                    except Exception as e:
+                        log(f"⚠️ [EVICT] cache delete failed {file_code}: {e}")
+            # Row RAKHO — telegram backup reference ke saath cold mode
+            conn.execute("UPDATE files SET r2_key = NULL, r2_cache_key = NULL, storage_type = 'telegram' WHERE short_id = ?", (file_code,))
+            conn.commit()
+        finally:
+            conn.close()
+        return removed
+
+    removed = await asyncio.to_thread(run_evict)
+    log(f"❄️ [EVICT] {file_code} → R2 freed ({len(removed)} objects), telegram backup active")
+    return {"status": 200, "msg": "R2 evicted, telegram backup active", "removed_keys": removed}
 
 # ============================================================
 # 🔄 UPDATED /api/workers WITH LIVE CLOUDFLARE SYNC
@@ -882,7 +946,7 @@ async def index_forwarded(key: str, message_id: int, filename: str):
                 "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
                 "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
                 "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
-                "file_hash": existing.get("file_hash"), "r2_cache_key": existing.get("r2_cache_key")
+                "file_hash": dict(existing).get("file_hash"), "r2_cache_key": dict(existing).get("r2_cache_key")
             }, timeout=10.0)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Save failed: {str(e)}")
@@ -935,7 +999,7 @@ async def fast_index(key: str, data: dict = Body(...)):
                     "doc_id": existing["doc_id"], "access_hash": existing["access_hash"],
                     "file_reference": existing["file_reference"], "dc_id": existing["dc_id"],
                     "storage_type": existing["storage_type"], "r2_key": existing["r2_key"],
-                    "file_hash": existing.get("file_hash"), "r2_cache_key": existing.get("r2_cache_key")
+                    "file_hash": dict(existing).get("file_hash"), "r2_cache_key": dict(existing).get("r2_cache_key")
                 }, timeout=10.0)
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Failed to save: {str(e)}")
@@ -1056,6 +1120,58 @@ async def backup_to_telegram(key: str, data: dict = Body(...)):
                 os.unlink(tmp_path)
         except:
             pass
+
+# ============================================================
+# ❄️ COLD STORAGE RESTORE: Telegram backup → R2 (background task)
+#    Node backend /api/file/restore_status poll karta hai.
+# ============================================================
+@app.post("/api/file/restore_from_telegram")
+async def restore_from_telegram(key: str, data: dict = Body(...)):
+    verify_key(key)
+    file_code = data.get("file_code")
+    if not file_code:
+        raise HTTPException(status_code=400, detail="Missing file_code")
+
+    entry = await asyncio.to_thread(get_file_entry, file_code)
+    if not entry:
+        raise HTTPException(status_code=404, detail="File not found in DB")
+
+    # Already restored? (r2_cache_key present + R2 pe exists)
+    if entry.get("r2_cache_key"):
+        st = await asyncio.to_thread(check_r2_file_exists, entry["r2_cache_key"])
+        if st == 'exists':
+            return {"status": "OK", "state": "restored", "r2_cache_key": entry["r2_cache_key"]}
+
+    msg_id = entry.get("tg_backup_msg_id") or entry.get("message_id")
+    if not msg_id or int(msg_id) <= 0:
+        return JSONResponse(status_code=400, content={"error": "No telegram backup reference for this file"})
+
+    # Background precache (get_or_create_precache concurrent dedupe karta hai)
+    asyncio.create_task(get_or_create_precache(file_code, entry))
+    log(f"🔄 [RESTORE] started {file_code} (msg {msg_id})")
+    return {"status": "OK", "state": "restoring"}
+
+@app.get("/api/file/restore_status")
+async def file_restore_status(key: str, file_code: str):
+    verify_key(key)
+    entry = await asyncio.to_thread(get_file_entry, file_code)
+    if not entry:
+        return JSONResponse(status_code=404, content={"status": 404, "error": "File not found"})
+    state = "idle"
+    if file_code in _active_precache:
+        state = "restoring"
+    elif entry.get("r2_cache_key"):
+        st = await asyncio.to_thread(check_r2_file_exists, entry["r2_cache_key"])
+        if st == 'exists':
+            state = "restored"
+    return {
+        "status": 200,
+        "state": state,
+        "filename": entry.get("filename"),
+        "size": entry.get("size"),
+        "tg_backup_msg_id": entry.get("tg_backup_msg_id") or 0,
+        "r2_cache_key": entry.get("r2_cache_key"),
+    }
 
 @app.get("/api/settings/worker-mode")
 async def get_global_worker_mode(key: str):
@@ -1345,21 +1461,47 @@ async def get_client():
 def verify_key(key: str):
     if key != INTERNAL_API_KEY: raise HTTPException(status_code=403)
 
+LOOP_LOCK_FILE = "/app/data/.bg_loops.lock"
+
+def _try_claim_loop_lock():
+    """🐛 FIX: 2 uvicorn workers → har worker me background loops DOUBLE
+    chalte the. Shared volume (/app/data) par lockfile — sirf ek worker
+    loops chalata hai. Stale (>24h) lock par takeover."""
+    try:
+        fd = os.open(LOOP_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(int(time.time())).encode("utf-8"))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        try:
+            if time.time() - os.stat(LOOP_LOCK_FILE).st_mtime > 86400:
+                os.remove(LOOP_LOCK_FILE)
+                return _try_claim_loop_lock()
+        except Exception:
+            pass
+        return False
+    except Exception as e:
+        log(f"loop lock error: {e} — loops start (fallback)")
+        return True
+
 @app.on_event("startup")
 async def on_startup():
     init_db()
-    asyncio.create_task(cache_cleanup_loop())
-    asyncio.create_task(r2_deduplication_loop())
-    asyncio.create_task(workers_health_check_loop())
-    async def auto_repair():
-        await asyncio.sleep(30)
-        try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(_repair_r2_sync),
-                timeout=300
-            )
-            log(f"Auto-repair done: {result}")
-        except Exception as e:
-            log(f"Auto-repair error: {str(e)}")
-    asyncio.create_task(auto_repair())
+    if _try_claim_loop_lock():
+        asyncio.create_task(cache_cleanup_loop())
+        asyncio.create_task(r2_deduplication_loop())
+        asyncio.create_task(workers_health_check_loop())
+        async def auto_repair():
+            await asyncio.sleep(30)
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(_repair_r2_sync),
+                    timeout=300
+                )
+                log(f"Auto-repair done: {result}")
+            except Exception as e:
+                log(f"Auto-repair error: {str(e)}")
+        asyncio.create_task(auto_repair())
+    else:
+        log("🔁 bg loops doosre worker ke paas hain (lockfile) — is worker me skip")
     log("URLKING HYBRID SYSTEM ONLINE & READY (INVISIBLE MODE ACTIVE)")
