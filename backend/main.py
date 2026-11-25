@@ -1,4 +1,5 @@
 import os
+import socket
 import uuid
 import tempfile
 import asyncio
@@ -1467,22 +1468,30 @@ def verify_key(key: str):
 LOOP_LOCK_FILE = "/app/data/.bg_loops.lock"
 
 def _try_claim_loop_lock():
-    """🐛 FIX: 2 uvicorn workers → har worker me background loops DOUBLE
-    chalte the. Shared volume (/app/data) par lockfile — sirf ek worker
-    loops chalata hai. Stale (>24h) lock par takeover."""
+    """🐛 FIX v2: lockfile shared volume par persist hota hai — container
+    recreate (deploy) ke baad purana lock recent mtime ke saath 24h tak
+    block karta tha (bg loops dead). Ab lock me OWNER HOSTNAME likhte hain:
+    alag hostname (naya container) = stale = turant takeover. Same container
+    ka doosra uvicorn worker = respect. >24h purana bhi takeover."""
+    MY = socket.gethostname()
     try:
+        try:
+            with open(LOOP_LOCK_FILE) as f:
+                content = f.read().strip()
+            owner = content.split(":", 1)[0]
+            is_stale = (owner != MY) or (time.time() - os.stat(LOOP_LOCK_FILE).st_mtime > 86400)
+            if is_stale:
+                os.remove(LOOP_LOCK_FILE)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
         fd = os.open(LOOP_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(int(time.time())).encode("utf-8"))
+        os.write(fd, f"{MY}:{int(time.time())}".encode("utf-8"))
         os.close(fd)
         return True
     except FileExistsError:
-        try:
-            if time.time() - os.stat(LOOP_LOCK_FILE).st_mtime > 86400:
-                os.remove(LOOP_LOCK_FILE)
-                return _try_claim_loop_lock()
-        except Exception:
-            pass
-        return False
+        return False  # same container ka doosra worker own karta hai
     except Exception as e:
         log(f"loop lock error: {e} — loops start (fallback)")
         return True

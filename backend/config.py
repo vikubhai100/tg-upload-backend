@@ -10,8 +10,13 @@ from pathlib import Path
 #    GOOGLE_SAFE_BROWSING_API_KEY
 # ============================================================
 R2_ENDPOINT = os.getenv("R2_ENDPOINT", "https://c756225d2d945ebc6c51149e7a1e3cfe.r2.cloudflarestorage.com")
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
-R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
+# ⚠️ TEMP FALLBACK (hotfix 2026-11-25): env-only karne se Coolify env me R2 keys
+#    set na hone par SARE downloads down ho gaye the ("Upload failed." /
+#    "File data not found."). Purani keys waise bhi git history me leak hain —
+#    fallback se service turant wapas aayi. Coolify env me ROTATED keys set
+#    karte hi env override ho jayega; tab fallback hata dena.
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "6725033f7581ed01c53a5b4411dc0614")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "21295882807a0d4940dc9330e146795043b6c69ce83520f04b0be5a49262d28f")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "urlking")
 
 CLOUDFLARE_TOKEN = os.getenv("CLOUDFLARE_TOKEN", "")
@@ -44,6 +49,8 @@ if not INTERNAL_API_KEY:
     print("⚠️ [config] INTERNAL_API_KEY env missing! Saare ?key= / X-Internal-Key calls 403 honge.", flush=True)
 if not R2_ACCESS_KEY or not R2_SECRET_KEY:
     print("⚠️ [config] R2_ACCESS_KEY / R2_SECRET_KEY env missing! R2 uploads/downloads fail honge.", flush=True)
+elif not os.getenv("R2_ACCESS_KEY"):
+    print("ℹ️ [config] R2 keys Coolify env me nahi — TEMP fallback chal rahi. ROTATED keys env me set karo!", flush=True)
 if not BOT_TOKEN or not API_ID or not API_HASH:
     print("⚠️ [config] BOT_TOKEN / API_ID / API_HASH env missing! Telegram client start nahi hoga.", flush=True)
 
